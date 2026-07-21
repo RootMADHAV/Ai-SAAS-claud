@@ -1,0 +1,16 @@
+LICENSE -- NOT YET CHOSEN.
+
+This is a placeholder, not a license grant. No license terms apply to
+this repository until this file is replaced with a real one.
+
+This is a deliberate omission, not an oversight: this project may become
+a commercial product, and the choice between something permissive
+(MIT, Apache 2.0), something copyleft, or a proprietary/all-rights-reserved
+license has real consequences for that -- for example, a permissive
+license would let anyone freely reuse or fork the codebase, which may
+conflict with commercial intent. That is a business decision for the
+project owner to make explicitly, not one to default into silently.
+
+Until this file is replaced: treat this repository as All Rights
+Reserved by default -- the safe assumption when no license has been
+chosen -- not as freely licensed for reuse.

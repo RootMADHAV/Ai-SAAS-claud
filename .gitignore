@@ -1,0 +1,27 @@
+# Secrets -- never commit a real .env
+.env
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+
+# Node / frontend (Phase 3)
+node_modules/
+.next/
+
+# Data volumes, if ever run outside Docker
+*.sqlite3
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store

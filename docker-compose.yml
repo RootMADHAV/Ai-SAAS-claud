@@ -1,0 +1,14 @@
+# Placeholder -- full service definitions land in Milestone 7.
+#
+# Target shape (see PROJECT_STATE.md, section 1 and "Design decisions"):
+#   - postgres, redis, minio, minio-init, qdrant   (infra, network: internal/queue)
+#   - backend, worker                              (network: internal, queue)
+#   - scanner-worker                                (network: scan-egress, queue --
+#                                                     deliberately NOT on `internal`,
+#                                                     no route to postgres)
+#   - frontend                                      (network: internal, Phase 3)
+#   - prometheus, grafana                           (behind `--profile observability`)
+#
+# Do not add real service definitions here outside of Milestone 7 --
+# see AI_ENGINEERING_RULES.md on never implementing more than one
+# milestone's worth of work in a session.
