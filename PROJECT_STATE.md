@@ -237,14 +237,19 @@ designed (schema in decisions above) but not yet coded.
 
 ## 6. Current implementation status
 
-Milestone 1 (Foundation) is content-complete: all 16 expected files
-exist. A full audit this session (every file read from disk, every
-import traced to its real definition, naming and domain-layer purity and
-documentation coverage all checked by hand) found zero issues. Not
-dynamically re-executed in this location -- see section 13. Directory
-scaffolding for the entire approved architecture is complete. Milestones
-2-7 and Phases 3-10 not started. See `docs/implementation_progress.md`
-for the live version of this section.
+Milestone 1 (Foundation) is complete: all 16 expected files exist,
+content audited (imports traced, naming/domain-purity/documentation
+checked), and dynamically executed -- pytest, Ruff (lint + format), and
+MyPy strict all run and passing against these exact file contents. That
+execution ran in Claude's own sandboxed environment, not on this machine
+directly (this Filesystem MCP still has no command-execution tool -- see
+section 13), against files read byte-for-byte from this repository and
+written unmodified into the sandbox. It is not confirmation that the
+commands succeed on `C:\Users\gamer\Downloads\claudeOnly` itself; that
+remains a one-time manual step if bit-for-bit local confirmation matters.
+Directory scaffolding for the entire approved architecture is complete.
+Milestones 2-7 and Phases 3-10 not started. See
+`docs/implementation_progress.md` for the live version of this section.
 
 ## 7. Completed work
 
@@ -322,10 +327,12 @@ file should not need editing that often.
 
 ## 13. Filesystem workflow
 
-Project root: `C:\Users\gamer\Downloads\claude only`, accessed via the
-Filesystem MCP (not the sandbox -- the sandbox holds an earlier,
-now-superseded copy of Milestone 1 that was transplanted here file by
-file).
+Project root: `C:\Users\gamer\Downloads\claudeOnly` (no space -- corrected
+this session; every prior reference to "claude only" with a space was a
+documentation typo, caught by comparing against `list_allowed_directories`,
+which is the authoritative source), accessed via the Filesystem MCP (not
+the sandbox -- the sandbox holds an earlier, now-superseded copy of
+Milestone 1 that was transplanted here file by file).
 
 Tools available: `list_allowed_directories`, `list_directory`,
 `list_directory_with_sizes`, `directory_tree`, `get_file_info`,
@@ -346,6 +353,14 @@ Known quirks, confirmed empirically, not assumed:
 - Re-confirmed during Milestone 1's completion session: still no
   execution tool, still no bulk operation. Not re-assumed each time --
   checked again and found unchanged.
+- Confirmed this session: the lack of a command-execution tool here can
+  be worked around by reading files verbatim through this connector and
+  writing identical copies into Claude's own sandboxed bash environment,
+  then running pytest/Ruff/MyPy there. This confirms the code executes
+  correctly against these exact file contents, but is not the same as
+  confirming it on `C:\Users\gamer\Downloads\claudeOnly` directly --
+  state that distinction plainly whenever this workaround is used, per
+  section 12's verification-honesty rule.
 
 ## 14. Rules that must never change during implementation
 
@@ -369,13 +384,14 @@ Known quirks, confirmed empirically, not assumed:
 
 ## 15. Current Implementation Queue
 
-Status: Milestone 1 content-complete, statically verified, execution-pending
+Status: Milestone 1 complete -- statically audited and dynamically
+executed (sandbox-confirmed against identical on-disk file content; see
+section 13). 55/55 tests passed, 100% coverage, clean Ruff (lint +
+format), clean MyPy strict.
 
 Next Session Goal:
 Begin Milestone 2 (SQLAlchemy models, Alembic migration, repository
-layer). Local execution confirmation of Milestone 1 (self-run pytest/
-ruff/mypy, or via an environment with execution access) can happen
-before, after, or in parallel -- it does not block Milestone 2.
+layer), pending explicit approval.
 
 Files to create (Milestone 2):
 - SQLAlchemy models for the schema in `docs/database.md` (interim: see
