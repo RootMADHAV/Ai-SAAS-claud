@@ -33,5 +33,12 @@ def id_from_string(value: str) -> UUID:
     always 36 characters with hyphens -- so trying ULID first is safe."""
     try:
         return ULID.from_str(value).to_uuid()
-    except (ValueError, TypeError):
+    except (ValueError, TypeError, AttributeError):
+        # AttributeError is included defensively: python-ulid added from_str
+        # in v2/v3; if an older version is installed, the AttributeError would
+        # otherwise propagate instead of falling through to UUID(value).  The
+        # correct package is python-ulid>=3.0 (see pyproject.toml) -- running
+        # ``pip install -e '.[dev]'`` from backend/ will install the right
+        # version.  The UUID() call below will raise ValueError on garbage
+        # input, which is the documented behaviour of id_from_string.
         return UUID(value)

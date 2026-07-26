@@ -1,1 +1,3 @@
-"""Organization, User, Role, Membership entities. Not yet implemented -- see PROJECT_STATE.md."""
+"""Identity & Access bounded context: Organization, User, OrganizationMember,
+AuditLogEntry entities (entities.py). See PROJECT_STATE.md sections 1 and 5.
+"""

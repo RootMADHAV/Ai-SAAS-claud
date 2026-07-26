@@ -32,7 +32,7 @@ def test_severity_comparison_with_unrelated_type() -> None:
     values against arbitrary objects."""
     assert Severity(SeverityLevel.HIGH) != "high"
     with pytest.raises(TypeError):
-        _ = Severity(SeverityLevel.HIGH) < "high"  # type: ignore[operator]
+        _ = Severity(SeverityLevel.HIGH) < "high"
 
 
 def test_severity_sorts_a_list() -> None:

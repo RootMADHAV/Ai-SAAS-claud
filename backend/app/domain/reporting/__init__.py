@@ -1,1 +1,3 @@
-"""Report entity and ReportFormat. Not yet implemented -- see PROJECT_STATE.md."""
+"""Reporting bounded context: Report entity (entities.py). See
+PROJECT_STATE.md section 1.
+"""

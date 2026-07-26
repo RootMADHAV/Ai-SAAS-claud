@@ -175,6 +175,43 @@ relitigate these without a genuine implementation blocker -- see Rules.
   meant to be subclassed, and dataclass inheritance with `__slots__` has
   enough sharp edges that the small memory saving is not worth it for
   something created at "one per finding," not "millions per second."
+- **RLS + soft-delete redesign** (discovered during Milestone 2
+  implementation, not part of the original approved design): the
+  original predicate -- `USING (org_id = current_setting('app.
+  current_org_id') AND deleted_at IS NULL)` -- is unimplementable as a
+  single policy. PostgreSQL checks a table's `SELECT`-relevant `USING`
+  clause against the *new* row on every `UPDATE`, in addition to any
+  `WITH CHECK` given (confirmed against real Postgres 16, and against
+  the pgsql-hackers thread "Bug: RLS policy FOR SELECT is used to check
+  new rows," Oct 2023, which describes this as long-standing, not a
+  version-specific bug). With `deleted_at IS NULL` inside the policy,
+  the very `UPDATE` that performs a soft delete produces a row that
+  fails its own table's read policy -- Postgres rejects it with "new row
+  violates row-level security policy," and no per-command policy split
+  avoids this, since the `SELECT`-side check on the new row is
+  unconditional. Fix: RLS now enforces tenant isolation only
+  (`organization_id`, or `id` for `organizations` itself) --
+  `deleted_at` filtering moved to explicit `WHERE deleted_at IS NULL` in
+  the repository read methods for the five soft-delete tables
+  (`get_by_id`, `get_by_slug`/`get_by_email`/`get_by_identity`/
+  `get_by_fingerprint`, and `Report.list_by_scan`), the same way every
+  other query-level filter in this codebase is expressed. Tenant
+  isolation itself is unaffected -- still fully enforced by the
+  database, not by application code remembering a WHERE clause; only the
+  soft-delete display concern moved, and it never depended on RLS in the
+  first place (`users` has always been soft-deleted with no RLS policy
+  at all, since it has no `organization_id` column). Full account in the
+  DESIGN NOTE at the top of the initial-schema Alembic migration.
+- Every `datetime` column requires an explicit `DateTime(timezone=True)`
+  in its `mapped_column(...)` call (discovered during Milestone 2): a
+  bare `Mapped[datetime]` with no explicit column type silently produces
+  a timezone-*naive* `TIMESTAMP` column, and asyncpg then rejects
+  binding the timezone-aware values this codebase's `utcnow()` produces
+  ("can't subtract offset-naive and offset-aware datetimes"). Every
+  model in `app/infrastructure/db/models/` uses `DateTime(timezone=True)`
+  explicitly for this reason, including columns outside the
+  `TimestampMixin`/`SoftDeleteMixin` pair (which already did this
+  correctly from the start).
 
 ## 4. Folder structure
 
@@ -192,20 +229,21 @@ relitigate these without a genuine implementation blocker -- see Rules.
 │        this document is the interim consolidated substitute)
 ├── backend/
 │   ├── pyproject.toml, Dockerfile (Dockerfile pending)
-│   ├── alembic/versions/
+│   ├── alembic.ini, alembic/env.py, alembic/script.py.mako,
+│   │   alembic/versions/ (initial schema migration, with RLS policies)
 │   ├── app/
 │   │   ├── main.py (pending), config.py
 │   │   ├── domain/
 │   │   │   ├── shared/        (ids, clock, fingerprint, events, enums -- staging, see decisions)
-│   │   │   ├── findings/      (value_objects.py done; entities pending)
-│   │   │   ├── scanning/, assets/, identity/, reporting/   (scaffolded, empty)
+│   │   │   ├── findings/      (value_objects.py, entities.py -- done)
+│   │   │   ├── scanning/, assets/, identity/, reporting/   (entities.py done; behavior/state machines pending)
 │   │   ├── application/
-│   │   │   ├── interfaces/    (ports -- scaffolded, empty)
-│   │   │   ├── identity/, assets/, scanning/, findings/, reporting/  (scaffolded, empty)
+│   │   │   ├── interfaces/    (repository ports for all 5 bounded contexts -- done; ScannerPort/AIProviderPort/EventBusPort/StoragePort pending)
+│   │   │   ├── identity/, assets/, scanning/, findings/, reporting/  (use cases -- scaffolded, empty)
 │   │   ├── infrastructure/
-│   │   │   ├── db/{models,repositories}/, ai_providers/, storage/,
-│   │   │   │   vector_store/, event_bus/, observability/, security/
-│   │   │   │   (all scaffolded, empty)
+│   │   │   ├── db/{base.py, session.py, models/, repositories/}  (done -- all 19 tables, all 5 repositories)
+│   │   │   ├── ai_providers/, storage/, vector_store/, event_bus/,
+│   │   │   │   observability/, security/  (all scaffolded, empty)
 │   │   ├── scanner_engine/
 │   │   │   ├── base_scanner.py (pending)
 │   │   │   └── adapters/{nuclei,nmap,burp,zap,reconx,bughunter,sqlmap}/
@@ -214,8 +252,10 @@ relitigate these without a genuine implementation blocker -- see Rules.
 │   │   ├── ai_agents/   (scaffolded, empty; analysis_service.py pending)
 │   │   ├── api/v1/      (scaffolded, empty)
 │   │   └── workers/     (scaffolded, empty)
-│   └── tests/unit/   (config, ids, clock, fingerprint, events,
-│                       value_objects -- all six done)
+│   └── tests/
+│       ├── conftest.py  (async Postgres fixtures -- rewritten in Milestone 2; see docs/implementation_progress.md for the discovered stray-file note)
+│       ├── unit/    (config, ids, clock, fingerprint, events, value_objects, domain_entities -- all seven done)
+│       └── integration/  (support.py + repository/session integration suite, all against real Postgres)
 └── frontend/   (Phase 3, not started)
 ```
 
@@ -223,45 +263,91 @@ relitigate these without a genuine implementation blocker -- see Rules.
 
 | Entity | Lives in | Key invariant / behavior |
 |---|---|---|
-| Organization / Membership | identity/ | >= 1 Owner always; cannot remove the last one |
-| Finding | findings/ | state machine `new -> triaged -> {confirmed, false_positive} -> {fixed, accepted_risk, wont_fix}`; `effective_severity` prefers CVSS over an AI estimate |
+| Organization / Membership | identity/ | >= 1 Owner always; cannot remove the last one (rule not yet enforced -- see below) |
+| Finding | findings/ | state machine `new -> triaged -> {confirmed, false_positive} -> {fixed, accepted_risk, wont_fix}`; `effective_severity` prefers CVSS over an AI estimate -- **implemented, tested** |
 | Severity (value object) | findings/ | ordered: info < low < medium < high < critical -- **implemented, tested** |
 | CVSS (value object) | findings/ | validates 0.0-10.0 + vector format; derives band from score -- **implemented, tested** |
-| Asset | assets/ | current-state cache; identity = `(org_id, asset_type, normalized value)` |
-| AssetObservation | assets/ | append-only; recording one updates the Asset cache |
-| Scan | scanning/ | state machine `queued -> running -> {completed, failed, cancelled}`, derived from its workflow steps |
-| WorkflowStep | scanning/ | `pending -> running -> {completed, failed, skipped}`, independently retryable |
+| Asset | assets/ | current-state cache; identity = `(org_id, asset_type, normalized value)` -- **implemented, tested** |
+| AssetObservation | assets/ | append-only; recording one updates the Asset cache -- **implemented, tested** |
+| Scan | scanning/ | state machine `queued -> running -> {completed, failed, cancelled}`, derived from its workflow steps -- **implemented, tested** (derivation logic itself is Milestone 3) |
+| WorkflowStep | scanning/ | `pending -> running -> {completed, failed, skipped}`, independently retryable -- **implemented, tested** |
 
-Only Severity and CVSS are implemented as of this update; the rest are
-designed (schema in decisions above) but not yet coded.
+As of this update, all entities listed above are implemented as plain
+data-carrying dataclasses (Milestone 2) -- see
+`app/domain/*/entities.py`. "Implemented, tested" here means the entity
+shape and any already-decided computed properties (e.g.
+`Finding.effective_severity`); it does **not** mean the state-machine
+transition rules or the aggregate-level `>= 1 Owner` invariant are
+enforced yet -- those require application-layer use cases (repository
+ports and their SQLAlchemy implementations exist as of Milestone 2;
+the use cases that call them do not, and are future-milestone work, per
+the scope note in each `entities.py`).
 
 ## 6. Current implementation status
 
 Milestone 1 (Foundation) is complete: all 16 expected files exist,
 content audited (imports traced, naming/domain-purity/documentation
 checked), and dynamically executed -- pytest, Ruff (lint + format), and
-MyPy strict all run and passing against these exact file contents. That
-execution ran in Claude's own sandboxed environment, not on this machine
-directly (this Filesystem MCP still has no command-execution tool -- see
-section 13), against files read byte-for-byte from this repository and
-written unmodified into the sandbox. It is not confirmation that the
-commands succeed on `C:\Users\gamer\Downloads\claudeOnly` itself; that
-remains a one-time manual step if bit-for-bit local confirmation matters.
-Directory scaffolding for the entire approved architecture is complete.
-Milestones 2-7 and Phases 3-10 not started. See
+MyPy strict all run and passing against these exact file contents.
+
+Milestone 2 (persistence layer) is complete as of this session: SQLAlchemy
+async ORM models for all 19 tables across all six bounded contexts, plain
+domain entities for all five bounded contexts, repository ports
+(`*RepositoryPort` ABCs) and their SQLAlchemy-backed implementations for
+all five aggregates, and a hand-written initial Alembic migration
+including Row-Level Security policies. 102 tests (55 unit carried over
+from Milestone 1 unchanged, 9 new unit tests for domain entities, 38
+integration tests against a real PostgreSQL 16 instance), 100% coverage,
+clean Ruff (lint + format), clean MyPy strict. The migration was applied
+to a real Postgres instance, exercised by the full integration suite,
+downgraded to nothing, and re-upgraded cleanly (`alembic downgrade base`
+then `alembic upgrade head`), proving reversibility rather than assuming
+it. RLS tenant isolation was proven both by raw SQL (two sessions scoped
+to different orgs, each seeing only its own row) and by the automated
+`test_rls_isolates_*_between_tenants` tests. Two genuine implementation
+gaps were discovered and fixed during this milestone -- see section 3's
+dated entries ("RLS + soft-delete redesign" and the `DateTime(timezone=
+True)` note) for the full account of each, since both count as design
+gaps under section 12's workflow rule, not ordinary bugs.
+
+As with Milestone 1's verification, this execution ran in Claude's own
+sandboxed environment (with a local PostgreSQL 16 instance installed for
+the purpose), not on `C:\Users\gamer\Downloads\claudeOnly` directly --
+this Filesystem MCP still has no command-execution tool (see section 13).
+Every file was then written to this repository via the Filesystem MCP
+file-by-file, matching the sandbox-verified content exactly (spot-checked
+by byte count on at least one large file, the initial migration). Local
+re-verification on the actual machine remains a one-time manual step if
+bit-for-bit confirmation there matters -- see the self-verification
+command in `docs/implementation_progress.md`.
+
+Milestones 3-7 and Phases 3-10 not started. See
 `docs/implementation_progress.md` for the live version of this section.
 
 ## 7. Completed work
 
-Config system (role-based, fail-fast), ULID id generation, fingerprint
-hashing, DomainEvent base, domain enums (staged), Severity/CVSS value
-objects with full test coverage, full repository directory scaffold (37
-directories, 34 `__init__.py` placeholders), three permanent-memory
-documents, and a full static audit of the above (imports, naming,
-architecture-layer purity, documentation) with zero issues found. 55
-tests total, 100% coverage, clean Ruff, clean MyPy strict -- verified in
-the sandbox prior to the Filesystem MCP pivot; not re-executed in this
-location since.
+Milestone 1: config system (role-based, fail-fast), ULID id generation,
+fingerprint hashing, DomainEvent base, domain enums (staged),
+Severity/CVSS value objects with full test coverage, full repository
+directory scaffold (37 directories, 34 `__init__.py` placeholders),
+three permanent-memory documents, and a full static audit of the above
+(imports, naming, architecture-layer purity, documentation) with zero
+issues found.
+
+Milestone 2: SQLAlchemy async ORM models for all 19 tables (identity.py,
+assets.py, scanning.py, findings.py, reporting.py, platform.py), plain
+domain entities for all five bounded contexts (identity, assets,
+scanning, findings, reporting), repository ports and SQLAlchemy-backed
+implementations for all five aggregates, Alembic migration infrastructure
+(alembic.ini, async env.py, initial migration with hand-written RLS
+policies), and a corrected `tests/conftest.py` (see
+`docs/implementation_progress.md` for why the previous version was
+replaced). 102 tests total (64 unit, 38 integration), 100% coverage,
+clean Ruff, clean MyPy strict -- verified in the sandbox (with a local
+PostgreSQL 16 instance) and transplanted file-by-file into this
+repository via the Filesystem MCP; not re-executed in this location
+since, per the same caveat that has applied since Milestone 1's
+completion (no execution tool available through this connector).
 
 ## 8. Remaining work
 
@@ -327,12 +413,12 @@ file should not need editing that often.
 
 ## 13. Filesystem workflow
 
-Project root: `C:\Users\gamer\Downloads\claudeOnly` (no space -- corrected
-this session; every prior reference to "claude only" with a space was a
-documentation typo, caught by comparing against `list_allowed_directories`,
-which is the authoritative source), accessed via the Filesystem MCP (not
-the sandbox -- the sandbox holds an earlier, now-superseded copy of
-Milestone 1 that was transplanted here file by file).
+Project root: `C:\Users\gamer\Downloads\claudeOnly` (no space; every
+prior reference to "claude only" with a space was a documentation typo
+from an earlier session, caught by comparing against
+`list_allowed_directories`, which is the authoritative source), accessed
+via the Filesystem MCP (not the sandbox -- the sandbox is a disposable
+verification environment used per-session, never the source of truth).
 
 Tools available: `list_allowed_directories`, `list_directory`,
 `list_directory_with_sizes`, `directory_tree`, `get_file_info`,
@@ -384,17 +470,24 @@ Known quirks, confirmed empirically, not assumed:
 
 ## 15. Current Implementation Queue
 
-Status: Milestone 1 complete -- statically audited and dynamically
-executed (sandbox-confirmed against identical on-disk file content; see
-section 13). 55/55 tests passed, 100% coverage, clean Ruff (lint +
-format), clean MyPy strict.
+Status: Milestone 2 complete -- SQLAlchemy models, Alembic migration (with
+RLS), and repository layer (ports + implementations) for all five
+bounded contexts. 102 tests passing (64 unit, 38 integration against
+real PostgreSQL), 100% coverage, clean Ruff (lint + format), clean MyPy
+strict. Migration verified reversible; RLS tenant isolation verified
+both via raw SQL and automated tests. See section 6 and section 3's
+dated entries for the two implementation gaps discovered and fixed this
+milestone (RLS + soft-delete redesign; `DateTime(timezone=True)`).
 
 Next Session Goal:
-Begin Milestone 2 (SQLAlchemy models, Alembic migration, repository
-layer), pending explicit approval.
+Begin Milestone 3 (Scanner engine -- Nuclei adapter -- + StoragePort +
+target validation), pending explicit approval.
 
-Files to create (Milestone 2):
-- SQLAlchemy models for the schema in `docs/database.md` (interim: see
-  the DDL described across the architecture-review chat history)
-- Alembic migration
-- Repository implementations of the repository ports
+Files to create (Milestone 3, per the roadmap in
+docs/implementation_progress.md): `ScannerPort` (ActiveScanner/
+ImportScanner split, per the locked decision in section 1), the Nuclei
+adapter under `app/scanner_engine/adapters/nuclei/`, `StoragePort` +
+a MinIO-backed implementation, and target validation (argument-list
+subprocess calls, enforced timeouts, non-root, RFC1918/loopback/
+link-local rejection -- per the scanner execution isolation decision in
+section 3).
