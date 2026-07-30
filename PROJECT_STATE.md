@@ -238,23 +238,27 @@ relitigate these without a genuine implementation blocker -- see Rules.
 │   │   │   ├── findings/      (value_objects.py, entities.py -- done)
 │   │   │   ├── scanning/, assets/, identity/, reporting/   (entities.py done; behavior/state machines pending)
 │   │   ├── application/
-│   │   │   ├── interfaces/    (repository ports for all 5 bounded contexts -- done; ScannerPort/AIProviderPort/EventBusPort/StoragePort pending)
+│   │   │   ├── interfaces/    (repository ports for all 5 bounded contexts -- done; ScannerPort/StoragePort done (Milestone 3); AIProviderPort/EventBusPort pending)
 │   │   │   ├── identity/, assets/, scanning/, findings/, reporting/  (use cases -- scaffolded, empty)
 │   │   ├── infrastructure/
 │   │   │   ├── db/{base.py, session.py, models/, repositories/}  (done -- all 19 tables, all 5 repositories)
-│   │   │   ├── ai_providers/, storage/, vector_store/, event_bus/,
-│   │   │   │   observability/, security/  (all scaffolded, empty)
+│   │   │   ├── storage/  (done -- MinioStoragePort, Milestone 3)
+│   │   │   ├── security/  (done -- target_validation.py, Milestone 3)
+│   │   │   ├── ai_providers/, vector_store/, event_bus/,
+│   │   │   │   observability/  (all scaffolded, empty)
 │   │   ├── scanner_engine/
-│   │   │   ├── base_scanner.py (pending)
+│   │   │   ├── base_scanner.py  (done -- run_scanner_subprocess, Milestone 3)
 │   │   │   └── adapters/{nuclei,nmap,burp,zap,reconx,bughunter,sqlmap}/
-│   │   │       (scaffolded, empty; nuclei/ is the Milestone 3 target,
-│   │   │        the rest are Milestone/Phase 4 stubs)
+│   │   │       (nuclei/ done -- NucleiAdapter, Milestone 3; the rest
+│   │   │        remain scaffolded, empty Phase 4 stubs)
 │   │   ├── ai_agents/   (scaffolded, empty; analysis_service.py pending)
 │   │   ├── api/v1/      (scaffolded, empty)
 │   │   └── workers/     (scaffolded, empty)
 │   └── tests/
 │       ├── conftest.py  (async Postgres fixtures -- rewritten in Milestone 2; see docs/implementation_progress.md for the discovered stray-file note)
-│       ├── unit/    (config, ids, clock, fingerprint, events, value_objects, domain_entities -- all seven done)
+│       ├── unit/    (config, ids, clock, fingerprint, events, value_objects,
+│       │         domain_entities, base_scanner, target_validation,
+│       │         minio_storage, nuclei_adapter -- all eleven done)
 │       └── integration/  (support.py + repository/session integration suite, all against real Postgres)
 └── frontend/   (Phase 3, not started)
 ```
@@ -321,7 +325,36 @@ re-verification on the actual machine remains a one-time manual step if
 bit-for-bit confirmation there matters -- see the self-verification
 command in `docs/implementation_progress.md`.
 
-Milestones 3-7 and Phases 3-10 not started. See
+Milestone 3 (Scanner engine -- Nuclei adapter -- + StoragePort + target
+validation) is complete. Process note, recorded per section 12's
+verification-honesty rule: the implementation -- `ScannerPort`
+(`ActiveScanner`/`ImportScanner` split), `StoragePort`,
+`run_scanner_subprocess` (argument-list-only, enforced timeout, non-root
+guard), `validate_target` (DNS-rebinding-aware SSRF/private/loopback/
+link-local/cloud-metadata guard), `MinioStoragePort` (official
+synchronous `minio` SDK wrapped in `asyncio.to_thread`), and
+`NucleiAdapter` -- was already present on disk, complete and correct, at
+the start of the session that closed this milestone out, despite this
+file and `docs/implementation_progress.md` both stating Milestone 3 as
+"not started" going into that session. That session's actual work was:
+discovering the discrepancy by inspecting the repository before writing
+anything (per this file's own instruction that the repository is ground
+truth over documents that may lag), auditing the existing code against
+every relevant locked decision in section 3, dynamically verifying it in
+a sandbox for the first time (105 unit tests total, 100% coverage on
+every Milestone 3 module, clean Ruff, clean MyPy strict on all 74 source
+files), fixing one stale docstring (`scanner_engine/adapters/__init__.py`
+still read "Not yet implemented"), and this documentation update -- not
+fresh implementation, since none was needed. Full account in
+`docs/session_state.md`. The Postgres integration suite (38 tests) was
+not re-executed in that session, since Milestone 3 touched no
+persistence-layer code; `MinioStoragePort` and `NucleiAdapter` are
+currently verified only against unit-level mocks of their external
+dependency (no real MinIO server or `nuclei` binary was reachable in
+that environment) -- see `docs/implementation_progress.md`'s Technical
+debt list.
+
+Milestones 4-7 and Phases 3-10 not started. See
 `docs/implementation_progress.md` for the live version of this section.
 
 ## 7. Completed work
@@ -348,6 +381,17 @@ PostgreSQL 16 instance) and transplanted file-by-file into this
 repository via the Filesystem MCP; not re-executed in this location
 since, per the same caveat that has applied since Milestone 1's
 completion (no execution tool available through this connector).
+
+Milestone 3: `ScannerPort` (`ActiveScanner`/`ImportScanner` split),
+`StoragePort`, `run_scanner_subprocess` (argument-list-only subprocess
+execution, enforced timeout, non-root guard), `validate_target`
+(DNS-rebinding-aware SSRF/private/loopback/link-local/cloud-metadata
+guard), `MinioStoragePort`, and `NucleiAdapter`. 105 unit tests total
+(41 new this milestone), 100% coverage on every Milestone 3 module,
+clean Ruff, clean MyPy strict. See section 6 for the process note on how
+this milestone was closed out -- the implementation was found already
+complete on disk and was audited and dynamically verified rather than
+written from scratch.
 
 ## 8. Remaining work
 
@@ -470,24 +514,25 @@ Known quirks, confirmed empirically, not assumed:
 
 ## 15. Current Implementation Queue
 
-Status: Milestone 2 complete -- SQLAlchemy models, Alembic migration (with
-RLS), and repository layer (ports + implementations) for all five
-bounded contexts. 102 tests passing (64 unit, 38 integration against
-real PostgreSQL), 100% coverage, clean Ruff (lint + format), clean MyPy
-strict. Migration verified reversible; RLS tenant isolation verified
-both via raw SQL and automated tests. See section 6 and section 3's
-dated entries for the two implementation gaps discovered and fixed this
-milestone (RLS + soft-delete redesign; `DateTime(timezone=True)`).
+Status: Milestone 3 complete -- `ScannerPort`/`StoragePort`, the shared
+`run_scanner_subprocess` execution guarantees, `validate_target`,
+`MinioStoragePort`, and `NucleiAdapter`. 105 unit tests passing, 100%
+coverage on every Milestone 3 module, clean Ruff (lint + format), clean
+MyPy strict. See section 6 for the process note on this milestone: the
+implementation was discovered already complete on disk at the start of
+the session that closed it out (docs had fallen out of sync with the
+repository), and that session's work was auditing it against every
+locked decision, dynamically verifying it, fixing one stale docstring,
+and this documentation update.
 
 Next Session Goal:
-Begin Milestone 3 (Scanner engine -- Nuclei adapter -- + StoragePort +
-target validation), pending explicit approval.
+Begin Milestone 4 (Processing pipeline orchestrator), pending explicit
+approval.
 
-Files to create (Milestone 3, per the roadmap in
-docs/implementation_progress.md): `ScannerPort` (ActiveScanner/
-ImportScanner split, per the locked decision in section 1), the Nuclei
-adapter under `app/scanner_engine/adapters/nuclei/`, `StoragePort` +
-a MinIO-backed implementation, and target validation (argument-list
-subprocess calls, enforced timeouts, non-root, RFC1918/loopback/
-link-local rejection -- per the scanner execution isolation decision in
-section 3).
+Files to create (Milestone 4, per the roadmap in
+docs/implementation_progress.md): the pipeline orchestrator implementing
+the locked `validate_target -> execute_scanner -> normalize ->
+deduplicate -> correlate -> enrich -> ai_analyze -> persist` sequence
+(section 3) as explicit `scan_workflow_steps` rows, wired to the
+Milestone 3 `ScannerPort`/`NucleiAdapter` and the Milestone 2 repository
+layer.

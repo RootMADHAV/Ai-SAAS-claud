@@ -1,0 +1,100 @@
+# docker-compose.dev.yml
+#
+# LOCAL DEV/VERIFICATION INFRASTRUCTURE ONLY -- this is NOT the
+# Milestone 7 deliverable and is not part of the application.
+#
+# `docker-compose.yml` (project root, no suffix) is a deliberate
+# placeholder reserved for Milestone 7's full service topology --
+# backend, worker, scanner-worker, frontend, with real network
+# segmentation (scan-egress vs internal) -- per its own comments and
+# PROJECT_STATE.md sections 1 and 3. This file does not touch that one
+# and defines no application services, because no Dockerfile or
+# `app/main.py` entrypoint exists yet for any of them to run (see
+# PROJECT_STATE.md section 4).
+#
+# What this file is for: giving you real PostgreSQL, MinIO, and Redis
+# instances to run this project's own documented self-verification
+# commands against (docs/implementation_progress.md "Testing status"),
+# and to close two Milestone 3 technical-debt items (docs/
+# implementation_progress.md "Technical debt" #6/#7: MinioStoragePort
+# and NucleiAdapter are currently verified only against unit-level
+# mocks, since no real MinIO server or `nuclei` binary was reachable in
+# the environment that verified Milestone 3).
+#
+# Postgres role note: app_user is deliberately created as a
+# non-superuser role by docker/dev-init/01-create-app-role-and-test-db.sql,
+# not via POSTGRES_USER here -- see that script's own comment for why
+# (a superuser bypasses Row-Level Security unconditionally, which would
+# make this project's RLS tenant-isolation tests pass locally for the
+# wrong reason).
+#
+# Usage:
+#   docker compose -f docker-compose.dev.yml up -d
+#   docker compose -f docker-compose.dev.yml ps          # wait for "healthy"
+#   docker compose -f docker-compose.dev.yml down        # stop, keep data
+#   docker compose -f docker-compose.dev.yml down -v     # stop, wipe data
+#
+# Then, from backend/, with a virtualenv active:
+#   pip install -e ".[dev]"
+#   export DATABASE_URL=postgresql+asyncpg://app_user:app_password@localhost:5432/security_platform
+#   export TEST_DATABASE_URL=postgresql+asyncpg://app_user:app_password@localhost:5432/security_platform_test
+#   alembic upgrade head
+#   DATABASE_URL=$TEST_DATABASE_URL alembic upgrade head   # test db needs the schema too
+#   pytest -v
+#   ruff check . && ruff format --check . && mypy app
+#
+# Full local .env values (MinIO/Redis, matching .env.example's names):
+#   REDIS_URL=redis://localhost:6379/0
+#   MINIO_ENDPOINT=localhost:9000
+#   MINIO_ROOT_USER=dev_minio_user
+#   MINIO_ROOT_PASSWORD=dev_minio_password
+
+services:
+  postgres:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_PASSWORD: postgres_admin_password_local_only
+    ports:
+      - "5432:5432"
+    volumes:
+      - security_platform_dev_pgdata:/var/lib/postgresql/data
+      - ./docker/dev-init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  minio:
+    image: minio/minio:latest
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: dev_minio_user
+      MINIO_ROOT_PASSWORD: dev_minio_password
+    ports:
+      - "9000:9000" # S3-compatible API -- what MinioStoragePort talks to
+      - "9001:9001" # web console, http://localhost:9001
+    volumes:
+      - security_platform_dev_miniodata:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  security_platform_dev_pgdata:
+  security_platform_dev_miniodata:

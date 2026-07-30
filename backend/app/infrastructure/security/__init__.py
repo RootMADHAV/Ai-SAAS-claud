@@ -1,2 +1,4 @@
 """Shared SSRF/target-validation guard used by every scanner adapter.
-Not yet implemented -- see PROJECT_STATE.md."""
+
+Milestone 3: ``target_validation.py`` (``validate_target``,
+``ValidatedTarget``, ``TargetValidationError``)."""
