@@ -10,7 +10,7 @@ AI-Powered Cybersecurity SaaS Platform (working name; no product name
 chosen yet)
 
 ## Current version
-Pre-release, Milestone 3 (scanner engine foundation) complete -- no version tag yet.
+Pre-release, Milestone 4 (processing pipeline orchestrator) complete -- no version tag yet.
 
 ## Overall roadmap
 
@@ -34,7 +34,7 @@ Phase 2 is broken into its own milestones:
 | 1 | Foundation: config, IDs, enums, value objects, common utilities, tests | Complete (statically audited + dynamically verified) |
 | 2 | DB models + Alembic migration + repositories | Complete (statically audited + dynamically verified) |
 | 3 | Scanner engine (Nuclei adapter) + StoragePort + target validation | Complete (statically audited + dynamically verified) |
-| 4 | Processing pipeline orchestrator | Not started |
+| 4 | Processing pipeline orchestrator | Complete (dynamically verified) |
 | 5 | API layer (public + internal split) | Not started |
 | 6 | AI analysis service | Not started |
 | 7 | Docker Compose wired end-to-end | Not started |
@@ -43,16 +43,14 @@ Phase 2 is broken into its own milestones:
 Phase 2 (MVP backend)
 
 ## Current milestone
-Milestone 3 (Scanner engine -- Nuclei adapter -- + StoragePort + target
-validation) -- complete. `ScannerPort` (ActiveScanner/ImportScanner
-split), `StoragePort`, the shared `run_scanner_subprocess` execution
-guarantees (argument-list-only, enforced timeout, non-root), the SSRF/
-target-safety guard, a MinIO-backed `StoragePort` implementation, and the
-first concrete `ActiveScanner` (`NucleiAdapter`) all exist and are
-dynamically verified (105 unit tests total, 100% coverage on every
-Milestone 3 module, clean Ruff, clean MyPy strict). See "Completed
-milestones" below for the full account, including a process note this
-milestone is unusual in requiring.
+Milestone 4 (Processing pipeline orchestrator) -- complete.
+`derive_scan_status()`/`PIPELINE_STEP_ORDER` (domain layer),
+`TriggerScanUseCase`, `normalize_scan_output()`/`NormalizedFinding`, and
+`RunScanWorkflowUseCase` (application layer, `app/application/
+scanning/`) all exist and are dynamically verified (44 new tests: 41
+unit, 3 integration against real Postgres; 100% coverage on every
+Milestone 4 module, clean Ruff, clean MyPy strict). See "Completed
+milestones" below for the full account.
 
 ## Completed milestones
 **Milestone 1 (Foundation) -- complete**, as of the prior session. See
@@ -183,11 +181,103 @@ and this documentation correction -- not fresh implementation, since none
 was needed. See `docs/session_state.md` for the full account of the
 discovery and what was and wasn't touched as a result.
 
+**Milestone 4 (Processing pipeline orchestrator) -- complete.** Genuine
+fresh implementation this session, unlike Milestone 3's discovery.
+Delivered:
+- `derive_scan_status()` and the `PIPELINE_STEP_ORDER` constant, added
+  to `app/domain/scanning/entities.py` (extending, not rewriting, the
+  Milestone 2 file -- `Scan`/`ScanWorkflowStep`/`ScanScope` are
+  untouched). Pure domain logic, zero framework imports: any step
+  `FAILED` -> `FAILED`; every step `COMPLETED`/`SKIPPED` -> `COMPLETED`;
+  otherwise `RUNNING`. This also corrects a stale cross-reference: the
+  `Scan` row in PROJECT_STATE.md section 5 previously said this
+  derivation logic was "Milestone 3" -- checked against Milestone 3's
+  actual delivered scope (the paragraph above) and found never true;
+  corrected to "Milestone 4" now that the function exists.
+- `TriggerScanUseCase` (`app/application/scanning/trigger_scan.py`) --
+  creates a `Scan` (status `QUEUED`) plus all eight `ScanWorkflowStep`
+  rows (status `PENDING`) in the locked pipeline order. Deliberately
+  does not call `validate_target` itself -- that is the pipeline's own
+  first step, not duplicated here.
+- `normalize_scan_output()`/`NormalizedFinding`
+  (`app/application/scanning/normalization.py`) -- turns nuclei's raw
+  JSONL bytes into structured, scanner-native (not yet validated)
+  fields: title, host, matched-at, raw severity string, CVE IDs, CVSS
+  score/vector candidates, and the full raw match object. Lives in the
+  application layer, not `scanner_engine/`, because `ScanOutput`'s own
+  docstring already commits Scanning to stop at "here is exactly what
+  the scanner said" and defer interpretation to this exact step; a
+  `NormalizerPort` was deliberately not built, since only one output
+  format (`nuclei-jsonl`) exists to normalize -- see PROJECT_STATE.md
+  section 3's dated entry.
+- `RunScanWorkflowUseCase` (`app/application/scanning/
+  run_scan_workflow.py`) -- the orchestrator itself. `execute(scan_id)`
+  walks all eight steps in the locked order
+  (`validate_target -> execute_scanner -> normalize -> deduplicate ->
+  correlate -> enrich -> ai_analyze -> persist`), updating each step's
+  `ScanWorkflowStep` row (`RUNNING` -> `COMPLETED`/`FAILED`,
+  `retry_count` incremented only on a genuine retry of a prior
+  failure), then sets `Scan.status` via `derive_scan_status`. Wired to
+  the Milestone 3 `ScannerPort`/`NucleiAdapter` (constructor-injected
+  `ActiveScanner`) and the Milestone 2 `ScanRepositoryPort`/
+  `AssetRepositoryPort`/`FindingRepositoryPort` implementations, exactly
+  as section 15's queue specified. A step failure is recorded on its
+  row and reflected in `Scan.status` (`FAILED`), then the exception is
+  suppressed rather than propagated to the caller -- a failed scan is a
+  normal business outcome the caller reads off the returned `Scan`, not
+  something every call site needs a `try`/`except` to learn about;
+  `LookupError` (unknown scan, missing workflow steps) and
+  `ScannerMismatchError` (wrong adapter wired for this scan's
+  `scanner_name`) still raise, since those are genuine misuse, not scan
+  outcomes.
+  - Resumability: `EXECUTE_SCANNER` is the one step treated as
+    expensive/non-idempotent -- once its row is `COMPLETED`, the real
+    scanner is never invoked again for that scan; its raw output is
+    read back from `StoragePort` under a deterministic
+    `{scan_id}/raw-output` key instead. Every other step is safe to
+    recompute on every invocation (pure reads, or guarded against
+    duplicate writes by checking for an existing `(scan_id, asset_id)`
+    observation / `(scan_id, finding_id)` occurrence before inserting).
+    This gives real "retry from the failed step" behavior for the
+    realistic case (a transient failure, fixed, then the same scan
+    retried) -- see Technical debt below for the one case this does not
+    cover.
+  - `AI_ANALYZE` is unconditionally marked `SKIPPED` -- `AIProviderPort`
+    and an `AnalysisService` are Milestone 6 scope and do not exist yet;
+    `SKIPPED` is an already-modeled terminal state
+    (PROJECT_STATE.md section 5), not a fabricated result, and still
+    counts as "done" for `derive_scan_status`.
+  - `enrich` validates a scanner-reported CVSS candidate into a real
+    `CVSS` value object (dropping it, not failing the scan, if
+    invalid), but deliberately never writes nuclei's own raw
+    self-reported severity string into `Finding.ai_severity_level` --
+    that field is named for an AI provider's own estimate (Milestone 6),
+    and writing scanner data into it would misrepresent provenance. The
+    raw severity claim is not lost: it travels in
+    `FindingOccurrence.raw_evidence` (the full raw scanner match
+    object).
+- 44 new tests: `tests/unit/test_scan_status_derivation.py` (7),
+  `tests/unit/test_normalization.py` (9),
+  `tests/unit/test_trigger_scan.py` (4),
+  `tests/unit/test_run_scan_workflow.py` (21, every port faked --
+  step sequencing, retry/resumption including the two branches where a
+  later-step failure must not re-invoke the scanner or re-enter
+  `AI_ANALYZE`, recurrence across two scans of the same target, mixed
+  IP/domain asset correlation, and a direct test of `_persist`'s
+  defensive `asset_id` guard), and
+  `tests/integration/test_scan_pipeline_orchestrator.py` (3, against
+  real Postgres via the actual `SqlAlchemyScanRepository`/
+  `SqlAlchemyAssetRepository`/`SqlAlchemyFindingRepository`
+  implementations, with only the scanner and object storage faked --
+  no real `nuclei` binary or MinIO server available, same constraint as
+  Milestone 3). 100% coverage on every Milestone 4 module, clean Ruff
+  (lint + format), clean MyPy strict.
+
 ## In-progress milestone
-None. Milestone 3 is now complete; Milestone 4 has not started.
+None. Milestone 4 is now complete; Milestone 5 has not started.
 
 ## Remaining milestones
-Milestones 4-7 (see roadmap table above), then Phases 3-10.
+Milestones 5-7 (see roadmap table above), then Phases 3-10.
 
 ## Architecture status
 One amendment this session: the RLS + soft-delete predicate
@@ -210,6 +300,18 @@ implementation (see "Completed milestones" above) was audited against
 every relevant locked decision in PROJECT_STATE.md section 3 and found
 consistent with all of them -- no design gap, and therefore no amendment
 to record here.
+
+Milestone 4 session: no changes to already-locked architecture, but
+four new dated entries were added to PROJECT_STATE.md section 3 (Scan
+status derivation; pipeline resumability as actually implemented;
+`AI_ANALYZE`/event-bus/scanner-registry scope boundaries; CVSS/severity
+provenance) -- each fills in a decision this project's own prior
+documentation had explicitly deferred (e.g. the `Scan` domain-model row
+in PROJECT_STATE.md section 5 always said derivation logic was pending a
+later milestone), rather than overriding anything previously locked.
+One stale cross-reference was corrected (Scan status derivation
+misattributed to "Milestone 3" in section 5's table, corrected to
+"Milestone 4") -- a documentation fix, not an architecture change.
 
 ## Testing status
 102 tests total (64 unit -- 55 from Milestone 1 unchanged plus 9 new for
@@ -277,6 +379,50 @@ MinIO server or `nuclei` binary was reachable in this environment to
 build an equivalent real-server integration test against, a weaker tier
 than Milestone 2's real-Postgres integration suite. See "Technical
 debt" below.
+
+**Milestone 4 addendum.** 44 new tests: 41 unit
+(`test_scan_status_derivation.py`, `test_normalization.py`,
+`test_trigger_scan.py`, `test_run_scan_workflow.py`) plus 3 integration
+(`test_scan_pipeline_orchestrator.py`, against real Postgres). 100%
+coverage on every Milestone 4 module (`entities.py`'s new additions,
+`normalization.py`, `trigger_scan.py`, `run_scan_workflow.py`), clean
+Ruff (`check` and `format --check`), clean MyPy strict. Execution ran in
+Claude's sandbox as usual (PROJECT_STATE.md section 13).
+
+The sandbox reconstruction for this milestone was the most extensive
+yet, stated plainly rather than glossed over: `RunScanWorkflowUseCase`
+genuinely depends on essentially the whole backend (domain entities,
+config, all six ORM model modules, all five repository
+implementations from Milestones 1-2, plus `ScannerPort`/`StoragePort`/
+`target_validation`/`NucleiAdapter` from Milestone 3), so all of it was
+read verbatim from `C:\Users\gamer\Downloads\claudeOnly` through the
+Filesystem MCP this session and reconstructed file-by-file in the
+sandbox before any Milestone 4 code was written or run. This is not a
+renewed byte-for-byte re-verification of the Milestone 1-3 test suites
+themselves -- those test files were not copied into the sandbox this
+session, only their source modules were (for import purposes), so
+Milestone 1-3's own "105 unit passed"/"38 integration passed" results
+are unchanged from their own sessions, not re-confirmed here. What this
+session's integration test newly confirms: the real, unmodified
+Milestone 2 repository implementations still behave correctly end-to-end
+(create, natural-key lookup, RLS-scoped session usage) when driven by
+this milestone's new orchestrator against a real Postgres 16 instance,
+not merely assumed unchanged because no Milestone 1-3 file was edited.
+
+Every new Milestone 4 file, and the one modified Milestone 2 file
+(`app/domain/scanning/entities.py`, extended not rewritten), was written
+into the real repository via the Filesystem MCP and spot-checked by byte
+count against the sandbox-verified source -- for every new file this
+time (`normalization.py`: 5508 bytes; `trigger_scan.py`: 2166 bytes;
+`run_scan_workflow.py`: 22052 bytes; `test_run_scan_workflow.py`: 25678
+bytes; `test_scan_pipeline_orchestrator.py`: 9979 bytes), all matching
+exactly. `entities.py`'s edit was applied surgically via `edit_file`
+against the real file's own exact original text (not the sandbox
+reconstruction's paraphrase of it), so its post-edit byte count
+naturally differs slightly from the sandbox copy by the few bytes of
+pre-existing wording the sandbox reconstruction had paraphrased rather
+than quoted verbatim -- expected, and does not affect the correctness of
+the applied edit, which is anchored to the real file's verbatim text.
 
 ## Files created
 Code (Milestone 1, complete, all 16 files present, audited, and
@@ -360,15 +506,43 @@ Documentation:
 Milestone 3's completion and the documentation-lag discovery described
 above.
 
+Code (Milestone 4, complete, dynamically verified, genuine fresh
+implementation this session):
+- `backend/app/application/scanning/trigger_scan.py` (new)
+- `backend/app/application/scanning/normalization.py` (new)
+- `backend/app/application/scanning/run_scan_workflow.py` (new)
+- `backend/tests/unit/test_scan_status_derivation.py` (new)
+- `backend/tests/unit/test_normalization.py` (new)
+- `backend/tests/unit/test_trigger_scan.py` (new)
+- `backend/tests/unit/test_run_scan_workflow.py` (new)
+- `backend/tests/integration/test_scan_pipeline_orchestrator.py` (new)
+
+Modified (Milestone 4, this session):
+- `backend/app/domain/scanning/entities.py`: extended (not rewritten)
+  with `PIPELINE_STEP_ORDER` and `derive_scan_status()`, plus an updated
+  module docstring paragraph explaining the derivation rule's new home;
+  `Scan`, `ScanWorkflowStep`, and `ScanScope` themselves are byte-for-
+  byte unchanged from Milestone 2.
+- `backend/app/application/scanning/__init__.py`: docstring corrected
+  from "Not yet implemented" to describe the three files now present,
+  the same pattern as the Milestone 3 `scanner_engine/adapters/
+  __init__.py` docstring fix.
+
+Documentation (Milestone 4, this session):
+`docs/session_state.md`, `docs/implementation_progress.md` (this file),
+`PROJECT_STATE.md` -- all three updated to record Milestone 4's
+completion, including the two flagged design decisions and the stale
+Milestone-3 cross-reference corrected in PROJECT_STATE.md section 5.
+
 ## Files pending
 - All actual domain/application/infrastructure code behind the scaffolded
-  packages that Milestones 2-3 did not cover (Milestones 4-7): use cases
-  in `application/{identity,assets,scanning,findings,reporting}/`,
-  `AIProviderPort`/`EventBusPort` and their implementations, the
-  remaining fourteen scanner adapters (Phase 4 -- explicitly out of
-  scope for Milestone 3, which covers Nuclei only), the processing
-  pipeline orchestrator (Milestone 4), the API layer (Milestone 5),
-  `app/main.py`.
+  packages that Milestones 2-4 did not cover (Milestones 5-7): use cases
+  in `application/{identity,assets,findings,reporting}/` (Scanning's own
+  use cases are now done -- Milestone 4), `AIProviderPort`/`EventBusPort`
+  and their implementations, the remaining fourteen scanner adapters
+  (Phase 4 -- explicitly out of scope for Milestone 3, which covers
+  Nuclei only), the API layer (Milestone 5), the AI analysis service
+  (Milestone 6), `app/main.py`.
 - `docs/architecture.md`, `roadmap.md`, `decisions.md`, `database.md`,
   `api.md`, `coding_standards.md`, `testing_strategy.md`,
   `security_model.md` -- still described only in chat history, never
@@ -411,10 +585,15 @@ above.
    be able to fetch a row regardless of its current soft-delete state,
    including the soft-delete operation itself -- but it does mean
    nothing currently prevents calling `update()` on an already-deleted
-   row (e.g. accidentally "reviving" one by clearing `deleted_at`). No
-   current use case does this, so it is not fixed speculatively; flagged
-   here so it is not forgotten once a use case that mutates existing
-   rows is built (Milestone 4+).
+   row (e.g. accidentally "reviving" one by clearing `deleted_at`).
+   Confirmed still not triggered as of Milestone 4:
+   `RunScanWorkflowUseCase` only ever calls `AssetRepositoryPort.update`/
+   `FindingRepositoryPort.update` on a row `get_by_identity`/
+   `get_by_fingerprint` itself just returned (both filter
+   `deleted_at IS NULL`), so a soft-deleted row is never the target of
+   an update through this use case -- it would go down the "create new"
+   branch instead. Still flagged here so it is not forgotten once a use
+   case that mutates existing rows more freely is built (Milestone 5+).
 6. `MinioStoragePort` (Milestone 3) is verified only against a unit-level
    mock of the `minio` SDK's `Minio` client, not a real MinIO server --
    no MinIO server package exists on this environment's allowed apt
@@ -430,6 +609,26 @@ above.
    (asserting actual `nuclei` CLI behavior, not just this adapter's own
    argv-construction and error-classification logic) is future work once
    `nuclei` is available in a CI/sandbox image.
+8. `RunScanWorkflowUseCase`'s correlate/persist idempotency guards
+   (PROJECT_STATE.md section 3's "Processing pipeline orchestrator
+   resumability" entry) make **sequential** retries of the *same* scan
+   safe (check-then-act against a natural key, then check-then-insert
+   against a `(scan_id, ...)` pair), but do not make **concurrent**
+   execution of *two different* scans against overlapping targets safe.
+   Two scans for the same organization targeting the same host, run
+   truly concurrently (two worker processes, not two sequential
+   `execute()` calls), could both observe "no existing Asset" via
+   `get_by_identity` before either has committed its own `add()`, and
+   the second `add()` would fail on the real `(organization_id,
+   asset_type, value)` unique constraint with an unhandled
+   `IntegrityError` rather than gracefully falling back to "use the one
+   the other scan just created." Not fixed speculatively -- nothing in
+   this codebase runs two scans concurrently yet; no Celery/worker
+   wiring exists before Milestone 7. Flagged now so it is not forgotten
+   once concurrent execution is actually possible: the fix, when it's
+   needed, is most likely catching the unique-constraint violation on
+   `add()` and re-fetching via `get_by_identity`, not a change to the
+   sequential-retry logic this milestone already has right.
 
 ## Important implementation rules
 - Production-quality code only; full type hints; comprehensive docstrings.
@@ -450,8 +649,9 @@ above.
   workflow" in PROJECT_STATE.md.
 
 ## Next planned task
-Wait for approval, then begin Milestone 4 (Processing pipeline
-orchestrator). Local execution confirmation of Milestones 1-3 is done
+Wait for approval, then begin Milestone 5 (API layer -- public +
+internal split). Local execution confirmation of Milestones 1-4 is done
 (see "Testing status" and "Completed milestones" above) -- Milestone 3's
 confirmation happened in the same session that discovered it was
-already implemented, not in the session that wrote it.
+already implemented, not in the session that wrote it; Milestone 4 was
+genuine fresh implementation and confirmation in the same session.

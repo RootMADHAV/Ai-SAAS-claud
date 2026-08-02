@@ -212,6 +212,83 @@ relitigate these without a genuine implementation blocker -- see Rules.
   explicitly for this reason, including columns outside the
   `TimestampMixin`/`SoftDeleteMixin` pair (which already did this
   correctly from the start).
+- **Scan status derivation** (Milestone 4, filling the gap the Scan
+  domain-model row in section 5 always flagged as deferred):
+  `derive_scan_status(steps)` in `app/domain/scanning/entities.py` is a
+  pure function, not a method on `Scan` -- `Scan` does not hold a live
+  reference to its own `ScanWorkflowStep` rows, so a function taking
+  them as an explicit argument is the correct shape. Rule: any step
+  `FAILED` -> `FAILED`; every step `COMPLETED` or `SKIPPED` -> `COMPLETED`;
+  otherwise `RUNNING`; no steps at all -> `QUEUED` (defensive only).
+- **Processing pipeline orchestrator resumability, as actually
+  implemented** (Milestone 4): the eight pipeline steps split into two
+  groups. `EXECUTE_SCANNER` is the one step this codebase treats as
+  expensive and non-idempotent -- once its `ScanWorkflowStep` row is
+  `COMPLETED`, `RunScanWorkflowUseCase` never invokes the real scanner
+  again for that scan; it reads the already-durably-stored raw output
+  back from `StoragePort` instead (stored under a deterministic
+  `{scan_id}/raw-output` key, so no new column was needed to remember
+  where it went). Every other step (`normalize`, `deduplicate`,
+  `correlate`, `enrich`, `persist`) is treated as safe to recompute on
+  every invocation, because each is either a pure read (normalize,
+  deduplicate, enrich) or is guarded against duplicate writes on a
+  retried run: `correlate` checks for an existing `(scan_id, asset_id)`
+  observation before calling `add_observation`, and `persist` checks for
+  an existing `(scan_id, finding_id)` occurrence before calling
+  `add_occurrence`, using each repository's own natural-key lookups
+  (`get_by_identity`, `get_by_fingerprint`) to avoid re-creating an
+  `Asset` or `Finding` that a prior attempt already created. This gives
+  genuine resumability for the realistic case (a transient failure,
+  fixed, then the same scan retried) without solving fully general
+  exactly-once delivery -- see this milestone's technical debt entry in
+  `docs/implementation_progress.md` for the one edge case this does not
+  cover.
+- **`AI_ANALYZE` is unconditionally `SKIPPED` in Milestone 4, not
+  event-published, not backed by a scanner registry** -- three related,
+  deliberate scope boundaries, not oversights: (1) `AIProviderPort` and
+  an `AnalysisService` do not exist yet (Milestone 6), so
+  `RunScanWorkflowUseCase` marks this step `SKIPPED` -- a real,
+  already-modeled terminal state (PROJECT_STATE.md section 5), not a
+  fabricated result -- rather than guessing at AI behavior; a `SKIPPED`
+  step still counts as "done" for `derive_scan_status`, so scans
+  complete today without AI commentary. (2) No `FindingCreated`
+  event is published after persist, even though this file already named
+  that as planned ("still publishes after persist, for future
+  consumers") -- `EventBusPort` itself does not exist yet (section 4's
+  folder structure), and this milestone does not invent one purely to
+  satisfy that forward reference. (3) `RunScanWorkflowUseCase` is
+  constructed with exactly one `ActiveScanner` instance and raises
+  `ScannerMismatchError` if a `Scan`'s `scanner_name` does not match it,
+  rather than building a multi-adapter registry for a codebase that
+  still has exactly one adapter (`NucleiAdapter`) -- the same
+  "don't build it until a second real shape exists" reasoning this file
+  already applies to deferring `BaseAgent`.
+- **CVSS/severity provenance kept strictly separate from scanner-native
+  severity claims** (Milestone 4, discovered while implementing the
+  `enrich` step -- a real design consideration, not a bug fix):
+  `Finding.ai_severity_level` is named for what it is, an AI provider's
+  own estimate (Milestone 6) -- `enrich` never writes a scanner's raw,
+  self-reported severity string (e.g. nuclei's own `info.severity`) into
+  that field, since doing so would misrepresent the data's provenance.
+  A finding with no valid CVSS and no AI estimate yet legitimately has
+  no `effective_severity` -- that is correct today, not a gap to patch
+  around. The scanner's raw severity claim is not discarded, though: it
+  travels in `FindingOccurrence.raw_evidence` (the full raw scanner match
+  object), available to a human or a future AI process, just not
+  asserted as authoritative by this milestone.
+- **Normalization is nuclei-specific application-layer code, not a
+  `NormalizerPort`** (Milestone 4, `app/application/scanning/
+  normalization.py`): `ScanOutput`'s own docstring already commits
+  Scanning to stop at "here is exactly what the scanner said" and defer
+  interpretation to "the normalize pipeline step (Milestone 4)" -- so
+  turning nuclei's raw JSONL into structured data, including deciding
+  what a CVSS candidate or a severity string even means, could not live
+  in `scanner_engine/` without Scanning starting to own Findings
+  concepts. It lives in the application layer instead, dispatching on
+  `output_format` via a plain `if`, not an injectable port -- with
+  exactly one real output format wired (Milestone 3), a port with one
+  implementation would be an untested abstraction, revisited when Phase
+  4 adds a second scanner output format.
 
 ## 4. Folder structure
 
@@ -239,7 +316,8 @@ relitigate these without a genuine implementation blocker -- see Rules.
 │   │   │   ├── scanning/, assets/, identity/, reporting/   (entities.py done; behavior/state machines pending)
 │   │   ├── application/
 │   │   │   ├── interfaces/    (repository ports for all 5 bounded contexts -- done; ScannerPort/StoragePort done (Milestone 3); AIProviderPort/EventBusPort pending)
-│   │   │   ├── identity/, assets/, scanning/, findings/, reporting/  (use cases -- scaffolded, empty)
+│   │   │   ├── scanning/      (done -- trigger_scan.py, run_scan_workflow.py, normalization.py, Milestone 4)
+│   │   │   ├── identity/, assets/, findings/, reporting/  (use cases -- scaffolded, empty)
 │   │   ├── infrastructure/
 │   │   │   ├── db/{base.py, session.py, models/, repositories/}  (done -- all 19 tables, all 5 repositories)
 │   │   │   ├── storage/  (done -- MinioStoragePort, Milestone 3)
@@ -258,8 +336,12 @@ relitigate these without a genuine implementation blocker -- see Rules.
 │       ├── conftest.py  (async Postgres fixtures -- rewritten in Milestone 2; see docs/implementation_progress.md for the discovered stray-file note)
 │       ├── unit/    (config, ids, clock, fingerprint, events, value_objects,
 │       │         domain_entities, base_scanner, target_validation,
-│       │         minio_storage, nuclei_adapter -- all eleven done)
-│       └── integration/  (support.py + repository/session integration suite, all against real Postgres)
+│       │         minio_storage, nuclei_adapter, scan_status_derivation,
+│       │         normalization, trigger_scan, run_scan_workflow -- all
+│       │         fifteen done)
+│       └── integration/  (support.py + repository/session integration suite,
+│                 plus test_scan_pipeline_orchestrator.py (Milestone 4),
+│                 all against real Postgres)
 └── frontend/   (Phase 3, not started)
 ```
 
@@ -273,7 +355,7 @@ relitigate these without a genuine implementation blocker -- see Rules.
 | CVSS (value object) | findings/ | validates 0.0-10.0 + vector format; derives band from score -- **implemented, tested** |
 | Asset | assets/ | current-state cache; identity = `(org_id, asset_type, normalized value)` -- **implemented, tested** |
 | AssetObservation | assets/ | append-only; recording one updates the Asset cache -- **implemented, tested** |
-| Scan | scanning/ | state machine `queued -> running -> {completed, failed, cancelled}`, derived from its workflow steps -- **implemented, tested** (derivation logic itself is Milestone 3) |
+| Scan | scanning/ | state machine `queued -> running -> {completed, failed, cancelled}`, derived from its workflow steps -- **implemented, tested** (derivation logic itself is Milestone 4; this row previously said "Milestone 3" -- a stale reference caught and corrected during Milestone 4, since Milestone 3's actual delivered scope, per section 6/7 below, never touched Scan status derivation) |
 | WorkflowStep | scanning/ | `pending -> running -> {completed, failed, skipped}`, independently retryable -- **implemented, tested** |
 
 As of this update, all entities listed above are implemented as plain
@@ -354,7 +436,61 @@ dependency (no real MinIO server or `nuclei` binary was reachable in
 that environment) -- see `docs/implementation_progress.md`'s Technical
 debt list.
 
-Milestones 4-7 and Phases 3-10 not started. See
+Milestone 4 (Processing pipeline orchestrator) is complete. Delivered:
+`derive_scan_status()` and the `PIPELINE_STEP_ORDER` constant, added to
+`app/domain/scanning/entities.py` (domain layer -- pure, zero framework
+imports); `TriggerScanUseCase` (`app/application/scanning/
+trigger_scan.py` -- creates a `Scan` plus its eight `ScanWorkflowStep`
+rows, all `PENDING`, in the locked order); `normalize_scan_output()` and
+`NormalizedFinding` (`app/application/scanning/normalization.py` -- the
+nuclei-JSONL-specific normalize step, see section 3's dated entry for
+why this is a plain function rather than a port); and
+`RunScanWorkflowUseCase` (`app/application/scanning/
+run_scan_workflow.py` -- the orchestrator itself, walking all eight
+steps, wired to the Milestone 3 `ScannerPort`/`NucleiAdapter` and the
+Milestone 2 repository layer exactly as section 15 called for). 44 new
+tests (41 unit across four files, 3 integration against real Postgres),
+100% coverage on every Milestone 4 module, clean Ruff (lint + format),
+clean MyPy strict. Two design decisions worth flagging explicitly
+because they resolve a genuine tension rather than following a locked
+decision verbatim -- both recorded in section 3's dated log rather than
+silently resolved: `AI_ANALYZE` is unconditionally `SKIPPED` (Milestone
+6 builds the `AnalysisService` this step actually needs), and a
+scanner's raw self-reported severity is never written into
+`Finding.ai_severity_level` (a field name that specifically means an AI
+provider's own estimate). One stale cross-reference was also found and
+corrected: section 5's `Scan` row said its status-derivation logic was
+"Milestone 3" -- it was never part of that milestone's actual delivered
+scope (see the paragraph above), and is corrected to "Milestone 4" in
+section 5 now that the function exists.
+
+As with every previous milestone, execution ran in Claude's own sandbox,
+not on `C:\Users\gamer\Downloads\claudeOnly` directly (section 13). The
+sandbox reconstruction for this milestone was more extensive than usual
+-- essentially the full backend, since `RunScanWorkflowUseCase` legitimately
+depends on the domain entities, config, all six ORM model modules, and
+all five repository implementations from Milestones 1-2 plus the
+ScannerPort/StoragePort/target_validation/NucleiAdapter surface from
+Milestone 3 -- reconstructed from this repository's own verbatim file
+contents read through the Filesystem MCP, not from memory. Stated
+plainly per the verification-honesty rule: this session did not re-run
+the original Milestone 1-3 test files verbatim (they were not copied
+into the sandbox; only their source modules were, for import purposes),
+so this is not a renewed byte-for-byte re-verification of those
+milestones' own test suites, which were already verified in their own
+sessions. What it does newly confirm is that the real, unmodified
+Milestone 2 repository implementations (`SqlAlchemyScanRepository`,
+`SqlAlchemyAssetRepository`, `SqlAlchemyFindingRepository`,
+`SqlAlchemyOrganizationRepository`) still work correctly end-to-end
+against a real, RLS-enabled Postgres 16 instance when driven by this
+milestone's new orchestrator -- exercised by the 3 new integration
+tests, not merely assumed unchanged. Every new and modified file was
+then written into this repository via the Filesystem MCP, verified
+byte-count-identical against the sandbox-verified source for every new
+file (not just one, this time) -- see `docs/session_state.md` for the
+exact counts.
+
+Milestones 5-7 and Phases 3-10 not started. See
 `docs/implementation_progress.md` for the live version of this section.
 
 ## 7. Completed work
@@ -392,6 +528,19 @@ clean Ruff, clean MyPy strict. See section 6 for the process note on how
 this milestone was closed out -- the implementation was found already
 complete on disk and was audited and dynamically verified rather than
 written from scratch.
+
+Milestone 4: `derive_scan_status()`/`PIPELINE_STEP_ORDER`
+(`app/domain/scanning/entities.py`), `TriggerScanUseCase`
+(`trigger_scan.py`), `normalize_scan_output()`/`NormalizedFinding`
+(`normalization.py`), and `RunScanWorkflowUseCase`
+(`run_scan_workflow.py`) -- the last three all new files in
+`app/application/scanning/`. 44 new tests (41 unit, 3 integration
+against real Postgres), 100% coverage on every Milestone 4 module, clean
+Ruff, clean MyPy strict. See section 6 for the full account, including
+the two flagged design decisions (`AI_ANALYZE` unconditionally
+`SKIPPED`; scanner-native severity never written to
+`Finding.ai_severity_level`) and the stale Milestone-3 cross-reference
+this session corrected in section 5.
 
 ## 8. Remaining work
 
@@ -514,25 +663,29 @@ Known quirks, confirmed empirically, not assumed:
 
 ## 15. Current Implementation Queue
 
-Status: Milestone 3 complete -- `ScannerPort`/`StoragePort`, the shared
-`run_scanner_subprocess` execution guarantees, `validate_target`,
-`MinioStoragePort`, and `NucleiAdapter`. 105 unit tests passing, 100%
-coverage on every Milestone 3 module, clean Ruff (lint + format), clean
-MyPy strict. See section 6 for the process note on this milestone: the
-implementation was discovered already complete on disk at the start of
-the session that closed it out (docs had fallen out of sync with the
-repository), and that session's work was auditing it against every
-locked decision, dynamically verifying it, fixing one stale docstring,
-and this documentation update.
+Status: Milestone 4 complete -- the processing pipeline orchestrator.
+`derive_scan_status()`/`PIPELINE_STEP_ORDER` (domain layer),
+`TriggerScanUseCase`, `normalize_scan_output()`, and
+`RunScanWorkflowUseCase` (application layer), wired to the Milestone 3
+`ScannerPort`/`NucleiAdapter` and the Milestone 2 repository layer. 44
+new tests (41 unit, 3 integration against real Postgres), 100% coverage
+on every Milestone 4 module, clean Ruff (lint + format), clean MyPy
+strict. See section 6 for the full account, including two design
+decisions flagged rather than silently resolved (`AI_ANALYZE`
+unconditionally `SKIPPED`; scanner-native severity claims never written
+to `Finding.ai_severity_level`) and a stale Milestone-3 cross-reference
+in section 5 corrected to Milestone 4.
 
 Next Session Goal:
-Begin Milestone 4 (Processing pipeline orchestrator), pending explicit
-approval.
+Begin Milestone 5 (API layer -- public + internal split), pending
+explicit approval.
 
-Files to create (Milestone 4, per the roadmap in
-docs/implementation_progress.md): the pipeline orchestrator implementing
-the locked `validate_target -> execute_scanner -> normalize ->
-deduplicate -> correlate -> enrich -> ai_analyze -> persist` sequence
-(section 3) as explicit `scan_workflow_steps` rows, wired to the
-Milestone 3 `ScannerPort`/`NucleiAdapter` and the Milestone 2 repository
-layer.
+Files to create (Milestone 5, per the roadmap in
+docs/implementation_progress.md): the FastAPI router modules
+(`/api/v1` public, `/internal` health/metrics/admin -- PROJECT_STATE.md
+section 3's "Public/internal API split"), request/response schemas, and
+the route handlers that call `TriggerScanUseCase`/`RunScanWorkflowUseCase`
+(Milestone 4) and the Milestone 2 repositories -- no business logic in
+the route handlers themselves, per section 10's coding standards.
+`app/main.py` (currently pending, per section 4's folder structure) is
+also in scope, since an API layer needs an app to mount its routers on.

@@ -4,18 +4,21 @@ See app/domain/identity/entities.py's module docstring for the scope
 rationale shared by every entities.py added in this milestone.
 
 ``Scan.status`` "derived from its workflow steps" (PROJECT_STATE.md
-section 5) is a real behavior, but the derivation rule itself belongs to
-the Scanning bounded context's own milestone (Milestone 3: "Scanner
-engine + StoragePort + target validation"), where the ``ScannerPort``
-this derivation depends on is actually built. Encoding a derivation
-method against workflow steps here, before that context exists, would be
-guessing at a rule this milestone has no way to verify against real
-adapter behavior -- so ``Scan`` carries a plain ``status`` field for now,
-set by whichever later milestone computes it.
+section 5) is a real behavior, but the derivation rule itself was
+deliberately deferred past Milestone 2 to whichever milestone actually
+produces ``ScanWorkflowStep`` rows to derive a status from -- see
+``derive_scan_status`` below, added in Milestone 4 (the processing
+pipeline orchestrator), which is that milestone. ``Scan`` itself still
+carries a plain ``status`` field, set by the orchestrator that calls
+``derive_scan_status``, not computed as a property on this dataclass --
+``Scan`` does not hold a live reference to its own steps, so a pure
+function taking them as an explicit argument is the correct shape here,
+not a method coupling this entity to a collection it doesn't own.
 """
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from uuid import UUID
@@ -75,3 +78,58 @@ class ScanScope:
     target_type: str
     target_value: str
     created_at: datetime
+
+
+# The locked processing pipeline (PROJECT_STATE.md section 3), as the
+# concrete sequence of ``WorkflowStepName`` values a scan's
+# ``ScanWorkflowStep`` rows are created in. A single source of truth for
+# this order, rather than repeating the literal list at every call site
+# that needs it (Milestone 4's ``TriggerScanUseCase`` to create the rows,
+# ``RunScanWorkflowUseCase`` to walk them) -- both live in
+# ``app/application/scanning/``, an outer layer relative to this module,
+# so the order itself belongs here, at the domain layer, not duplicated
+# in either of them.
+PIPELINE_STEP_ORDER: tuple[WorkflowStepName, ...] = (
+    WorkflowStepName.VALIDATE_TARGET,
+    WorkflowStepName.EXECUTE_SCANNER,
+    WorkflowStepName.NORMALIZE,
+    WorkflowStepName.DEDUPLICATE,
+    WorkflowStepName.CORRELATE,
+    WorkflowStepName.ENRICH,
+    WorkflowStepName.AI_ANALYZE,
+    WorkflowStepName.PERSIST,
+)
+
+
+def derive_scan_status(steps: Sequence[ScanWorkflowStep]) -> ScanStatus:
+    """The derivation rule named in PROJECT_STATE.md section 5: a scan's
+    status is computed from its workflow steps, not tracked as
+    independent state that could drift from them.
+
+    Rules, in priority order:
+      - No steps recorded yet -> ``QUEUED`` (defensive; in practice
+        ``TriggerScanUseCase`` always creates all eight rows up front, so
+        this should not occur once a scan exists).
+      - Any step ``FAILED`` -> ``FAILED``, regardless of how many steps
+        after it are still ``PENDING`` -- the pipeline stops at the first
+        failure (PROJECT_STATE.md section 3's resumability rationale:
+        retry from the failed step, not from scratch), so a later step
+        never having run yet does not change the scan's overall outcome.
+      - Every step ``COMPLETED`` or ``SKIPPED`` -> ``COMPLETED`` -- a
+        ``SKIPPED`` step (Milestone 4: ``AI_ANALYZE``, pending the
+        ``AnalysisService`` Milestone 6 builds) is a legitimate
+        non-execution, not a failure, and does not prevent the scan as a
+        whole from being considered done.
+      - Otherwise (some ``PENDING``/``RUNNING``, none ``FAILED``) ->
+        ``RUNNING``.
+    """
+    if not steps:
+        return ScanStatus.QUEUED
+    if any(step.status is WorkflowStepStatus.FAILED for step in steps):
+        return ScanStatus.FAILED
+    if all(
+        step.status in (WorkflowStepStatus.COMPLETED, WorkflowStepStatus.SKIPPED)
+        for step in steps
+    ):
+        return ScanStatus.COMPLETED
+    return ScanStatus.RUNNING
