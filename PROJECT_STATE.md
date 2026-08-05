@@ -289,6 +289,51 @@ relitigate these without a genuine implementation blocker -- see Rules.
   exactly one real output format wired (Milestone 3), a port with one
   implementation would be an untested abstraction, revisited when Phase
   4 adds a second scanner output format.
+- **Milestone 5's public API covers only the Scanning bounded context,
+  with no authentication.** Two related, deliberate scope boundaries:
+  (1) `/api/v1` exposes create/run/get for `Scan` only -- Findings,
+  Assets, and Reporting have no application-layer use cases yet
+  (`application/{findings,assets,reporting}/` remain empty scaffolds)
+  and no "list by organization" repository query for a read endpoint to
+  call even if one were added; Scanning is the one bounded context with
+  use cases *and* an adapter fully wired end-to-end (Milestones 3-4).
+  (2) No route verifies caller identity -- `organization_id` in the URL
+  path is trusted as given. Identity & Access has no signup/login use
+  case yet to build real JWT verification against
+  (`application/identity/` remains an empty scaffold, despite
+  `jwt_secret` existing in `Settings` since Milestone 1 as forward-
+  looking config), and RBAC is Phase 6 on the roadmap -- both well past
+  this milestone. Building either now would be exactly the kind of
+  future-milestone abstraction this project's session rules prohibit.
+  This is a real, currently-unenforced authorization gap, tracked as
+  Technical debt item #9 in `docs/implementation_progress.md`, not
+  silently left implicit. `get_org_session`'s organization-existence
+  check (a 404 for an unknown org, via the same
+  `OrganizationRepositoryPort.get_by_id` every other caller already
+  uses) is a data-integrity/UX safeguard, not an authorization control --
+  the two are not the same thing and must not be conflated.
+- **The scan pipeline runs synchronously inside the HTTP request
+  handler** (Milestone 5, `POST .../scans/{scan_id}/run`), blocking for
+  up to `DEFAULT_SCAN_TIMEOUT_SECONDS` (600s). No task queue or worker
+  process exists yet -- that wiring is Milestone 7's ("Docker Compose
+  wired end-to-end"), per the roadmap in `docs/implementation_progress.md`.
+  Building it now would be Milestone 7 work landing inside Milestone 5.
+  Tracked as Technical debt item #10.
+- **`create_scan` and `run_scan` are separate endpoints** (Milestone 5),
+  not a single combined call, because `TriggerScanUseCase` and
+  `RunScanWorkflowUseCase` are already separate for a reason (recording
+  intent to scan is not executing the pipeline), and keeping them
+  separate over HTTP is what makes Milestone 4's resumability visible to
+  a client: calling `run` again on a scan that failed partway retries
+  from the failed step, exactly as the use case already supports for a
+  direct caller.
+- **`minio_bucket` added to `Settings`, required for every
+  `worker_role`** (Milestone 5), alongside the other MinIO fields.
+  Milestone 5 is the first to actually construct `MinioStoragePort`
+  through `Settings` in a composition root (`app/main.py`'s lifespan)
+  rather than directly in a test with an explicit bucket argument
+  (Milestones 3-4's own tests) -- necessary, not speculative; the app
+  cannot be composed without it.
 
 ## 4. Folder structure
 
@@ -309,7 +354,7 @@ relitigate these without a genuine implementation blocker -- see Rules.
 │   ├── alembic.ini, alembic/env.py, alembic/script.py.mako,
 │   │   alembic/versions/ (initial schema migration, with RLS policies)
 │   ├── app/
-│   │   ├── main.py (pending), config.py
+│   │   ├── main.py (done -- FastAPI app factory + lifespan, Milestone 5), config.py
 │   │   ├── domain/
 │   │   │   ├── shared/        (ids, clock, fingerprint, events, enums -- staging, see decisions)
 │   │   │   ├── findings/      (value_objects.py, entities.py -- done)
@@ -318,6 +363,10 @@ relitigate these without a genuine implementation blocker -- see Rules.
 │   │   │   ├── interfaces/    (repository ports for all 5 bounded contexts -- done; ScannerPort/StoragePort done (Milestone 3); AIProviderPort/EventBusPort pending)
 │   │   │   ├── scanning/      (done -- trigger_scan.py, run_scan_workflow.py, normalization.py, Milestone 4)
 │   │   │   ├── identity/, assets/, findings/, reporting/  (use cases -- scaffolded, empty)
+│   │   ├── api/
+│   │   │   ├── dependencies.py  (done -- composition-root DI providers, Milestone 5)
+│   │   │   ├── v1/  (done -- schemas.py, scans.py -- the public Scanning API, Milestone 5)
+│   │   │   └── internal/  (done -- health.py; metrics/admin pending observability/RBAC, Milestone 5)
 │   │   ├── infrastructure/
 │   │   │   ├── db/{base.py, session.py, models/, repositories/}  (done -- all 19 tables, all 5 repositories)
 │   │   │   ├── storage/  (done -- MinioStoragePort, Milestone 3)
@@ -330,18 +379,19 @@ relitigate these without a genuine implementation blocker -- see Rules.
 │   │   │       (nuclei/ done -- NucleiAdapter, Milestone 3; the rest
 │   │   │        remain scaffolded, empty Phase 4 stubs)
 │   │   ├── ai_agents/   (scaffolded, empty; analysis_service.py pending)
-│   │   ├── api/v1/      (scaffolded, empty)
 │   │   └── workers/     (scaffolded, empty)
 │   └── tests/
 │       ├── conftest.py  (async Postgres fixtures -- rewritten in Milestone 2; see docs/implementation_progress.md for the discovered stray-file note)
 │       ├── unit/    (config, ids, clock, fingerprint, events, value_objects,
 │       │         domain_entities, base_scanner, target_validation,
 │       │         minio_storage, nuclei_adapter, scan_status_derivation,
-│       │         normalization, trigger_scan, run_scan_workflow -- all
-│       │         fifteen done)
+│       │         normalization, trigger_scan, run_scan_workflow,
+│       │         api_schemas, health -- all seventeen done)
 │       └── integration/  (support.py + repository/session integration suite,
 │                 plus test_scan_pipeline_orchestrator.py (Milestone 4),
-│                 all against real Postgres)
+│                 plus test_api_scans.py, test_health_ready.py,
+│                 test_main_lifespan.py (Milestone 5), all against
+│                 real Postgres)
 └── frontend/   (Phase 3, not started)
 ```
 
@@ -490,7 +540,45 @@ byte-count-identical against the sandbox-verified source for every new
 file (not just one, this time) -- see `docs/session_state.md` for the
 exact counts.
 
-Milestones 5-7 and Phases 3-10 not started. See
+Milestone 5 (API layer -- public + internal split) is complete.
+Delivered: `app/api/dependencies.py` (the composition root's per-request
+DI providers -- `AppState`, `get_org_session`, and the repository/use-
+case providers built on top of it), `app/api/v1/schemas.py` and
+`scans.py` (the public Scanning API -- create/run/get, mapping 1:1 onto
+Milestone 4's two use cases plus a direct repository read, exactly as
+section 15's queue specified), `app/api/internal/health.py`
+(liveness/readiness), and `app/main.py` (the `create_app()` factory,
+lifespan wiring, and two global exception handlers). 28 new/updated
+tests across 5 files, clean Ruff (lint + format), clean MyPy strict on
+every Milestone 5 module. Four design/scope decisions worth flagging
+explicitly, each recorded in section 3's dated log: the public API
+covers only the Scanning bounded context (Findings/Assets/Reporting have
+no use cases yet to call); no authentication exists on any route
+(`organization_id` in the URL path is trusted as given -- a real,
+currently-unenforced gap, tracked as Technical debt item #9); the
+pipeline runs synchronously inside the HTTP request handler (no task
+queue exists before Milestone 7, Technical debt item #10); and
+`minio_bucket` was added to `Settings` (necessary for this milestone's
+composition root to actually construct `MinioStoragePort`).
+
+As with every previous milestone, execution ran in Claude's own sandbox,
+not on `C:\Users\gamer\Downloads\claudeOnly` directly (section 13). A
+mid-session Filesystem MCP outage meant the real Alembic migration could
+not be re-fetched verbatim in time for the sandbox reconstruction;
+rather than reconstruct SQL from memory, the sandbox schema was created
+via `SQLAlchemy Base.metadata.create_all()` instead of
+`alembic upgrade head` this session only, meaning RLS policies were not
+present in this session's own sandbox database. Judged not to undermine
+what Milestone 5 needed to verify (RLS tenant isolation itself is
+unchanged and was already proven by Milestone 2's real-Postgres suite;
+this milestone reuses `session_scoped_to_org` exactly as built, without
+introducing new RLS-relevant behavior) -- stated plainly rather than
+glossed over, per the verification-honesty rule. Full account, including
+a separate `coverage`/SQLAlchemy-async-greenlet measurement-gap
+investigation, in `docs/session_state.md` and
+`docs/implementation_progress.md`.
+
+Milestones 6-7 and Phases 3-10 not started. See
 `docs/implementation_progress.md` for the live version of this section.
 
 ## 7. Completed work
@@ -541,6 +629,18 @@ the two flagged design decisions (`AI_ANALYZE` unconditionally
 `SKIPPED`; scanner-native severity never written to
 `Finding.ai_severity_level`) and the stale Milestone-3 cross-reference
 this session corrected in section 5.
+
+Milestone 5: `app/api/dependencies.py` (composition-root DI providers),
+`app/api/v1/schemas.py`/`scans.py` (the public Scanning API),
+`app/api/internal/health.py` (liveness/readiness), and `app/main.py`
+(FastAPI app factory + lifespan). 28 new/updated tests across 5 files,
+clean Ruff, clean MyPy strict on every Milestone 5 module. See section 6
+for the full account, including the four flagged design/scope decisions
+(Scanning-only API surface; no authentication yet; synchronous pipeline
+execution; `minio_bucket` added to `Settings`) and this session's two
+verification-honesty notes (a mid-session Filesystem MCP outage that
+changed how the sandbox schema was created; a `coverage`/SQLAlchemy-
+async-greenlet measurement-gap investigation).
 
 ## 8. Remaining work
 
@@ -663,29 +763,36 @@ Known quirks, confirmed empirically, not assumed:
 
 ## 15. Current Implementation Queue
 
-Status: Milestone 4 complete -- the processing pipeline orchestrator.
-`derive_scan_status()`/`PIPELINE_STEP_ORDER` (domain layer),
-`TriggerScanUseCase`, `normalize_scan_output()`, and
-`RunScanWorkflowUseCase` (application layer), wired to the Milestone 3
-`ScannerPort`/`NucleiAdapter` and the Milestone 2 repository layer. 44
-new tests (41 unit, 3 integration against real Postgres), 100% coverage
-on every Milestone 4 module, clean Ruff (lint + format), clean MyPy
-strict. See section 6 for the full account, including two design
-decisions flagged rather than silently resolved (`AI_ANALYZE`
-unconditionally `SKIPPED`; scanner-native severity claims never written
-to `Finding.ai_severity_level`) and a stale Milestone-3 cross-reference
-in section 5 corrected to Milestone 4.
+Status: Milestone 5 complete -- the API layer (public + internal split).
+`app/api/dependencies.py` (composition-root DI providers),
+`app/api/v1/schemas.py`/`scans.py` (the public Scanning API),
+`app/api/internal/health.py` (liveness/readiness), and `app/main.py`
+(FastAPI app factory + lifespan), wired to the Milestone 4 use cases and
+the Milestone 2 repository layer. 28 new/updated tests across 5 files,
+clean Ruff (lint + format), clean MyPy strict on every Milestone 5
+module. See section 6 for the full account, including four design/scope
+decisions flagged rather than silently resolved (Scanning-only API
+surface; no authentication yet -- Technical debt item #9; synchronous
+pipeline execution -- Technical debt item #10; `minio_bucket` added to
+`Settings`) and this session's two verification-honesty notes (a
+mid-session Filesystem MCP outage; a coverage-measurement investigation).
 
 Next Session Goal:
-Begin Milestone 5 (API layer -- public + internal split), pending
-explicit approval.
+Begin Milestone 6 (AI analysis service), pending explicit approval.
 
-Files to create (Milestone 5, per the roadmap in
-docs/implementation_progress.md): the FastAPI router modules
-(`/api/v1` public, `/internal` health/metrics/admin -- PROJECT_STATE.md
-section 3's "Public/internal API split"), request/response schemas, and
-the route handlers that call `TriggerScanUseCase`/`RunScanWorkflowUseCase`
-(Milestone 4) and the Milestone 2 repositories -- no business logic in
-the route handlers themselves, per section 10's coding standards.
-`app/main.py` (currently pending, per section 4's folder structure) is
-also in scope, since an API layer needs an app to mount its routers on.
+Files to create (Milestone 6, per the roadmap in
+docs/implementation_progress.md): `AIProviderPort`
+(`app/application/interfaces/`, following the same port-naming
+convention as `ScannerPort`/`StoragePort`), at least one concrete
+provider adapter under `app/infrastructure/ai_providers/` (Anthropic is
+the configured `ai_default_provider` per `.env.example`), and an
+`AnalysisService` (`app/ai_agents/`, per PROJECT_STATE.md section 3's
+existing note that one concrete `AnalysisService` is planned with no
+formal `BaseAgent` interface yet -- YAGNI until a second agent's real
+shape is known). Once `AnalysisService` exists,
+`RunScanWorkflowUseCase`'s `_run_ai_analyze_step` (currently
+unconditionally `SKIPPED`, per Milestone 4's decision log) becomes the
+natural place to wire it in -- revisit that method specifically, not the
+rest of the pipeline. Whether `POST .../scans/{scan_id}/run`'s existing
+API contract needs to change to surface AI results is a design question
+for that session, not decided here.

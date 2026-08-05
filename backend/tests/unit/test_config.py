@@ -21,6 +21,7 @@ def _settings(**overrides: object) -> Settings:
         "minio_endpoint": "localhost:9000",
         "minio_root_user": "test-user",
         "minio_root_password": "a-real-minio-password",
+        "minio_bucket": "scan-raw-output",
         "jwt_secret": "a-real-secret",
     }
     defaults.update(overrides)
@@ -42,6 +43,15 @@ def test_every_role_requires_minio_settings() -> None:
     the ingestion worker to pick up, per the network segmentation design."""
     with pytest.raises(ValidationError, match="MinIO settings"):
         _settings(minio_root_password=None)
+
+
+def test_every_role_requires_minio_bucket() -> None:
+    """Milestone 5 addition: the composition root (app/main.py) needs a
+    bucket name to construct ``MinioStoragePort`` -- see PROJECT_STATE.md
+    section 3's Milestone 5 entry for why this joined the other MinIO
+    settings as a required field rather than a hardcoded string."""
+    with pytest.raises(ValidationError, match="MinIO settings"):
+        _settings(minio_bucket=None)
 
 
 def test_api_role_requires_jwt_secret() -> None:
@@ -113,6 +123,7 @@ def test_get_settings_reads_from_real_environment_variables(
     monkeypatch.setenv("MINIO_ENDPOINT", "localhost:9000")
     monkeypatch.setenv("MINIO_ROOT_USER", "test-user")
     monkeypatch.setenv("MINIO_ROOT_PASSWORD", "a-real-minio-password")
+    monkeypatch.setenv("MINIO_BUCKET", "scan-raw-output")
     monkeypatch.setenv("JWT_SECRET", "a-real-secret")
 
     settings = get_settings()

@@ -46,6 +46,7 @@ def test_create_engine_rejects_scanner_worker_settings() -> None:
         minio_endpoint="localhost:9000",
         minio_root_user="test",
         minio_root_password="a-real-password",
+        minio_bucket="test-bucket",
     )
     with pytest.raises(ValueError, match="scanner_worker must never hold"):
         create_engine(settings)

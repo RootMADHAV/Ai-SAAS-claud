@@ -59,6 +59,7 @@ class Settings(BaseSettings):
     minio_endpoint: str | None = None
     minio_root_user: str | None = None
     minio_root_password: str | None = None
+    minio_bucket: str | None = None
     qdrant_url: str | None = None
 
     jwt_secret: str | None = None
@@ -85,10 +86,17 @@ class Settings(BaseSettings):
         # were a placeholder value.
         if self.redis_url is None:
             raise ValueError("REDIS_URL is required for every worker_role")
-        if not all((self.minio_endpoint, self.minio_root_user, self.minio_root_password)):
+        if not all(
+            (
+                self.minio_endpoint,
+                self.minio_root_user,
+                self.minio_root_password,
+                self.minio_bucket,
+            )
+        ):
             raise ValueError(
-                "MinIO settings (MINIO_ENDPOINT, MINIO_ROOT_USER, MINIO_ROOT_PASSWORD) "
-                "are required for every worker_role"
+                "MinIO settings (MINIO_ENDPOINT, MINIO_ROOT_USER, MINIO_ROOT_PASSWORD, "
+                "MINIO_BUCKET) are required for every worker_role"
             )
 
         # Only the scanner-worker is forbidden from holding database
