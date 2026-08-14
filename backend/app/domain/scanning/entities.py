@@ -116,10 +116,16 @@ def derive_scan_status(steps: Sequence[ScanWorkflowStep]) -> ScanStatus:
         retry from the failed step, not from scratch), so a later step
         never having run yet does not change the scan's overall outcome.
       - Every step ``COMPLETED`` or ``SKIPPED`` -> ``COMPLETED`` -- a
-        ``SKIPPED`` step (Milestone 4: ``AI_ANALYZE``, pending the
-        ``AnalysisService`` Milestone 6 builds) is a legitimate
-        non-execution, not a failure, and does not prevent the scan as a
-        whole from being considered done.
+        ``SKIPPED`` step is a legitimate non-execution, not a failure,
+        and does not prevent the scan as a whole from being considered
+        done. As of Milestone 6, ``AnalysisService`` gives ``AI_ANALYZE``
+        real work to do (see ``RunScanWorkflowUseCase._ai_analyze``), so
+        no step in the pipeline's current code path produces ``SKIPPED``
+        going forward -- but the value, and this rule's handling of it,
+        remain correct for any historical scan rows created before this
+        milestone, and for the enum value itself, which is not removed
+        just because nothing currently produces it (see
+        PROJECT_STATE.md section 3's Milestone 6 entry).
       - Otherwise (some ``PENDING``/``RUNNING``, none ``FAILED``) ->
         ``RUNNING``.
     """

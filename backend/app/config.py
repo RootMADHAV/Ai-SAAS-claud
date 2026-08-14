@@ -67,6 +67,15 @@ class Settings(BaseSettings):
     refresh_token_expire_days: int = 30
 
     ai_default_provider: str = "anthropic"
+    # Which model the configured provider should use -- generically named
+    # (not "anthropic_model") since its meaning ("model identifier for
+    # whichever provider ai_default_provider selects") stays valid once a
+    # second provider adapter exists, the same forward-compatible naming
+    # already applied to ai_default_provider itself. Defaults to a
+    # rolling alias, not a dated snapshot, so this value does not go
+    # stale the moment Anthropic ships a new snapshot under the same
+    # model family.
+    ai_model: str = "claude-sonnet-4-5"
     anthropic_api_key: str | None = None
     openai_api_key: str | None = None
     openrouter_api_key: str | None = None
@@ -114,6 +123,31 @@ class Settings(BaseSettings):
         if self.worker_role is WorkerRole.API and self.jwt_secret is None:
             raise ValueError("JWT_SECRET is required for worker_role=api")
 
+        # Only the API actually runs RunScanWorkflowUseCase (Milestone 5's
+        # own "the pipeline runs synchronously inside the HTTP request
+        # handler" decision, unchanged by this milestone) -- so only the
+        # API role needs an AI provider credential today. Scoped to
+        # "anthropic" specifically, not every possible provider key at
+        # once: AnthropicProvider is the only adapter this milestone
+        # actually builds (PROJECT_STATE.md section 3's "don't build a
+        # registry for one real implementation" reasoning, applied here
+        # to config validation too) -- requiring, say, OPENAI_API_KEY
+        # before an OpenAI adapter exists would demand a credential
+        # nothing in this codebase can use yet. Pointing
+        # ai_default_provider at any other provider name currently fails
+        # at composition-root wiring time (app/main.py's _lifespan), not
+        # here, since that failure is about what adapter exists to
+        # construct, not about a missing credential.
+        if (
+            self.worker_role is WorkerRole.API
+            and self.ai_default_provider == "anthropic"
+            and self.anthropic_api_key is None
+        ):
+            raise ValueError(
+                "ANTHROPIC_API_KEY is required for worker_role=api when "
+                "AI_DEFAULT_PROVIDER=anthropic (the default)"
+            )
+
         if self.environment is Environment.PRODUCTION:
             if self.jwt_secret is not None and self.jwt_secret in _DEV_ONLY_SECRETS:
                 raise ValueError(
@@ -121,6 +155,10 @@ class Settings(BaseSettings):
                 )
             if self.minio_root_password in _DEV_ONLY_SECRETS:
                 raise ValueError("MINIO_ROOT_PASSWORD must not be a dev default in production")
+            if self.anthropic_api_key is not None and self.anthropic_api_key in _DEV_ONLY_SECRETS:
+                raise ValueError(
+                    "ANTHROPIC_API_KEY must be a real secret in production, not a dev default"
+                )
 
         return self
 

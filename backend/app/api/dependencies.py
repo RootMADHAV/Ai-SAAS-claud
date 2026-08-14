@@ -3,12 +3,14 @@ wiring for the Scanning API (``app/api/v1/scans.py``).
 
 Everything here builds on already-existing, already-verified layers
 (Milestone 2's repositories, Milestone 3's ``ScannerPort``/``StoragePort``
-adapters, Milestone 4's use cases). Nothing in this module invents a new
-port, a new use case, or a new persistence concept -- it only wires
+adapters, Milestone 4's use cases, and as of Milestone 6,
+``AnalysisService``/``AIProviderPort``). Nothing in this module invents a
+new port, a new use case, or a new persistence concept -- it only wires
 existing pieces together per HTTP request, which is exactly Milestone 5's
 scope (PROJECT_STATE.md section 15: "route handlers that call
 TriggerScanUseCase/RunScanWorkflowUseCase ... and the Milestone 2
-repositories").
+repositories"), extended by Milestone 6 only to the extent that
+``RunScanWorkflowUseCase`` now also needs an ``AnalysisService``.
 
 One request = one RLS-scoped transaction: ``get_org_session`` opens
 exactly one ``session_scoped_to_org`` (app/infrastructure/db/session.py,
@@ -29,6 +31,7 @@ from uuid import UUID
 from fastapi import Depends, HTTPException, Request
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from app.ai_agents.analysis_service import AnalysisService
 from app.application.interfaces.assets_repository import AssetRepositoryPort
 from app.application.interfaces.findings_repository import FindingRepositoryPort
 from app.application.interfaces.scanner_port import ActiveScanner
@@ -49,16 +52,23 @@ from app.infrastructure.db.session import session_scoped_to_org
 class AppState:
     """Everything the composition root (``app/main.py``'s lifespan) builds
     once at process startup and every request's dependency chain reads
-    from below -- a session factory bound to one long-lived engine, and
-    the two Milestone 3 adapters (``ActiveScanner``, ``StoragePort``)
-    ``RunScanWorkflowUseCase`` needs. Grouped into one dataclass, stored
-    as a single ``request.app.state`` attribute, so there is exactly one
-    place (``_state`` below) that casts out of Starlette's untyped
-    ``State`` container, instead of one cast per field."""
+    from below -- a session factory bound to one long-lived engine, the
+    two Milestone 3 adapters (``ActiveScanner``, ``StoragePort``), and
+    (as of Milestone 6) ``AnalysisService``, all of which
+    ``RunScanWorkflowUseCase`` needs. ``analysis_service`` is stored here
+    rather than reconstructed per request for the same reason
+    ``active_scanner``/``storage`` are: it wraps a stateless
+    ``AIProviderPort`` client with no per-request state of its own, so
+    building it once at startup and reusing it is correct, not merely
+    convenient. Grouped into one dataclass, stored as a single
+    ``request.app.state`` attribute, so there is exactly one place
+    (``_state`` below) that casts out of Starlette's untyped ``State``
+    container, instead of one cast per field."""
 
     session_factory: async_sessionmaker[AsyncSession]
     active_scanner: ActiveScanner
     storage: StoragePort
+    analysis_service: AnalysisService
 
 
 def _state(request: Request) -> AppState:
@@ -87,6 +97,10 @@ def get_active_scanner(request: Request) -> ActiveScanner:
 
 def get_storage(request: Request) -> StoragePort:
     return _state(request).storage
+
+
+def get_analysis_service(request: Request) -> AnalysisService:
+    return _state(request).analysis_service
 
 
 async def get_org_session(
@@ -148,6 +162,7 @@ def get_run_scan_workflow_use_case(
     finding_repository: FindingRepositoryPort = Depends(get_finding_repository),
     active_scanner: ActiveScanner = Depends(get_active_scanner),
     storage: StoragePort = Depends(get_storage),
+    analysis_service: AnalysisService = Depends(get_analysis_service),
 ) -> RunScanWorkflowUseCase:
     return RunScanWorkflowUseCase(
         scan_repository=scan_repository,
@@ -155,4 +170,5 @@ def get_run_scan_workflow_use_case(
         finding_repository=finding_repository,
         active_scanner=active_scanner,
         storage=storage,
+        analysis_service=analysis_service,
     )

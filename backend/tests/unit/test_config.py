@@ -23,6 +23,7 @@ def _settings(**overrides: object) -> Settings:
         "minio_root_password": "a-real-minio-password",
         "minio_bucket": "scan-raw-output",
         "jwt_secret": "a-real-secret",
+        "anthropic_api_key": "a-real-anthropic-key",
     }
     defaults.update(overrides)
     return Settings(_env_file=None, **defaults)  # type: ignore[call-arg,arg-type]
@@ -77,6 +78,45 @@ def test_scanner_worker_with_no_database_url_is_valid() -> None:
     assert settings.database_url is None
 
 
+def test_ai_default_provider_and_model_have_sensible_defaults() -> None:
+    """Milestone 6 addition: AnthropicProvider is the only adapter this
+    milestone wires, so ai_default_provider defaults to "anthropic" and
+    ai_model to a rolling (non-dated-snapshot) alias -- see
+    app/config.py's field docstrings for why."""
+    settings = _settings()
+    assert settings.ai_default_provider == "anthropic"
+    assert settings.ai_model == "claude-sonnet-4-5"
+
+
+def test_api_role_requires_anthropic_api_key_when_provider_is_anthropic() -> None:
+    """Milestone 6 addition: RunScanWorkflowUseCase's AI_ANALYZE step now
+    does real work, and (Milestone 5's own unchanged decision) the API
+    process is the one that runs it -- so the API role needs a real
+    credential for whichever provider is configured, matching the
+    JWT_SECRET precedent."""
+    with pytest.raises(ValidationError, match="ANTHROPIC_API_KEY is required for worker_role=api"):
+        _settings(anthropic_api_key=None)
+
+
+def test_non_api_roles_do_not_require_anthropic_api_key() -> None:
+    """Only the API role currently runs RunScanWorkflowUseCase
+    (Milestone 5's synchronous-pipeline decision, unchanged) -- a worker
+    role has no use for an AI provider credential yet."""
+    settings = _settings(worker_role=WorkerRole.INGESTION_WORKER, anthropic_api_key=None)
+    assert settings.anthropic_api_key is None
+
+
+def test_api_role_with_non_anthropic_provider_does_not_require_anthropic_api_key() -> None:
+    """Scoped to "anthropic" specifically, not every possible provider
+    key at once -- AnthropicProvider is the only adapter this milestone
+    actually builds (see app/config.py's check_role_boundaries
+    docstring comment). Whether AI_DEFAULT_PROVIDER=openai is itself
+    usable is a composition-root concern (app/main.py's _lifespan
+    raises there), not something Settings validation polices."""
+    settings = _settings(ai_default_provider="openai", anthropic_api_key=None)
+    assert settings.anthropic_api_key is None
+
+
 def test_production_rejects_dev_default_jwt_secret() -> None:
     with pytest.raises(ValidationError, match="JWT_SECRET must be a real secret"):
         _settings(environment=Environment.PRODUCTION, jwt_secret="change_me_dev_only")
@@ -104,6 +144,18 @@ def test_production_rejects_dev_default_minio_password() -> None:
         )
 
 
+def test_production_rejects_dev_default_anthropic_api_key() -> None:
+    """Mirrors the jwt_secret/minio_root_password production-secret
+    checks exactly -- a dev-placeholder AI provider key deployed to
+    production is the same category of mistake."""
+    with pytest.raises(ValidationError, match="ANTHROPIC_API_KEY must be a real secret"):
+        _settings(
+            environment=Environment.PRODUCTION,
+            jwt_secret="a-long-real-secret-value",
+            anthropic_api_key="change_me_dev_only",
+        )
+
+
 def test_development_allows_dev_default_jwt_secret() -> None:
     settings = _settings(environment=Environment.DEVELOPMENT, jwt_secret="change_me_dev_only")
     assert settings.jwt_secret == "change_me_dev_only"
@@ -125,6 +177,7 @@ def test_get_settings_reads_from_real_environment_variables(
     monkeypatch.setenv("MINIO_ROOT_PASSWORD", "a-real-minio-password")
     monkeypatch.setenv("MINIO_BUCKET", "scan-raw-output")
     monkeypatch.setenv("JWT_SECRET", "a-real-secret")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "a-real-anthropic-key")
 
     settings = get_settings()
 

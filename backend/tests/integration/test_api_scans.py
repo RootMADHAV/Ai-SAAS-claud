@@ -8,16 +8,23 @@ bind an asyncpg connection pool to a different event loop than this
 test's own (see tests/conftest.py's ``engine`` fixture docstring for why
 that specific failure mode matters enough to design around here too).
 
-Only the three low-level providers with a real external dependency
-(``get_session_factory``, ``get_active_scanner``, ``get_storage``) are
-overridden -- see app/api/dependencies.py's module docstring. Everything
-built on top of them (``get_org_session``'s organization-existence
-check, the repository providers, the use-case providers) runs for real,
-so these tests exercise the actual org-scoping and 404/409 wiring, not a
-bypassed version of it -- the same "repositories are real, only the
-scanner/storage adapters are faked" split already established in
-tests/integration/test_scan_pipeline_orchestrator.py for the use cases
-these routes call.
+Only the low-level providers with a real external dependency
+(``get_session_factory``, ``get_active_scanner``, ``get_storage``, and
+as of Milestone 6, ``get_analysis_service``) are overridden -- see
+app/api/dependencies.py's module docstring. Everything built on top of
+them (``get_org_session``'s organization-existence check, the repository
+providers, the use-case providers) runs for real, so these tests
+exercise the actual org-scoping and 404/409 wiring, not a bypassed
+version of it -- the same "repositories are real, only the
+scanner/storage/AI-provider adapters are faked" split already
+established in tests/integration/test_scan_pipeline_orchestrator.py for
+the use cases these routes call. ``get_analysis_service`` is overridden
+with a real ``AnalysisService`` wrapping a fake ``AIProviderPort`` --
+never a fake ``AnalysisService`` itself -- for exactly the same reason
+``get_active_scanner``/``get_storage`` are faked at the port level while
+``TriggerScanUseCase``/``RunScanWorkflowUseCase`` are always real: what
+needs faking here is the one thing with a real external dependency (an
+AI provider's API), not the orchestration logic built on top of it.
 """
 
 from __future__ import annotations
@@ -30,7 +37,14 @@ import pytest
 from fastapi import FastAPI
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
-from app.api.dependencies import get_active_scanner, get_session_factory, get_storage
+from app.ai_agents.analysis_service import AnalysisService
+from app.api.dependencies import (
+    get_active_scanner,
+    get_analysis_service,
+    get_session_factory,
+    get_storage,
+)
+from app.application.interfaces.ai_provider_port import AICompletionResult, AIProviderPort
 from app.application.interfaces.scanner_port import ActiveScanner, ScanOutput
 from app.application.interfaces.storage_port import StorageObjectNotFoundError, StoragePort
 from app.domain.shared.enums import ScanStatus, WorkflowStepName, WorkflowStepStatus
@@ -101,12 +115,30 @@ class _FakeStorage(StoragePort):
         return key in self._objects
 
 
+class _FakeAIProviderPort(AIProviderPort):
+    """An AIProviderPort returning a fixed, schema-valid analysis --
+    no real Anthropic credential or network call is available or wanted
+    in this environment (the same constraint already documented for
+    Milestone 3's own scanner/storage fakes, applied here to the one new
+    external dependency Milestone 6 introduces)."""
+
+    @property
+    def provider_name(self) -> str:
+        return "fake"
+
+    async def complete(self, *, system_prompt: str, user_prompt: str) -> AICompletionResult:
+        return AICompletionResult(
+            text='{"summary": "s", "severity": "high", "remediation": "r"}',
+            model="fake-model",
+        )
+
+
 @pytest.fixture
 def wired_app(engine: AsyncEngine) -> FastAPI:
     """A fresh ``FastAPI`` app per test, wired to this test's own
-    Postgres engine plus fresh scanner/storage fakes -- never the module-
-    level ``app`` in ``app.main``, so no test can leak state into
-    another (see ``create_app()``'s own docstring on why it is a
+    Postgres engine plus fresh scanner/storage/AI-provider fakes -- never
+    the module-level ``app`` in ``app.main``, so no test can leak state
+    into another (see ``create_app()``'s own docstring on why it is a
     factory)."""
     app = create_app()
     app.dependency_overrides[get_session_factory] = lambda: async_sessionmaker(
@@ -114,6 +146,9 @@ def wired_app(engine: AsyncEngine) -> FastAPI:
     )
     app.dependency_overrides[get_active_scanner] = lambda: _FakeActiveScanner()
     app.dependency_overrides[get_storage] = lambda: _FakeStorage()
+    app.dependency_overrides[get_analysis_service] = lambda: AnalysisService(
+        provider=_FakeAIProviderPort()
+    )
     return app
 
 
@@ -188,9 +223,13 @@ async def test_create_scan_for_a_nonexistent_organization_returns_404(wired_app:
     assert response.status_code == 404
 
 
-async def test_run_scan_completes_and_marks_ai_analyze_skipped(
+async def test_run_scan_completes_and_marks_ai_analyze_completed(
     wired_app: FastAPI, db_session: AsyncSession
 ) -> None:
+    """As of Milestone 6, AI_ANALYZE is real work (a fake AIProviderPort
+    here, a real AnthropicProvider in production), not the unconditional
+    SKIPPED placeholder Milestone 4 shipped -- see
+    run_scan_workflow.py's module docstring."""
     org_id = await _create_organization(db_session)
 
     async with await _make_client(wired_app) as client:
@@ -206,7 +245,7 @@ async def test_run_scan_completes_and_marks_ai_analyze_skipped(
     assert body["status"] == ScanStatus.COMPLETED.value
     steps_by_name = {step["step_name"]: step for step in body["workflow_steps"]}
     assert steps_by_name[WorkflowStepName.AI_ANALYZE.value]["status"] == (
-        WorkflowStepStatus.SKIPPED.value
+        WorkflowStepStatus.COMPLETED.value
     )
     assert steps_by_name[WorkflowStepName.PERSIST.value]["status"] == (
         WorkflowStepStatus.COMPLETED.value

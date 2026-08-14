@@ -1,12 +1,14 @@
-"""Unit tests for app/application/scanning/run_scan_workflow.py (Milestone 4).
+"""Unit tests for app/application/scanning/run_scan_workflow.py (Milestone
+4; extended in Milestone 6 for real AI_ANALYZE wiring).
 
 Every port is faked -- per PROJECT_STATE.md section 11, fakes are for the
 consumers of a port. The real SQLAlchemy repositories, the real
-``NucleiAdapter``, and the real ``MinioStoragePort`` each already have
-their own dedicated test coverage; the concern here is this use case's
-own orchestration logic (step sequencing, status derivation, retry,
-resumption, idempotent correlate/persist), which is best isolated from
-any one port's concrete implementation. A separate integration test
+``NucleiAdapter``, the real ``MinioStoragePort``, and (as of Milestone 6)
+the real ``AnthropicProvider`` each already have their own dedicated
+test coverage; the concern here is this use case's own orchestration
+logic (step sequencing, status derivation, retry, resumption, idempotent
+correlate/persist, and now AI-analysis wiring), which is best isolated
+from any one port's concrete implementation. A separate integration test
 (tests/integration/test_scan_pipeline_orchestrator.py) exercises this
 same use case against the real Scan/Asset/Finding repositories.
 """
@@ -19,6 +21,12 @@ from uuid import UUID
 
 import pytest
 
+from app.ai_agents.analysis_service import PROMPT_VERSION, AnalysisService
+from app.application.interfaces.ai_provider_port import (
+    AICompletionResult,
+    AIProviderError,
+    AIProviderPort,
+)
 from app.application.interfaces.assets_repository import AssetRepositoryPort
 from app.application.interfaces.findings_repository import FindingRepositoryPort
 from app.application.interfaces.scanner_port import ActiveScanner, ScanOutput
@@ -37,11 +45,13 @@ from app.domain.findings.entities import (
     FindingOccurrence,
     FindingStatusHistory,
 )
+from app.domain.findings.value_objects import Severity
 from app.domain.scanning.entities import PIPELINE_STEP_ORDER, Scan, ScanScope, ScanWorkflowStep
 from app.domain.shared.clock import utcnow
 from app.domain.shared.enums import (
     AssetType,
     ScanStatus,
+    SeverityLevel,
     WorkflowStepName,
     WorkflowStepStatus,
 )
@@ -121,6 +131,11 @@ class FakeAssetRepository(AssetRepositoryPort):
             raise LookupError(f"Asset {asset.id} does not exist")
         self.assets[asset.id] = asset
 
+    async def soft_delete(self, asset_id: UUID) -> None:
+        if asset_id not in self.assets:
+            raise LookupError(f"Asset {asset_id} does not exist")
+        self.assets[asset_id].deleted_at = utcnow()
+
     async def add_observation(self, observation: AssetObservation) -> None:
         self.observations.append(observation)
 
@@ -138,6 +153,7 @@ class FakeFindingRepository(FindingRepositoryPort):
     def __init__(self) -> None:
         self.findings: dict[UUID, Finding] = {}
         self.occurrences: list[FindingOccurrence] = []
+        self.analyses: list[FindingAnalysis] = []
         self.status_history: list[FindingStatusHistory] = []
         self.raise_on_add: Exception | None = None
 
@@ -168,10 +184,10 @@ class FakeFindingRepository(FindingRepositoryPort):
         return [occ for occ in self.occurrences if occ.finding_id == finding_id]
 
     async def add_analysis(self, analysis: FindingAnalysis) -> None:
-        raise NotImplementedError
+        self.analyses.append(analysis)
 
     async def list_analyses(self, finding_id: UUID) -> list[FindingAnalysis]:
-        raise NotImplementedError
+        return [a for a in self.analyses if a.finding_id == finding_id]
 
     async def add_status_history(self, entry: FindingStatusHistory) -> None:
         self.status_history.append(entry)
@@ -237,6 +253,33 @@ class FakeActiveScanner(ActiveScanner):
         )
 
 
+@dataclass
+class FakeAIProviderPort(AIProviderPort):
+    """Records every call (count and last prompt) so tests can assert
+    AI_ANALYZE's real invocation behavior -- whether it ran at all, how
+    many times, and what it was told -- the same "record calls, assert
+    on them" pattern ``FakeActiveScanner`` already establishes for
+    ``EXECUTE_SCANNER``."""
+
+    response_text: str = (
+        '{"summary": "AI summary.", "severity": "high", "remediation": "Patch it."}'
+    )
+    raise_error: Exception | None = None
+    call_count: int = 0
+    last_user_prompt: str | None = None
+
+    @property
+    def provider_name(self) -> str:
+        return "fake"
+
+    async def complete(self, *, system_prompt: str, user_prompt: str) -> AICompletionResult:
+        self.call_count += 1
+        self.last_user_prompt = user_prompt
+        if self.raise_error is not None:
+            raise self.raise_error
+        return AICompletionResult(text=self.response_text, model="fake-model")
+
+
 def _nuclei_line(**overrides: object) -> dict[str, object]:
     line: dict[str, object] = {
         "template-id": "CVE-2021-12345",
@@ -264,6 +307,7 @@ class Harness:
     finding_repository: FakeFindingRepository
     scanner: FakeActiveScanner
     storage: FakeStorage
+    ai_provider: FakeAIProviderPort
     use_case: RunScanWorkflowUseCase
     organization_id: UUID = field(default_factory=new_id)
 
@@ -303,15 +347,24 @@ def harness() -> Harness:
     finding_repository = FakeFindingRepository()
     scanner = FakeActiveScanner(raw_jsonl_lines=[_nuclei_line()])
     storage = FakeStorage()
+    ai_provider = FakeAIProviderPort()
+    analysis_service = AnalysisService(provider=ai_provider)
     use_case = RunScanWorkflowUseCase(
         scan_repository=scan_repository,
         asset_repository=asset_repository,
         finding_repository=finding_repository,
         active_scanner=scanner,
         storage=storage,
+        analysis_service=analysis_service,
     )
     return Harness(
-        scan_repository, asset_repository, finding_repository, scanner, storage, use_case
+        scan_repository,
+        asset_repository,
+        finding_repository,
+        scanner,
+        storage,
+        ai_provider,
+        use_case,
     )
 
 
@@ -328,6 +381,11 @@ async def test_happy_path_completes_and_persists_a_finding(harness: Harness) -> 
     assert finding.title == "Example Vulnerability"
     assert finding.cvss_score == 7.5
     assert finding.cvss_vector == "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H"
+    # AI_ANALYZE now genuinely runs (Milestone 6) -- the finding gets a
+    # real AI severity estimate and a persisted analysis, on top of the
+    # CVSS data _enrich already produced.
+    assert finding.ai_severity_level is SeverityLevel.HIGH
+    assert len(harness.finding_repository.analyses) == 1
     assert len(harness.asset_repository.assets) == 1
     asset = next(iter(harness.asset_repository.assets.values()))
     assert asset.value == "example.com"
@@ -337,25 +395,40 @@ async def test_happy_path_completes_and_persists_a_finding(harness: Harness) -> 
     assert len(harness.finding_repository.status_history) == 1
 
 
-async def test_ai_analyze_is_always_skipped(harness: Harness) -> None:
+async def test_ai_analyze_completes_and_analysis_is_persisted(harness: Harness) -> None:
+    """As of Milestone 6, AI_ANALYZE is real work, not an unconditional
+    SKIPPED placeholder -- see run_scan_workflow.py's module docstring."""
     scan = await harness.trigger()
 
     await harness.use_case.execute(scan.id)
 
     steps = {s.step_name: s for s in await harness.scan_repository.list_workflow_steps(scan.id)}
-    assert steps[WorkflowStepName.AI_ANALYZE].status is WorkflowStepStatus.SKIPPED
+    assert steps[WorkflowStepName.AI_ANALYZE].status is WorkflowStepStatus.COMPLETED
     assert steps[WorkflowStepName.AI_ANALYZE].completed_at is not None
+    assert harness.ai_provider.call_count == 1
+
+    finding = next(iter(harness.finding_repository.findings.values()))
+    assert finding.ai_severity_level is SeverityLevel.HIGH
+    assert len(harness.finding_repository.analyses) == 1
+    analysis = harness.finding_repository.analyses[0]
+    assert analysis.finding_id == finding.id
+    assert analysis.ai_summary == "AI summary."
+    assert analysis.remediation_advice == "Patch it."
+    assert analysis.ai_severity_estimate is SeverityLevel.HIGH
+    assert analysis.prompt_version == PROMPT_VERSION
+    assert analysis.model_metadata == {"provider": "fake", "model": "fake-model"}
 
 
-async def test_every_other_step_is_completed(harness: Harness) -> None:
+async def test_every_step_is_completed(harness: Harness) -> None:
+    """Unlike Milestone 4's version of this test, AI_ANALYZE is no
+    longer excluded -- it is genuine work now, not an unconditional
+    SKIPPED placeholder."""
     scan = await harness.trigger()
 
     await harness.use_case.execute(scan.id)
 
     steps = {s.step_name: s for s in await harness.scan_repository.list_workflow_steps(scan.id)}
     for name in PIPELINE_STEP_ORDER:
-        if name is WorkflowStepName.AI_ANALYZE:
-            continue
         assert steps[name].status is WorkflowStepStatus.COMPLETED, name
         assert steps[name].completed_at is not None
 
@@ -406,6 +479,7 @@ async def test_already_completed_scan_is_a_no_op(harness: Harness) -> None:
 
     assert result.status is ScanStatus.COMPLETED
     assert harness.scanner.call_count == 1  # not invoked again
+    assert harness.ai_provider.call_count == 1  # not invoked again either
     assert len(harness.finding_repository.findings) == 1  # not duplicated
 
 
@@ -486,6 +560,96 @@ async def test_second_scan_of_the_same_target_is_a_recurrence(harness: Harness) 
     assert len(harness.finding_repository.status_history) == 1
 
 
+async def test_recurring_finding_appends_analysis_without_overwriting_ai_severity_level(
+    harness: Harness,
+) -> None:
+    """Mirrors the existing, pre-Milestone-6 precedent for
+    cvss_score/cvss_vector, which are likewise only ever set at Finding
+    creation and never refreshed on a later re-detection (see
+    ``_persist``'s ``existing_finding`` branch) -- ``ai_severity_level``
+    follows the same rule here, for consistency with that established
+    behavior, not as a new design decision this milestone is making
+    independently. ``finding_analyses``, by contrast, is explicitly
+    append-only (PROJECT_STATE.md section 3) and does get a fresh row
+    every time AI_ANALYZE runs, tracking each analysis attempt over
+    time."""
+    scan_one = await harness.trigger()
+    await harness.use_case.execute(scan_one.id)
+    finding = next(iter(harness.finding_repository.findings.values()))
+    first_severity = finding.ai_severity_level
+    assert first_severity is SeverityLevel.HIGH
+
+    harness.ai_provider.response_text = (
+        '{"summary": "different", "severity": "low", "remediation": "different"}'
+    )
+    scan_two = await harness.trigger()
+    await harness.use_case.execute(scan_two.id)
+
+    finding = next(iter(harness.finding_repository.findings.values()))
+    assert finding.ai_severity_level == first_severity  # unchanged, matches cvss precedent
+    assert len(harness.finding_repository.analyses) == 2  # one per scan/analysis attempt
+    assert harness.finding_repository.analyses[1].ai_severity_estimate is SeverityLevel.LOW
+
+
+async def test_ai_provider_failure_does_not_fail_the_scan(harness: Harness) -> None:
+    """A transient AI-provider hiccup on one finding must not sink an
+    otherwise-successful scan -- AI commentary has always been optional
+    for a scan to be considered done (WorkflowStepStatus.SKIPPED's own
+    pre-Milestone-6 role for this exact step)."""
+    harness.ai_provider.raise_error = AIProviderError("anthropic is down")
+    scan = await harness.trigger()
+
+    result = await harness.use_case.execute(scan.id)
+
+    assert result.status is ScanStatus.COMPLETED
+    steps = {s.step_name: s for s in await harness.scan_repository.list_workflow_steps(scan.id)}
+    assert steps[WorkflowStepName.AI_ANALYZE].status is WorkflowStepStatus.COMPLETED
+    finding = next(iter(harness.finding_repository.findings.values()))
+    assert finding.ai_severity_level is None
+    assert harness.finding_repository.analyses == []
+
+
+async def test_malformed_ai_response_does_not_fail_the_scan(harness: Harness) -> None:
+    """An AnalysisError (the provider responded, but its response failed
+    schema validation) is caught the same way an AIProviderError is --
+    see the two tests immediately around this one."""
+    harness.ai_provider.response_text = "not valid json at all"
+    scan = await harness.trigger()
+
+    result = await harness.use_case.execute(scan.id)
+
+    assert result.status is ScanStatus.COMPLETED
+    finding = next(iter(harness.finding_repository.findings.values()))
+    assert finding.ai_severity_level is None
+    assert harness.finding_repository.analyses == []
+
+
+async def test_ai_analysis_input_never_resurfaces_a_cvss_candidate_enrich_rejected(
+    harness: Harness,
+) -> None:
+    """A CVSS candidate ``_enrich`` rejects (invalid vector, here) is
+    treated as absent everywhere downstream, including in what
+    ``_ai_analyze`` tells the provider -- not silently resurrected from
+    ``NormalizedFinding``'s own unvalidated candidate. See
+    ``_ai_analyze``'s docstring."""
+    harness.scanner.raw_jsonl_lines = [
+        _nuclei_line(
+            info={
+                "name": "Finding With Unparseable Score Data",
+                "severity": "high",
+                "classification": {"cvss-score": 7.5, "cvss-metrics": "not-a-real-vector"},
+            }
+        )
+    ]
+    scan = await harness.trigger()
+
+    await harness.use_case.execute(scan.id)
+
+    assert harness.ai_provider.last_user_prompt is not None
+    assert "CVSS score" not in harness.ai_provider.last_user_prompt
+    assert "CVSS vector" not in harness.ai_provider.last_user_prompt
+
+
 async def test_second_scan_of_the_same_target_reuses_the_asset(harness: Harness) -> None:
     scan_one = await harness.trigger()
     await harness.use_case.execute(scan_one.id)
@@ -509,6 +673,7 @@ async def test_multiple_findings_against_the_same_host_share_one_asset(harness: 
     assert len(harness.asset_repository.assets) == 1
     assert len(harness.finding_repository.findings) == 2
     assert len(harness.asset_repository.observations) == 1  # one observation per (scan, asset)
+    assert harness.ai_provider.call_count == 2  # one analysis per finding
 
 
 async def test_ip_host_is_correlated_as_an_ip_asset(harness: Harness) -> None:
@@ -527,10 +692,13 @@ async def test_ip_host_is_correlated_as_an_ip_asset(harness: Harness) -> None:
 async def test_finding_without_cvss_still_persists_with_raw_evidence_preserved(
     harness: Harness,
 ) -> None:
-    """No CVSS in nuclei's output -> no cvss_score/vector on the Finding,
-    and definitely not smuggled into ai_severity_level (see _enrich's
-    docstring) -- but nuclei's own raw severity claim is not lost, it
-    travels in the occurrence's raw_evidence."""
+    """No CVSS in nuclei's output -> no cvss_score/vector on the Finding
+    -- but nuclei's own raw severity claim is not lost, it travels in the
+    occurrence's raw_evidence and in what _ai_analyze tells the provider
+    (FindingAnalysisInput.raw_severity). The AI's own severity estimate
+    (from the fake provider's canned "high" response) still ends up on
+    ai_severity_level regardless of there being no CVSS -- the two are
+    populated independently."""
     harness.scanner.raw_jsonl_lines = [
         {
             "template-id": "info-template",
@@ -545,8 +713,8 @@ async def test_finding_without_cvss_still_persists_with_raw_evidence_preserved(
     finding = next(iter(harness.finding_repository.findings.values()))
     assert finding.cvss_score is None
     assert finding.cvss_vector is None
-    assert finding.ai_severity_level is None
-    assert finding.effective_severity is None
+    assert finding.ai_severity_level is SeverityLevel.HIGH
+    assert finding.effective_severity == Severity(SeverityLevel.HIGH)
     occurrence = harness.finding_repository.occurrences[0]
     assert occurrence.raw_evidence is not None
     assert occurrence.raw_evidence["info"]["severity"] == "info"  # type: ignore[index]
@@ -584,6 +752,7 @@ async def test_no_findings_still_completes_the_scan(harness: Harness) -> None:
     assert result.status is ScanStatus.COMPLETED
     assert harness.finding_repository.findings == {}
     assert harness.asset_repository.assets == {}
+    assert harness.ai_provider.call_count == 0  # nothing to analyze
 
 
 async def test_resuming_after_a_correlate_failure_does_not_rerun_the_scanner(
@@ -613,12 +782,16 @@ async def test_resuming_after_a_correlate_failure_does_not_rerun_the_scanner(
     assert steps[WorkflowStepName.CORRELATE].retry_count == 1
 
 
-async def test_resuming_after_a_persist_failure_does_not_rerun_ai_analyze(
+async def test_resuming_after_a_persist_failure_reruns_ai_analyze(
     harness: Harness,
 ) -> None:
-    """AI_ANALYZE runs (and is marked SKIPPED) before PERSIST in pipeline
-    order. If PERSIST then fails and the scan is retried, AI_ANALYZE --
-    already SKIPPED -- must not be re-entered either."""
+    """AI_ANALYZE runs before PERSIST in pipeline order and, as of
+    Milestone 6, is treated as safe-to-recompute like every other stage
+    except EXECUTE_SCANNER (see run_scan_workflow.py's module docstring
+    on the accepted cost of this choice). If PERSIST then fails and the
+    scan is retried, AI_ANALYZE genuinely re-runs -- calling the AI
+    provider again -- unlike EXECUTE_SCANNER, which must never be
+    re-invoked for the same scan."""
     harness.finding_repository.raise_on_add = RuntimeError("transient db blip")
     scan = await harness.trigger()
 
@@ -627,15 +800,19 @@ async def test_resuming_after_a_persist_failure_does_not_rerun_ai_analyze(
     first_steps = {
         s.step_name: s for s in await harness.scan_repository.list_workflow_steps(scan.id)
     }
-    assert first_steps[WorkflowStepName.AI_ANALYZE].status is WorkflowStepStatus.SKIPPED
+    assert first_steps[WorkflowStepName.AI_ANALYZE].status is WorkflowStepStatus.COMPLETED
     assert first_steps[WorkflowStepName.PERSIST].status is WorkflowStepStatus.FAILED
+    assert harness.ai_provider.call_count == 1
+    assert harness.scanner.call_count == 1
 
     second = await harness.use_case.execute(scan.id)
 
     assert second.status is ScanStatus.COMPLETED
     steps = {s.step_name: s for s in await harness.scan_repository.list_workflow_steps(scan.id)}
-    assert steps[WorkflowStepName.AI_ANALYZE].status is WorkflowStepStatus.SKIPPED
+    assert steps[WorkflowStepName.AI_ANALYZE].status is WorkflowStepStatus.COMPLETED
     assert steps[WorkflowStepName.PERSIST].retry_count == 1
+    assert harness.ai_provider.call_count == 2  # re-invoked on the retry
+    assert harness.scanner.call_count == 1  # never re-invoked
 
 
 async def test_persist_defends_against_a_missing_asset_id(harness: Harness) -> None:

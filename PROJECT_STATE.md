@@ -334,6 +334,51 @@ relitigate these without a genuine implementation blocker -- see Rules.
   rather than directly in a test with an explicit bucket argument
   (Milestones 3-4's own tests) -- necessary, not speculative; the app
   cannot be composed without it.
+- **The `AI_ANALYZE`-before-`PERSIST` ordering tension, and how
+  Milestone 6 resolved it without reordering the locked pipeline**: the
+  locked pipeline order (`... -> enrich -> ai_analyze -> persist`) runs
+  `AI_ANALYZE` before `PERSIST`, so no `Finding.id` exists yet for a
+  brand-new finding when analysis happens -- but `FindingAnalysis.
+  finding_id` requires one. Fix: `_ai_analyze` stashes its result in
+  memory on `_PipelineItem.ai_analysis`, exactly the same pattern
+  `_enrich` already uses for `item.cvss`; `_persist`, which already
+  resolves a real `finding.id` for every item (new or recurring) before
+  this data would need one, is what actually writes `Finding.
+  ai_severity_level` and appends the `FindingAnalysis` row. A per-
+  finding `AIProviderError`/`AnalysisError` is caught and logged inside
+  `_ai_analyze`, not allowed to fail the step -- AI commentary has
+  always been optional for a scan to be considered done (`SKIPPED`'s
+  own pre-Milestone-6 role here); any other exception still propagates.
+  `Finding.ai_severity_level` is set at Finding creation only, never
+  refreshed on a later re-detection, mirroring the existing precedent
+  for `cvss_score`/`cvss_vector`; `finding_analyses` remains append-only
+  regardless, gaining a fresh row every time `AI_ANALYZE` produces a
+  result.
+- **`AI_ANALYZE` is treated as safe-to-recompute (like `normalize`/
+  `deduplicate`/`enrich`), not exempted like `EXECUTE_SCANNER`**
+  (Milestone 6) -- considered giving it the same "skip once already
+  `COMPLETED`" treatment `EXECUTE_SCANNER` gets, to avoid re-calling the
+  AI provider on a scan retried after a later-step failure. Rejected:
+  `EXECUTE_SCANNER`'s exemption exists because re-running it means
+  re-scanning a live target -- a correctness/safety concern, not merely
+  a cost one. Re-analyzing a finding with an LLM again has no
+  correctness concern, only a cost one, and giving it the same exemption
+  would require a new durability mechanism (persisting in-progress AI
+  results somewhere retrievable across `execute()` invocations, since
+  `_PipelineItem`s are rebuilt from scratch every call) this milestone
+  does not otherwise need. Accepted the real, minor cost instead (a
+  retried scan re-calls the AI provider for every finding) and flagged
+  it as Technical debt item #11, rather than building speculative
+  infrastructure to avoid it.
+- **`anthropic_api_key` required for `worker_role=api` only when
+  `ai_default_provider == "anthropic"`, not unconditionally for every
+  possible provider** (Milestone 6). `AnthropicProvider` is the only
+  adapter this milestone builds -- requiring, say, `OPENAI_API_KEY`
+  before an OpenAI adapter exists would demand a credential nothing in
+  this codebase can use yet. Pointing `AI_DEFAULT_PROVIDER` at any other
+  provider name fails at composition-root wiring time (`app/main.py`'s
+  `_lifespan`) instead, since that failure is about which adapter
+  exists to construct, not about a missing credential.
 
 ## 4. Folder structure
 
@@ -354,31 +399,31 @@ relitigate these without a genuine implementation blocker -- see Rules.
 │   ├── alembic.ini, alembic/env.py, alembic/script.py.mako,
 │   │   alembic/versions/ (initial schema migration, with RLS policies)
 │   ├── app/
-│   │   ├── main.py (done -- FastAPI app factory + lifespan, Milestone 5), config.py
+│   │   ├── main.py (done -- FastAPI app factory + lifespan, Milestone 5; extended Milestone 6 to construct AnthropicProvider/AnalysisService), config.py
 │   │   ├── domain/
 │   │   │   ├── shared/        (ids, clock, fingerprint, events, enums -- staging, see decisions)
 │   │   │   ├── findings/      (value_objects.py, entities.py -- done)
 │   │   │   ├── scanning/, assets/, identity/, reporting/   (entities.py done; behavior/state machines pending)
 │   │   ├── application/
-│   │   │   ├── interfaces/    (repository ports for all 5 bounded contexts -- done; ScannerPort/StoragePort done (Milestone 3); AIProviderPort/EventBusPort pending)
-│   │   │   ├── scanning/      (done -- trigger_scan.py, run_scan_workflow.py, normalization.py, Milestone 4)
+│   │   │   ├── interfaces/    (repository ports for all 5 bounded contexts -- done; ScannerPort/StoragePort done (Milestone 3); AIProviderPort done (Milestone 6); EventBusPort pending)
+│   │   │   ├── scanning/      (done -- trigger_scan.py, run_scan_workflow.py, normalization.py, Milestone 4; run_scan_workflow.py's AI_ANALYZE step extended Milestone 6)
 │   │   │   ├── identity/, assets/, findings/, reporting/  (use cases -- scaffolded, empty)
 │   │   ├── api/
-│   │   │   ├── dependencies.py  (done -- composition-root DI providers, Milestone 5)
+│   │   │   ├── dependencies.py  (done -- composition-root DI providers, Milestone 5; extended Milestone 6 for get_analysis_service)
 │   │   │   ├── v1/  (done -- schemas.py, scans.py -- the public Scanning API, Milestone 5)
 │   │   │   └── internal/  (done -- health.py; metrics/admin pending observability/RBAC, Milestone 5)
 │   │   ├── infrastructure/
 │   │   │   ├── db/{base.py, session.py, models/, repositories/}  (done -- all 19 tables, all 5 repositories)
 │   │   │   ├── storage/  (done -- MinioStoragePort, Milestone 3)
 │   │   │   ├── security/  (done -- target_validation.py, Milestone 3)
-│   │   │   ├── ai_providers/, vector_store/, event_bus/,
-│   │   │   │   observability/  (all scaffolded, empty)
+│   │   │   ├── ai_providers/  (done -- anthropic_provider.py, Milestone 6; OpenAI/Ollama/OpenRouter adapters pending a second real provider shape)
+│   │   │   ├── vector_store/, event_bus/, observability/  (all scaffolded, empty)
 │   │   ├── scanner_engine/
 │   │   │   ├── base_scanner.py  (done -- run_scanner_subprocess, Milestone 3)
 │   │   │   └── adapters/{nuclei,nmap,burp,zap,reconx,bughunter,sqlmap}/
 │   │   │       (nuclei/ done -- NucleiAdapter, Milestone 3; the rest
 │   │   │        remain scaffolded, empty Phase 4 stubs)
-│   │   ├── ai_agents/   (scaffolded, empty; analysis_service.py pending)
+│   │   ├── ai_agents/   (done -- analysis_service.py, Milestone 6; no BaseAgent interface yet -- YAGNI)
 │   │   └── workers/     (scaffolded, empty)
 │   └── tests/
 │       ├── conftest.py  (async Postgres fixtures -- rewritten in Milestone 2; see docs/implementation_progress.md for the discovered stray-file note)
@@ -386,11 +431,14 @@ relitigate these without a genuine implementation blocker -- see Rules.
 │       │         domain_entities, base_scanner, target_validation,
 │       │         minio_storage, nuclei_adapter, scan_status_derivation,
 │       │         normalization, trigger_scan, run_scan_workflow,
-│       │         api_schemas, health -- all seventeen done)
+│       │         api_schemas, health, anthropic_provider, analysis_service
+│       │         -- all nineteen done)
 │       └── integration/  (support.py + repository/session integration suite,
-│                 plus test_scan_pipeline_orchestrator.py (Milestone 4),
+│                 plus test_scan_pipeline_orchestrator.py (Milestone 4;
+│                 AI-provider fake added Milestone 6),
 │                 plus test_api_scans.py, test_health_ready.py,
-│                 test_main_lifespan.py (Milestone 5), all against
+│                 test_main_lifespan.py (Milestone 5; both extended
+│                 Milestone 6 for AI-provider wiring), all against
 │                 real Postgres)
 └── frontend/   (Phase 3, not started)
 ```
@@ -578,7 +626,44 @@ a separate `coverage`/SQLAlchemy-async-greenlet measurement-gap
 investigation, in `docs/session_state.md` and
 `docs/implementation_progress.md`.
 
-Milestones 6-7 and Phases 3-10 not started. See
+Milestone 6 (AI analysis service) is complete. Delivered:
+`AIProviderPort`/`AICompletionResult`/`AIProviderError`
+(`app/application/interfaces/ai_provider_port.py` -- a minimal,
+provider-agnostic "send a prompt, get text back" port, mirroring
+`ScannerPort`'s division of responsibility); `AnthropicProvider`
+(`app/infrastructure/ai_providers/anthropic_provider.py` -- the first
+concrete implementation, wrapping the official `anthropic` SDK's async
+client, whose actual installed API -- message content block types,
+exception hierarchy -- was confirmed empirically in the verification
+sandbox rather than assumed from memory); and `AnalysisService`
+(`app/ai_agents/analysis_service.py` -- the one concrete AI agent
+section 3 already named as planned, still with no formal `BaseAgent`
+interface). `RunScanWorkflowUseCase`'s `AI_ANALYZE` step
+(`app/application/scanning/run_scan_workflow.py`) now calls
+`AnalysisService` for real instead of unconditionally marking itself
+`SKIPPED` -- see section 3's two Milestone 6 dated entries for the
+ordering-tension resolution and the recomputation-cost trade-off this
+required working through. 84 new/updated tests (65 unit, 19
+integration against real Postgres), 100% coverage on every Milestone 6
+module, clean Ruff (lint + format), clean MyPy strict.
+
+As with every previous milestone, execution ran in Claude's own sandbox,
+not on `C:\Users\gamer\Downloads\claudeOnly` directly (section 13),
+including installing the `anthropic` SDK there to confirm its actual API
+before writing `AnthropicProvider` against it. One verification-honesty
+note, stated plainly rather than glossed over: this session's own
+hand-retyped sandbox copy of the real Alembic migration had a
+transcription error in the `organizations` table's RLS policy (missing
+`missing_ok=true`; too-strict `WITH CHECK`), which broke organization
+creation via the raw, unscoped session every integration test in this
+project uses to provision a test organization -- a pattern documented as
+passing against the real migration in every prior session's own
+real-repository test runs. Corrected the sandbox's own copy to unblock
+this session's verification; the real repository's actual migration
+file was read-only this entire session and was never touched. Full
+account in `docs/session_state.md`.
+
+Milestone 7 and Phases 3-10 not started. See
 `docs/implementation_progress.md` for the live version of this section.
 
 ## 7. Completed work
@@ -641,6 +726,23 @@ execution; `minio_bucket` added to `Settings`) and this session's two
 verification-honesty notes (a mid-session Filesystem MCP outage that
 changed how the sandbox schema was created; a `coverage`/SQLAlchemy-
 async-greenlet measurement-gap investigation).
+
+Milestone 6: `AIProviderPort`/`AICompletionResult`/`AIProviderError`
+(`ai_provider_port.py`), `AnthropicProvider` (`anthropic_provider.py`),
+and `AnalysisService`/`FindingAnalysisInput`/`FindingAnalysisResult`/
+`AnalysisError`/`PROMPT_VERSION` (`analysis_service.py`) -- three new
+files across `app/application/interfaces/`, `app/infrastructure/
+ai_providers/`, and `app/ai_agents/` respectively -- plus
+`run_scan_workflow.py`'s `AI_ANALYZE` step wired to call
+`AnalysisService` for real. 84 new/updated tests (65 unit, 19
+integration against real Postgres), 100% coverage on every Milestone 6
+module, clean Ruff, clean MyPy strict. See section 6 for the full
+account, including the two flagged design decisions (the
+`AI_ANALYZE`-before-`PERSIST` ordering resolution; the
+safe-to-recompute-not-exempted recomputation-cost trade-off, Technical
+debt item #11) and this session's verification-honesty note (a sandbox-
+only Alembic-migration transcription error, corrected in the sandbox
+and never propagated to the real repository).
 
 ## 8. Remaining work
 
@@ -763,36 +865,40 @@ Known quirks, confirmed empirically, not assumed:
 
 ## 15. Current Implementation Queue
 
-Status: Milestone 5 complete -- the API layer (public + internal split).
-`app/api/dependencies.py` (composition-root DI providers),
-`app/api/v1/schemas.py`/`scans.py` (the public Scanning API),
-`app/api/internal/health.py` (liveness/readiness), and `app/main.py`
-(FastAPI app factory + lifespan), wired to the Milestone 4 use cases and
-the Milestone 2 repository layer. 28 new/updated tests across 5 files,
-clean Ruff (lint + format), clean MyPy strict on every Milestone 5
-module. See section 6 for the full account, including four design/scope
-decisions flagged rather than silently resolved (Scanning-only API
-surface; no authentication yet -- Technical debt item #9; synchronous
-pipeline execution -- Technical debt item #10; `minio_bucket` added to
-`Settings`) and this session's two verification-honesty notes (a
-mid-session Filesystem MCP outage; a coverage-measurement investigation).
+Status: Milestone 6 complete -- the AI analysis service.
+`app/application/interfaces/ai_provider_port.py` (`AIProviderPort`),
+`app/infrastructure/ai_providers/anthropic_provider.py`
+(`AnthropicProvider`), and `app/ai_agents/analysis_service.py`
+(`AnalysisService`), wired into `RunScanWorkflowUseCase`'s `AI_ANALYZE`
+step. 84 new/updated tests (65 unit, 19 integration against real
+Postgres), clean Ruff (lint + format), clean MyPy strict on every
+Milestone 6 module. See section 6 for the full account, including the
+two flagged design decisions (the `AI_ANALYZE`-before-`PERSIST` ordering
+resolution; the safe-to-recompute-not-exempted recomputation-cost
+trade-off, now Technical debt item #11) and this session's
+verification-honesty note (a sandbox-only Alembic-migration
+transcription error, corrected in the sandbox only -- the real
+repository's migration file was never touched).
 
 Next Session Goal:
-Begin Milestone 6 (AI analysis service), pending explicit approval.
+Begin Milestone 7 (Docker Compose wired end-to-end), pending explicit
+approval.
 
-Files to create (Milestone 6, per the roadmap in
-docs/implementation_progress.md): `AIProviderPort`
-(`app/application/interfaces/`, following the same port-naming
-convention as `ScannerPort`/`StoragePort`), at least one concrete
-provider adapter under `app/infrastructure/ai_providers/` (Anthropic is
-the configured `ai_default_provider` per `.env.example`), and an
-`AnalysisService` (`app/ai_agents/`, per PROJECT_STATE.md section 3's
-existing note that one concrete `AnalysisService` is planned with no
-formal `BaseAgent` interface yet -- YAGNI until a second agent's real
-shape is known). Once `AnalysisService` exists,
-`RunScanWorkflowUseCase`'s `_run_ai_analyze_step` (currently
-unconditionally `SKIPPED`, per Milestone 4's decision log) becomes the
-natural place to wire it in -- revisit that method specifically, not the
-rest of the pipeline. Whether `POST .../scans/{scan_id}/run`'s existing
-API contract needs to change to surface AI results is a design question
-for that session, not decided here.
+Files to create/change (Milestone 7, per the roadmap in
+docs/implementation_progress.md): real Celery/worker wiring so
+`RunScanWorkflowUseCase.execute()` no longer runs synchronously inside
+the HTTP request handler (Technical debt item #10) -- likely a
+scanner-worker process (network-isolated per section 3's locked Docker
+Compose segmentation design) and an ingestion-worker process, with the
+API's `POST .../scans/{scan_id}/run` route dispatching a task instead of
+calling the use case directly. `docker-compose.yml` itself (currently a
+root placeholder) wired end-to-end: Postgres, Redis, MinIO, Qdrant, the
+API process, and the new worker process(es), with the `scan-egress`/
+`internal`/`queue` network segmentation section 3 already locked in
+Milestone 1. Exactly how `AnalysisService`/`RunScanWorkflowUseCase` get
+constructed inside a worker process (vs. today's API-process
+composition root in `app/main.py`) is a design question for that
+session, not decided here -- likely a second, worker-specific
+composition root, since `worker_role=scanner_worker` is explicitly
+forbidden from holding database credentials (section 3), which
+`RunScanWorkflowUseCase` as currently constructed needs.

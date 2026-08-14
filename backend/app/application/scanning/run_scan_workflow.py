@@ -13,65 +13,111 @@ Resumability (PROJECT_STATE.md section 3's stated rationale for storing
 steps as explicit rows -- "retry from the failed step, not from
 scratch") is implemented as follows: every stage except
 ``EXECUTE_SCANNER`` is a pure, side-effect-free-on-repeat computation
-(normalize/deduplicate/enrich never write anything; correlate/persist
-are guarded against duplicate writes on a retried run -- see
-``_correlate``/``_persist``), so it is always safe to run one again with
-the same inputs. This use case takes advantage of that by simply
-recomputing every one of those stages on every invocation, using
-whichever inputs are cheapest to obtain (in particular, ``normalize``
-always re-reads the scanner's raw output from durable storage rather
-than depending on anything held only in memory from a previous, possibly
-crashed, invocation). ``EXECUTE_SCANNER`` is the one stage that is
-neither cheap nor safe to blindly repeat -- re-running it means
-re-scanning a live target -- so it is the only stage this use case
-actually skips (not just "does not re-track") once its
-``ScanWorkflowStep`` row is already ``COMPLETED``; see
+(normalize/deduplicate/enrich/ai_analyze never write anything durable
+themselves; correlate/persist are guarded against duplicate writes on a
+retried run -- see ``_correlate``/``_persist``), so it is always safe to
+run one again with the same inputs. This use case takes advantage of
+that by simply recomputing every one of those stages on every
+invocation, using whichever inputs are cheapest to obtain (in
+particular, ``normalize`` always re-reads the scanner's raw output from
+durable storage rather than depending on anything held only in memory
+from a previous, possibly crashed, invocation). ``EXECUTE_SCANNER`` is
+the one stage that is neither cheap nor safe to blindly repeat --
+re-running it means re-scanning a live target -- so it is the only
+stage this use case actually skips (not just "does not re-track") once
+its ``ScanWorkflowStep`` row is already ``COMPLETED``; see
 ``_run_execute_scanner_step``.
 
-Deliberately out of scope for Milestone 4, and not built here:
-  - ``AI_ANALYZE`` has no real handler -- ``AIProviderPort`` and an
-    ``AnalysisService`` do not exist yet (Milestone 6, per the roadmap in
-    docs/implementation_progress.md). This use case unconditionally marks
-    that step ``SKIPPED`` rather than fabricating a result -- see
-    ``_run_ai_analyze_step`` and ``WorkflowStepStatus.SKIPPED``'s own
-    role in the state machine (PROJECT_STATE.md section 5). A skipped
-    step still counts as "done" for ``derive_scan_status``, so a scan
-    completes today without AI commentary, which Milestone 6 will later
-    add without needing to touch this file's control flow.
+``AI_ANALYZE``, as of Milestone 6 (``AnalysisService`` now exists -- see
+``app/ai_agents/analysis_service.py``), is wired through the same
+``_run_step`` every other "safe to recompute" stage uses -- see
+``_ai_analyze`` below for two design points worth calling out
+explicitly rather than leaving implicit:
+
+  - **Ordering.** ``AI_ANALYZE`` runs *before* ``PERSIST`` in the locked
+    pipeline order, so no ``Finding.id`` exists yet for a brand-new
+    finding at the point this stage runs. ``_ai_analyze`` therefore only
+    ever stashes its result on ``_PipelineItem.ai_analysis`` (in memory),
+    exactly the same pattern ``_enrich`` already uses for
+    ``item.cvss``; ``_persist``, which already resolves a real
+    ``finding.id`` for every item (new or recurring), is what actually
+    writes ``Finding.ai_severity_level`` and appends a
+    ``FindingAnalysis`` row. This resolves the ordering tension without
+    reordering the locked pipeline itself.
+  - **Recomputation cost.** Because ``AI_ANALYZE`` is treated as "safe to
+    recompute" rather than exempted like ``EXECUTE_SCANNER``, a scan
+    retried after a later stage (``PERSIST``) fails will call the AI
+    provider again for every finding, even ones it already analyzed
+    successfully on the failed attempt. This is a real, accepted cost
+    (an extra AI-provider call per finding on such a retry), not
+    solved with a new durability mechanism the way ``EXECUTE_SCANNER``'s
+    raw output is durably stashed in ``StoragePort`` -- unlike
+    re-scanning a live target, re-analyzing a finding with an LLM has no
+    correctness or safety concern, only a cost one, so it does not merit
+    the same exemption. See Technical debt item #11 in
+    ``docs/implementation_progress.md``.
+
+A per-finding ``AIProviderError``/``AnalysisError`` is caught inside
+``_ai_analyze`` and logged, not raised -- AI commentary has always been
+optional for a scan to be considered done (``WorkflowStepStatus.
+SKIPPED``'s own historical role for this exact step, before this
+milestone), and a transient provider hiccup on one finding should not
+fail an otherwise-successful scan's worth of real findings. Any other
+exception is a genuine bug, not an expected provider failure, and is
+allowed to propagate and fail this step like any other -- ``_ai_analyze``
+does not swallow exceptions broadly.
+
+Deliberately out of scope for Milestone 6, and not built here:
   - No ``FindingCreated``/event-bus publication after persist, even
     though PROJECT_STATE.md section 3 names this as planned ("still
     publishes after persist, for future consumers") -- ``EventBusPort``
     itself does not exist yet (see PROJECT_STATE.md section 4's folder
-    structure: "AIProviderPort/EventBusPort pending"), and this use case
-    does not invent one just to satisfy that forward reference.
+    structure: "AIProviderPort/EventBusPort pending" -- ``AIProviderPort``
+    is now done as of this milestone, ``EventBusPort`` is not), and this
+    use case does not invent one just to satisfy that forward reference.
   - Dispatching across multiple ``ActiveScanner`` implementations (a
     scanner "registry") -- only ``NucleiAdapter`` exists (Milestone 3).
     This use case is constructed with exactly one ``ActiveScanner`` and
     raises ``ScannerMismatchError`` if a ``Scan``'s recorded
     ``scanner_name`` does not match it, rather than guessing which of
     several adapters to use.
+  - Dispatching across multiple ``AIProviderPort`` implementations -- only
+    ``AnthropicProvider`` exists (Milestone 6). This use case is
+    constructed with exactly one ``AnalysisService`` (itself wrapping
+    exactly one provider), the same "don't build a registry for one
+    real implementation" reasoning already applied to
+    ``ActiveScanner``/``BaseAgent``.
   - Splitting ``EXECUTE_SCANNER`` into its own worker process, isolated
     from database access, per the scanner-worker/ingestion-worker network
     segmentation locked in PROJECT_STATE.md section 3. This use case is
-    process-agnostic -- it calls its injected ``ActiveScanner`` and
-    ``StoragePort`` directly in the same call stack as the repository
-    calls -- and is written so that whichever process ends up
-    constructing it (a single process today; a split scanner-worker /
-    ingestion-worker pair once Milestone 7 wires Docker Compose
-    end-to-end) can do so without changing this file. Which process that
-    is, and how work crosses that boundary, is deployment wiring left to
-    Milestone 7.
+    process-agnostic -- it calls its injected ``ActiveScanner``,
+    ``StoragePort``, and (as of this milestone) ``AnalysisService``
+    directly in the same call stack as the repository calls -- and is
+    written so that whichever process ends up constructing it (a single
+    process today; a split scanner-worker / ingestion-worker pair once
+    Milestone 7 wires Docker Compose end-to-end) can do so without
+    changing this file. Which process that is, and how work crosses that
+    boundary, is deployment wiring left to Milestone 7.
 """
 
 from __future__ import annotations
 
 import contextlib
 import ipaddress
+import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import TypeVar
 from uuid import UUID
 
+from app.ai_agents.analysis_service import (
+    PROMPT_VERSION,
+    AnalysisError,
+    AnalysisService,
+    FindingAnalysisInput,
+    FindingAnalysisResult,
+)
+from app.application.interfaces.ai_provider_port import AIProviderError
 from app.application.interfaces.assets_repository import AssetRepositoryPort
 from app.application.interfaces.findings_repository import FindingRepositoryPort
 from app.application.interfaces.scanner_port import ActiveScanner
@@ -79,7 +125,12 @@ from app.application.interfaces.scanning_repository import ScanRepositoryPort
 from app.application.interfaces.storage_port import StoragePort
 from app.application.scanning.normalization import NormalizedFinding, normalize_scan_output
 from app.domain.assets.entities import Asset, AssetObservation
-from app.domain.findings.entities import Finding, FindingOccurrence, FindingStatusHistory
+from app.domain.findings.entities import (
+    Finding,
+    FindingAnalysis,
+    FindingOccurrence,
+    FindingStatusHistory,
+)
 from app.domain.findings.value_objects import CVSS
 from app.domain.scanning.entities import (
     PIPELINE_STEP_ORDER,
@@ -116,6 +167,8 @@ DEFAULT_SCAN_TIMEOUT_SECONDS = 600.0
 # weighted blend" already commits to not inventing scoring logic here.
 _DIRECT_DETECTION_CONFIDENCE = 1.0
 
+logger = logging.getLogger(__name__)
+
 T = TypeVar("T")
 
 
@@ -128,16 +181,17 @@ class ScannerMismatchError(ValueError):
 @dataclass(slots=True)
 class _PipelineItem:
     """Internal, per-normalized-finding working state threaded through
-    deduplicate -> correlate -> enrich -> persist. Not a domain entity
-    and not exposed outside this module -- purely an orchestration
-    detail of how one invocation's batch is carried from stage to
-    stage."""
+    deduplicate -> correlate -> enrich -> ai_analyze -> persist. Not a
+    domain entity and not exposed outside this module -- purely an
+    orchestration detail of how one invocation's batch is carried from
+    stage to stage."""
 
     normalized: NormalizedFinding
     fingerprint: str
     existing_finding: Finding | None = None
     asset_id: UUID | None = None
     cvss: CVSS | None = None
+    ai_analysis: FindingAnalysisResult | None = None
 
 
 def _effective_host(normalized: NormalizedFinding, scan: Scan) -> str:
@@ -164,6 +218,7 @@ class RunScanWorkflowUseCase:
         finding_repository: FindingRepositoryPort,
         active_scanner: ActiveScanner,
         storage: StoragePort,
+        analysis_service: AnalysisService,
         scan_timeout_seconds: float = DEFAULT_SCAN_TIMEOUT_SECONDS,
     ) -> None:
         self._scan_repository = scan_repository
@@ -171,6 +226,7 @@ class RunScanWorkflowUseCase:
         self._finding_repository = finding_repository
         self._active_scanner = active_scanner
         self._storage = storage
+        self._analysis_service = analysis_service
         self._scan_timeout_seconds = scan_timeout_seconds
 
     async def execute(self, scan_id: UUID) -> Scan:
@@ -221,7 +277,9 @@ class RunScanWorkflowUseCase:
             await self._run_step(
                 steps_by_name[WorkflowStepName.ENRICH], lambda: self._enrich(items)
             )
-            await self._run_ai_analyze_step(steps_by_name[WorkflowStepName.AI_ANALYZE])
+            await self._run_step(
+                steps_by_name[WorkflowStepName.AI_ANALYZE], lambda: self._ai_analyze(items)
+            )
             await self._run_step(
                 steps_by_name[WorkflowStepName.PERSIST], lambda: self._persist(scan, items)
             )
@@ -294,19 +352,6 @@ class RunScanWorkflowUseCase:
             )
 
         await self._run_step(step, _do)
-
-    async def _run_ai_analyze_step(self, step: ScanWorkflowStep) -> None:
-        """Unconditionally skipped -- see module docstring. Cannot fail,
-        so no try/except is needed around it."""
-        if step.status in (WorkflowStepStatus.COMPLETED, WorkflowStepStatus.SKIPPED):
-            return
-        step.status = WorkflowStepStatus.RUNNING
-        step.started_at = step.started_at or utcnow()
-        step.error_message = None
-        await self._scan_repository.update_workflow_step(step)
-        step.status = WorkflowStepStatus.SKIPPED
-        step.completed_at = utcnow()
-        await self._scan_repository.update_workflow_step(step)
 
     async def _validate(self, scan: Scan) -> None:
         validate_target(scan.target)
@@ -401,14 +446,17 @@ class RunScanWorkflowUseCase:
         Deliberately does not fall back to nuclei's own raw
         ``raw_severity`` string when no valid CVSS exists.
         ``Finding.ai_severity_level`` is named for what it is: an AI
-        provider's own estimate (Milestone 6), not a scanner's
-        self-reported severity claim, and writing scanner data into a
-        field named for AI-derived data would misrepresent its
-        provenance. Nuclei's raw severity is not lost -- it travels in
-        ``FindingOccurrence.raw_evidence`` (see ``_persist``) -- it is
-        just not asserted as `the` severity here. A finding enriched with
-        neither a valid CVSS nor (later) an AI estimate legitimately has
-        no ``effective_severity`` yet; that is correct today, not a bug.
+        provider's own estimate (populated by ``_ai_analyze``/
+        ``_persist`` as of Milestone 6), not a scanner's self-reported
+        severity claim, and writing scanner data into a field named for
+        AI-derived data would misrepresent its provenance. Nuclei's raw
+        severity is not lost -- it travels in
+        ``FindingOccurrence.raw_evidence`` (see ``_persist``) and in the
+        prompt ``_ai_analyze`` sends the AI provider (as
+        ``FindingAnalysisInput.raw_severity``) -- it is just not
+        asserted as *the* severity here. A finding enriched with neither
+        a valid CVSS nor a usable AI estimate legitimately has no
+        ``effective_severity``; that is correct, not a bug.
         """
         for item in items:
             n = item.normalized
@@ -418,6 +466,43 @@ class RunScanWorkflowUseCase:
                 item.cvss = CVSS(score=n.cvss_score, vector=n.cvss_vector)
             except ValueError:
                 item.cvss = None
+
+    async def _ai_analyze(self, items: list[_PipelineItem]) -> None:
+        """Calls ``AnalysisService`` once per finding this invocation is
+        carrying, stashing each result on its ``_PipelineItem`` for
+        ``_persist`` to write -- see module docstring for why (the
+        pipeline-ordering tension between ``AI_ANALYZE`` running before
+        ``PERSIST`` and ``FindingAnalysis.finding_id`` needing a real,
+        already-persisted finding) and for why a per-item provider
+        failure is caught and logged here rather than allowed to fail
+        this step (and therefore the whole scan).
+
+        Uses ``item.cvss`` (the *validated* candidate ``_enrich``
+        produced), not ``item.normalized.cvss_score``/``cvss_vector``
+        (the raw, unvalidated candidate) -- a CVSS string ``_enrich``
+        rejected is treated as absent everywhere downstream, including
+        in what this step tells the AI provider, not silently
+        resurrected through a different path.
+        """
+        for item in items:
+            n = item.normalized
+            finding_input = FindingAnalysisInput(
+                title=n.title,
+                raw_severity=n.raw_severity,
+                description=n.description,
+                cve_ids=n.cve_ids,
+                cvss_score=item.cvss.score if item.cvss is not None else None,
+                cvss_vector=item.cvss.vector if item.cvss is not None else None,
+            )
+            try:
+                item.ai_analysis = await self._analysis_service.analyze(finding_input)
+            except (AIProviderError, AnalysisError) as exc:
+                logger.warning(
+                    "AI analysis unavailable for finding %r (template %r): %s",
+                    n.title,
+                    n.template_id,
+                    exc,
+                )
 
     async def _persist(self, scan: Scan, items: list[_PipelineItem]) -> None:
         pipeline_run_at = utcnow()
@@ -444,6 +529,11 @@ class RunScanWorkflowUseCase:
                     created_at=pipeline_run_at,
                     updated_at=pipeline_run_at,
                     description=n.description,
+                    ai_severity_level=(
+                        item.ai_analysis.ai_severity_estimate
+                        if item.ai_analysis is not None
+                        else None
+                    ),
                     cvss_score=item.cvss.score if item.cvss else None,
                     cvss_vector=item.cvss.vector if item.cvss else None,
                 )
@@ -472,5 +562,32 @@ class RunScanWorkflowUseCase:
                         detected_at=pipeline_run_at,
                         created_at=pipeline_run_at,
                         raw_evidence=n.raw_evidence,
+                    )
+                )
+
+            if item.ai_analysis is not None:
+                # No idempotency guard here, unlike occurrences/assets/
+                # findings above: FindingAnalysis has no scan_id column
+                # (unlike FindingOccurrence, which has one specifically
+                # so it *can* be deduped per scan -- see the initial
+                # migration) and finding_analyses is explicitly an
+                # append-only log of analysis attempts, kept "to support
+                # re-analysis history and 'what changed'"
+                # (PROJECT_STATE.md section 3). A PERSIST retry that
+                # re-reaches this point means AI_ANALYZE also re-ran (see
+                # module docstring's "Recomputation cost" note) and
+                # produced a fresh result worth recording in its own
+                # right, not a duplicate of an earlier one.
+                await self._finding_repository.add_analysis(
+                    FindingAnalysis(
+                        id=new_id(),
+                        organization_id=scan.organization_id,
+                        finding_id=finding.id,
+                        prompt_version=PROMPT_VERSION,
+                        created_at=pipeline_run_at,
+                        model_metadata=dict(item.ai_analysis.model_metadata),
+                        ai_summary=item.ai_analysis.ai_summary,
+                        ai_severity_estimate=item.ai_analysis.ai_severity_estimate,
+                        remediation_advice=item.ai_analysis.remediation_advice,
                     )
                 )

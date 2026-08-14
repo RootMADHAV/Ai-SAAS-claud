@@ -1,10 +1,12 @@
-"""Integration test for the Milestone 4 processing pipeline orchestrator,
-against real Postgres-backed repositories (Milestone 2) rather than
-fakes.
+"""Integration test for the processing pipeline orchestrator (Milestone
+4; AI_ANALYZE wiring added Milestone 6), against real Postgres-backed
+repositories (Milestone 2) rather than fakes.
 
-The scanner and object storage are still faked here (no real ``nuclei``
-binary or MinIO server is available in this environment -- the same
-constraint already documented for Milestone 3's own test suite in
+The scanner, object storage, and (as of Milestone 6) AI provider are
+still faked here (no real ``nuclei`` binary, MinIO server, or Anthropic
+credential is available in this environment -- the same constraint
+already documented for Milestone 3's own test suite, and now for
+Milestone 6's ``AnthropicProvider``, in
 docs/implementation_progress.md's Technical debt list) -- but
 ``ScanRepositoryPort``, ``AssetRepositoryPort``, and
 ``FindingRepositoryPort`` are the genuine SQLAlchemy implementations,
@@ -12,8 +14,10 @@ running against a real, RLS-enabled PostgreSQL 16 database, exercised
 inside ``session_scoped_to_org`` exactly as production code would use
 them. This is the thing tests/unit/test_run_scan_workflow.py's
 fully-faked repositories cannot prove: that this use case's repository
-calls are actually valid against the real schema (correct column types,
-foreign keys, unique constraints) and correctly tenant-scoped under RLS.
+calls -- including, as of this milestone, ``add_analysis``/
+``list_analyses`` and writing ``Finding.ai_severity_level`` -- are
+actually valid against the real schema (correct column types, foreign
+keys, unique constraints) and correctly tenant-scoped under RLS.
 """
 
 from __future__ import annotations
@@ -28,12 +32,19 @@ import pytest_asyncio
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
+from app.ai_agents.analysis_service import AnalysisService
+from app.application.interfaces.ai_provider_port import AICompletionResult, AIProviderPort
 from app.application.interfaces.scanner_port import ActiveScanner, ScanOutput
 from app.application.interfaces.storage_port import StorageObjectNotFoundError, StoragePort
 from app.application.scanning.run_scan_workflow import RunScanWorkflowUseCase
 from app.application.scanning.trigger_scan import TriggerScanUseCase
 from app.domain.shared.clock import utcnow
-from app.domain.shared.enums import AssetType, ScanStatus, WorkflowStepName, WorkflowStepStatus
+from app.domain.shared.enums import (
+    AssetType,
+    ScanStatus,
+    SeverityLevel,
+    WorkflowStepStatus,
+)
 from app.domain.shared.fingerprint import compute_fingerprint
 from app.infrastructure.db.repositories.assets_repository import SqlAlchemyAssetRepository
 from app.infrastructure.db.repositories.findings_repository import SqlAlchemyFindingRepository
@@ -93,6 +104,30 @@ class FakeActiveScanner(ActiveScanner):
         )
 
 
+@dataclass
+class FakeAIProviderPort(AIProviderPort):
+    """No real Anthropic credential is available in this environment --
+    see tests/unit/test_anthropic_provider.py for AnthropicProvider's own
+    dedicated (also-faked-SDK-client) verification tier. This fake is
+    wrapped in a real AnalysisService below, exactly as production code
+    wraps the real AnthropicProvider -- only the provider boundary is
+    faked, never AnalysisService itself."""
+
+    call_count: int = 0
+
+    @property
+    def provider_name(self) -> str:
+        return "fake"
+
+    async def complete(self, *, system_prompt: str, user_prompt: str) -> AICompletionResult:
+        self.call_count += 1
+        return AICompletionResult(
+            text='{"summary": "Integration test summary.", "severity": "critical", '
+            '"remediation": "Apply the vendor patch."}',
+            model="fake-model",
+        )
+
+
 def _nuclei_line() -> dict[str, object]:
     return {
         "template-id": "CVE-2021-99999",
@@ -119,6 +154,7 @@ class Fixtures:
     run_scan_workflow: RunScanWorkflowUseCase
     scanner: FakeActiveScanner
     storage: FakeStorage
+    ai_provider: FakeAIProviderPort
 
 
 @pytest_asyncio.fixture
@@ -136,6 +172,7 @@ async def fixtures(engine: AsyncEngine) -> AsyncIterator[Fixtures]:
         finding_repository = SqlAlchemyFindingRepository(session)
         scanner = FakeActiveScanner(raw_jsonl_lines=[_nuclei_line()])
         storage = FakeStorage()
+        ai_provider = FakeAIProviderPort()
 
         yield Fixtures(
             session=session,
@@ -147,15 +184,17 @@ async def fixtures(engine: AsyncEngine) -> AsyncIterator[Fixtures]:
                 finding_repository=finding_repository,
                 active_scanner=scanner,
                 storage=storage,
+                analysis_service=AnalysisService(provider=ai_provider),
             ),
             scanner=scanner,
             storage=storage,
+            ai_provider=ai_provider,
         )
         await session.commit()
 
     table_names = (
         "organizations, scans, scan_workflow_steps, assets, asset_observations, "
-        "findings, finding_occurrences, finding_status_history"
+        "findings, finding_occurrences, finding_analyses, finding_status_history"
     )
     async with engine.begin() as connection:
         await connection.execute(text(f"TRUNCATE TABLE {table_names} RESTART IDENTITY CASCADE"))
@@ -180,10 +219,8 @@ async def test_full_pipeline_persists_a_finding_against_real_postgres(
     assert len(steps) == 8
     assert [s.step_order for s in steps] == sorted(s.step_order for s in steps)
     for step in steps:
-        if step.step_name is WorkflowStepName.AI_ANALYZE:
-            assert step.status is WorkflowStepStatus.SKIPPED
-        else:
-            assert step.status is WorkflowStepStatus.COMPLETED
+        assert step.status is WorkflowStepStatus.COMPLETED, step.step_name
+    assert fixtures.ai_provider.call_count == 1
 
     asset_repository = SqlAlchemyAssetRepository(fixtures.session)
     finding_repository = SqlAlchemyFindingRepository(fixtures.session)
@@ -195,6 +232,17 @@ async def test_full_pipeline_persists_a_finding_against_real_postgres(
     assert finding.cvss_score == 9.8
     assert finding.effective_severity is not None
     assert finding.effective_severity.level.value == "critical"
+    # AI_ANALYZE (Milestone 6) genuinely ran and its result was persisted
+    # through the real FindingRepositoryPort/database round trip, not
+    # merely asserted against an in-memory fake as
+    # tests/unit/test_run_scan_workflow.py's own equivalent test does.
+    assert finding.ai_severity_level is SeverityLevel.CRITICAL
+
+    analyses = await finding_repository.list_analyses(finding.id)
+    assert len(analyses) == 1
+    assert analyses[0].ai_summary == "Integration test summary."
+    assert analyses[0].remediation_advice == "Apply the vendor patch."
+    assert analyses[0].model_metadata == {"provider": "fake", "model": "fake-model"}
 
     asset = await asset_repository.get_by_id(finding.asset_id)
     assert asset is not None
@@ -247,6 +295,15 @@ async def test_second_scan_against_the_same_target_updates_the_existing_finding(
     assert len(occurrences) == 2
     assert {occ.scan_id for occ in occurrences} == {first_scan.id, second_scan.id}
 
+    # AI_ANALYZE re-runs for every scan (see run_scan_workflow.py's module
+    # docstring), so finding_analyses -- an explicit append-only log --
+    # gets one row per scan, against the real database, not just the
+    # in-memory fake tests/unit/test_run_scan_workflow.py already covers
+    # this behavior against.
+    analyses = await finding_repository.list_analyses(finding.id)
+    assert len(analyses) == 2
+    assert fixtures.ai_provider.call_count == 2
+
 
 async def test_invalid_target_marks_the_scan_failed_in_postgres(fixtures: Fixtures) -> None:
     scan = await fixtures.trigger_scan.execute(
@@ -262,3 +319,4 @@ async def test_invalid_target_marks_the_scan_failed_in_postgres(fixtures: Fixtur
     assert reloaded is not None
     assert reloaded.status is ScanStatus.FAILED
     assert fixtures.scanner.call_count == 0
+    assert fixtures.ai_provider.call_count == 0
