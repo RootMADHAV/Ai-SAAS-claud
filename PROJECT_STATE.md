@@ -379,6 +379,71 @@ relitigate these without a genuine implementation blocker -- see Rules.
   provider name fails at composition-root wiring time (`app/main.py`'s
   `_lifespan`) instead, since that failure is about which adapter
   exists to construct, not about a missing credential.
+- **`run_scan` (`POST .../scans/{scan_id}/run`) now dispatches a Celery
+  task instead of executing `RunScanWorkflowUseCase` inside the HTTP
+  request handler, resolving Technical debt item #10** (Milestone 7).
+  The route performs the same two checks the use case's own `execute()`
+  always performed first (scan exists -> 404; `scanner_name` matches the
+  wired adapter -> 409, still via `ScannerMismatchError`, now raised
+  directly from the route), then dispatches
+  `app/workers/tasks.py::run_scan_workflow_task` via a new
+  `get_scan_dispatcher` seam (`app/api/dependencies.py`) and returns
+  `202 Accepted` with the scan's pre-execution state. A scan already
+  `RUNNING` is not re-dispatched -- a new, easy-to-trigger failure mode
+  this change introduces (dispatch returns almost instantly, so a
+  client can call `run` twice in rapid succession), addressed with the
+  smallest guard that closes it. `RunScanWorkflowUseCase` itself is
+  unmodified -- its own module docstring already anticipated exactly
+  this deployment-wiring decision being made in Milestone 7, not a
+  restructuring of the use case.
+- **The API process no longer constructs `MinioStoragePort` or
+  `AnthropicProvider`/`AnalysisService`, and no longer holds their
+  credentials** (Milestone 7) -- a direct, necessary consequence of the
+  dispatch change above, not unrelated cleanup: once `run_scan` no
+  longer calls `RunScanWorkflowUseCase` itself, the API process never
+  touches either adapter, so it has no further use for either
+  credential. `app/main.py`'s `_lifespan` correspondingly narrowed to
+  building only a session factory and `NucleiAdapter` (credential-free,
+  still needed for the cheap scanner-name check above); the
+  `ANTHROPIC_API_KEY`-required check in `app/config.py`'s
+  `check_role_boundaries` moved from `worker_role=api` to
+  `worker_role=ingestion_worker`, following the process that actually
+  constructs `AnalysisService` now (`app/workers/tasks.py`'s
+  `_run_scan_workflow_from_settings`, the worker's own composition
+  root, mirroring `_lifespan` almost exactly).
+- **No network-isolated `scanner_worker` split was built in Milestone
+  7, and `docker-compose.yml`'s network topology diverges from the
+  placeholder comment it replaces as a direct, discovered consequence.**
+  `RunScanWorkflowUseCase` runs completely unmodified inside one
+  `ingestion_worker` Celery task -- including its own `EXECUTE_SCANNER`
+  step, unrestructured. The placeholder this file's own `docker-
+  compose.yml` previously carried envisioned a `scanner-worker` on
+  `scan-egress`, isolated from `internal` (no route to Postgres) --
+  i.e., a worker with internet access but no database access. Given the
+  single, unsplit worker Milestone 7 actually builds needs *both*
+  database access (every pipeline step) *and* outbound internet access
+  (`EXECUTE_SCANNER`'s real scan targets, `AI_ANALYZE`'s calls to the
+  Anthropic API) inside the same process, that isolation is not
+  achievable without breaking the worker's own required functionality --
+  discovered while writing the compose file itself, not decided in
+  advance. Resolved honestly rather than silently: `worker` is attached
+  to `internal` (Postgres), `queue` (Redis/MinIO), and a new,
+  deliberately-differently-named `worker-egress` network (genuine
+  internet access) -- distinct from the placeholder's future
+  `scan-egress`, so the two are never confused as already having been
+  built. What *is* fully achievable now, and delivered: `backend` (the
+  API process) sits on `internal` with genuinely no internet route at
+  all, made possible by the credential-narrowing above. Building the
+  real split requires restructuring `RunScanWorkflowUseCase` into
+  independently-schedulable phases with a durable hand-off between them
+  -- a genuine architectural change, not "more Celery wiring," explicitly
+  out of scope for Milestone 7 and tracked as Technical debt item #12 in
+  `docs/implementation_progress.md`. Code-level scan-target safety
+  (`validate_target`'s SSRF/private-IP rejection, argument-list-only
+  subprocess execution, enforced timeouts, non-root execution) is
+  unchanged and fully enforced regardless -- this is network-level
+  defense-in-depth on top of those checks, not a gap in them, matching
+  this section's own original framing of the split.
 
 ## 4. Folder structure
 
@@ -395,22 +460,22 @@ relitigate these without a genuine implementation blocker -- see Rules.
 │       (pending -- described in chat history, not yet written as files;
 │        this document is the interim consolidated substitute)
 ├── backend/
-│   ├── pyproject.toml, Dockerfile (Dockerfile pending)
+│   ├── pyproject.toml, Dockerfile (done -- multi-stage, shared by backend+worker Compose services, Milestone 7)
 │   ├── alembic.ini, alembic/env.py, alembic/script.py.mako,
 │   │   alembic/versions/ (initial schema migration, with RLS policies)
 │   ├── app/
-│   │   ├── main.py (done -- FastAPI app factory + lifespan, Milestone 5; extended Milestone 6 to construct AnthropicProvider/AnalysisService), config.py
+│   │   ├── main.py (done -- FastAPI app factory + lifespan, Milestone 5; extended Milestone 6 to construct AnthropicProvider/AnalysisService; narrowed Milestone 7 -- no longer constructs MinioStoragePort/AnthropicProvider/AnalysisService), config.py
 │   │   ├── domain/
 │   │   │   ├── shared/        (ids, clock, fingerprint, events, enums -- staging, see decisions)
 │   │   │   ├── findings/      (value_objects.py, entities.py -- done)
 │   │   │   ├── scanning/, assets/, identity/, reporting/   (entities.py done; behavior/state machines pending)
 │   │   ├── application/
 │   │   │   ├── interfaces/    (repository ports for all 5 bounded contexts -- done; ScannerPort/StoragePort done (Milestone 3); AIProviderPort done (Milestone 6); EventBusPort pending)
-│   │   │   ├── scanning/      (done -- trigger_scan.py, run_scan_workflow.py, normalization.py, Milestone 4; run_scan_workflow.py's AI_ANALYZE step extended Milestone 6)
+│   │   │   ├── scanning/      (done -- trigger_scan.py, run_scan_workflow.py, normalization.py, Milestone 4; run_scan_workflow.py's AI_ANALYZE step extended Milestone 6; run_scan_workflow.py itself unchanged Milestone 7 -- now invoked from app/workers/tasks.py instead of app/api/v1/scans.py)
 │   │   │   ├── identity/, assets/, findings/, reporting/  (use cases -- scaffolded, empty)
 │   │   ├── api/
-│   │   │   ├── dependencies.py  (done -- composition-root DI providers, Milestone 5; extended Milestone 6 for get_analysis_service)
-│   │   │   ├── v1/  (done -- schemas.py, scans.py -- the public Scanning API, Milestone 5)
+│   │   │   ├── dependencies.py  (done -- composition-root DI providers, Milestone 5; extended Milestone 6 for get_analysis_service; narrowed Milestone 7 -- get_storage/get_analysis_service/get_run_scan_workflow_use_case/get_asset_repository/get_finding_repository removed, get_scan_dispatcher added)
+│   │   │   ├── v1/  (done -- schemas.py, scans.py -- the public Scanning API, Milestone 5; scans.py's run_scan rewritten Milestone 7 for async dispatch/202)
 │   │   │   └── internal/  (done -- health.py; metrics/admin pending observability/RBAC, Milestone 5)
 │   │   ├── infrastructure/
 │   │   │   ├── db/{base.py, session.py, models/, repositories/}  (done -- all 19 tables, all 5 repositories)
@@ -424,22 +489,25 @@ relitigate these without a genuine implementation blocker -- see Rules.
 │   │   │       (nuclei/ done -- NucleiAdapter, Milestone 3; the rest
 │   │   │        remain scaffolded, empty Phase 4 stubs)
 │   │   ├── ai_agents/   (done -- analysis_service.py, Milestone 6; no BaseAgent interface yet -- YAGNI)
-│   │   └── workers/     (scaffolded, empty)
+│   │   └── workers/     (done -- celery_app.py, tasks.py, Milestone 7; runs RunScanWorkflowUseCase inside an ingestion_worker Celery task -- see decisions)
 │   └── tests/
 │       ├── conftest.py  (async Postgres fixtures -- rewritten in Milestone 2; see docs/implementation_progress.md for the discovered stray-file note)
 │       ├── unit/    (config, ids, clock, fingerprint, events, value_objects,
 │       │         domain_entities, base_scanner, target_validation,
 │       │         minio_storage, nuclei_adapter, scan_status_derivation,
 │       │         normalization, trigger_scan, run_scan_workflow,
-│       │         api_schemas, health, anthropic_provider, analysis_service
-│       │         -- all nineteen done)
+│       │         api_schemas, health, anthropic_provider, analysis_service,
+│       │         celery_app, api_dependencies -- all twenty-one done)
 │       └── integration/  (support.py + repository/session integration suite,
 │                 plus test_scan_pipeline_orchestrator.py (Milestone 4;
 │                 AI-provider fake added Milestone 6),
 │                 plus test_api_scans.py, test_health_ready.py,
 │                 test_main_lifespan.py (Milestone 5; both extended
-│                 Milestone 6 for AI-provider wiring), all against
-│                 real Postgres)
+│                 Milestone 6 for AI-provider wiring; test_api_scans.py
+│                 rewritten and test_main_lifespan.py simplified
+│                 Milestone 7 for the async-dispatch contract),
+│                 plus test_scan_worker_task.py (Milestone 7), all
+│                 against real Postgres)
 └── frontend/   (Phase 3, not started)
 ```
 
@@ -663,8 +731,47 @@ this session's verification; the real repository's actual migration
 file was read-only this entire session and was never touched. Full
 account in `docs/session_state.md`.
 
-Milestone 7 and Phases 3-10 not started. See
-`docs/implementation_progress.md` for the live version of this section.
+Milestone 7 (Docker Compose wired end-to-end) is complete. Delivered:
+`app/workers/celery_app.py` (the Celery application instance) and
+`app/workers/tasks.py` (`execute_scan_workflow`, `_run_scan_workflow_
+from_settings`, `run_scan_workflow_task`), so `RunScanWorkflowUseCase.
+execute()` -- itself unmodified except for one new module-docstring
+paragraph -- now runs inside a real `ingestion_worker` Celery task
+instead of synchronously inside the HTTP request handler.
+`app/api/v1/scans.py`'s `run_scan` route now performs the same
+existence/scanner-name checks synchronously and dispatches, returning
+`202 Accepted`, resolving Technical debt item #10. `app/api/
+dependencies.py` and `app/main.py` narrowed accordingly -- the API
+process no longer constructs or holds credentials for `MinioStoragePort`
+or `AnthropicProvider`/`AnalysisService`, per the least-privilege design
+decision this milestone made. `docker-compose.yml` (root, replacing the
+placeholder) wires the full stack: `postgres`, `redis`, `minio`,
+`qdrant`, `backend`, `worker`. 12 new/updated tests, clean Ruff (lint +
+format), clean MyPy strict on every Milestone 7 module. See section 3's
+four new Milestone 7 dated entries for the full design-decision account,
+including the network-segmentation divergence discovered while writing
+the compose file (a `scanner_worker` split, as the placeholder this file
+replaces envisioned, is not achievable for the single, unsplit worker
+this milestone actually builds -- tracked as Technical debt item #12).
+
+As with every previous milestone, execution ran in Claude's own sandbox,
+not on `C:\Users\gamer\Downloads\claudeOnly` directly (section 13). A
+mid-session Filesystem MCP outage occurred after all implementation and
+sandbox verification was already complete, while updating a
+documentation detail -- handled per this project's standing guidance
+(stopped retrying immediately, continued sandbox-only work, resumed the
+transplant once the connector recovered; no file was left in a
+partially-written state, since nothing had been transplanted yet when
+the outage began). A genuine, pre-existing defect unrelated to this
+milestone's own scope was also found and fixed: a test helper
+(`test_api_scans.py`'s `_create_organization()`) that did not set the
+RLS org-context GUC before inserting, which a direct empirical check
+against real Postgres 16 confirmed genuinely fails against
+`organizations`' own RLS policy. Fixed in the file already being
+rewritten for this milestone's own reasons, flagged explicitly rather
+than silently folded in. Full account of both, plus a coverage-gap
+investigation that closed a real, novel gap in `app/api/dependencies.py`,
+in `docs/session_state.md` and `docs/implementation_progress.md`.
 
 ## 7. Completed work
 
@@ -743,6 +850,33 @@ safe-to-recompute-not-exempted recomputation-cost trade-off, Technical
 debt item #11) and this session's verification-honesty note (a sandbox-
 only Alembic-migration transcription error, corrected in the sandbox
 and never propagated to the real repository).
+
+Milestone 7: `app/workers/celery_app.py` (the Celery application
+instance) and `app/workers/tasks.py` (`execute_scan_workflow`,
+`_run_scan_workflow_from_settings`, `run_scan_workflow_task`) so
+`RunScanWorkflowUseCase.execute()` -- itself unmodified except for one
+new module-docstring paragraph -- now runs inside a real
+`ingestion_worker` Celery task instead of synchronously inside the HTTP
+request handler. `app/api/v1/scans.py`'s `run_scan` route rewritten to
+dispatch the task and return `202 Accepted`, resolving Technical debt
+item #10. `app/api/dependencies.py` and `app/main.py` narrowed (API
+process no longer constructs or holds credentials for `MinioStoragePort`
+or `AnthropicProvider`/`AnalysisService`). `backend/Dockerfile` (new,
+multi-stage, non-root, shared by both Compose services) and
+`backend/.dockerignore` (new). `docker-compose.yml` (root, replacing
+the placeholder) wires the full stack: `postgres`, `redis`, `minio`,
+`qdrant`, `backend`, `worker`. 12 new/updated tests (3 new unit files,
+1 new integration file, 3 existing files rewritten/simplified), clean
+Ruff, clean MyPy strict on every Milestone 7 module. See section 6 for
+the full account, including the four new section 3 dated entries
+(async-dispatch/202 contract; API least-privilege credential narrowing;
+no network-isolated scanner-worker split built; network-segmentation
+divergence from the placeholder) and the two verification-honesty notes
+(a mid-session Filesystem MCP outage after all implementation was
+already complete; a pre-existing test-helper correctness defect found
+and fixed while rewriting `test_api_scans.py`). The
+network-isolated `scanner_worker` split named in the roadmap was not
+built -- tracked as Technical debt item #12.
 
 ## 8. Remaining work
 
@@ -865,40 +999,24 @@ Known quirks, confirmed empirically, not assumed:
 
 ## 15. Current Implementation Queue
 
-Status: Milestone 6 complete -- the AI analysis service.
-`app/application/interfaces/ai_provider_port.py` (`AIProviderPort`),
-`app/infrastructure/ai_providers/anthropic_provider.py`
-(`AnthropicProvider`), and `app/ai_agents/analysis_service.py`
-(`AnalysisService`), wired into `RunScanWorkflowUseCase`'s `AI_ANALYZE`
-step. 84 new/updated tests (65 unit, 19 integration against real
-Postgres), clean Ruff (lint + format), clean MyPy strict on every
-Milestone 6 module. See section 6 for the full account, including the
-two flagged design decisions (the `AI_ANALYZE`-before-`PERSIST` ordering
-resolution; the safe-to-recompute-not-exempted recomputation-cost
-trade-off, now Technical debt item #11) and this session's
-verification-honesty note (a sandbox-only Alembic-migration
-transcription error, corrected in the sandbox only -- the real
-repository's migration file was never touched).
+Status: Milestone 7 complete -- Docker Compose wired end-to-end.
+`app/workers/celery_app.py` and `app/workers/tasks.py` now run
+`RunScanWorkflowUseCase.execute()` inside a real `ingestion_worker`
+Celery task. `app/api/v1/scans.py`'s `run_scan` dispatches the task
+and returns `202 Accepted` (Technical debt item #10 resolved).
+`app/api/dependencies.py` and `app/main.py` narrowed to least-privilege
+(API process no longer holds MinIO or Anthropic credentials).
+`docker-compose.yml` (root) wires the full stack: `postgres`, `redis`,
+`minio`, `qdrant`, `backend`, `worker`. `backend/Dockerfile` and
+`backend/.dockerignore` added. 12 new/updated tests, clean Ruff (lint +
+format), clean MyPy strict on every Milestone 7 module. See section 6
+for the full account, including the four new section 3 dated entries and
+the two verification-honesty notes. The network-isolated `scanner_worker`
+split was not built -- tracked as Technical debt item #12.
 
-Next Session Goal:
-Begin Milestone 7 (Docker Compose wired end-to-end), pending explicit
-approval.
-
-Files to create/change (Milestone 7, per the roadmap in
-docs/implementation_progress.md): real Celery/worker wiring so
-`RunScanWorkflowUseCase.execute()` no longer runs synchronously inside
-the HTTP request handler (Technical debt item #10) -- likely a
-scanner-worker process (network-isolated per section 3's locked Docker
-Compose segmentation design) and an ingestion-worker process, with the
-API's `POST .../scans/{scan_id}/run` route dispatching a task instead of
-calling the use case directly. `docker-compose.yml` itself (currently a
-root placeholder) wired end-to-end: Postgres, Redis, MinIO, Qdrant, the
-API process, and the new worker process(es), with the `scan-egress`/
-`internal`/`queue` network segmentation section 3 already locked in
-Milestone 1. Exactly how `AnalysisService`/`RunScanWorkflowUseCase` get
-constructed inside a worker process (vs. today's API-process
-composition root in `app/main.py`) is a design question for that
-session, not decided here -- likely a second, worker-specific
-composition root, since `worker_role=scanner_worker` is explicitly
-forbidden from holding database credentials (section 3), which
-`RunScanWorkflowUseCase` as currently constructed needs.
+Phase 2 (MVP backend) milestone breakdown (Milestones 1-7) is now fully
+complete. Next work requires explicit approval before beginning -- likely
+candidates include authentication (Technical debt item #9), the
+network-isolated scanner-worker split (Technical debt item #12),
+Findings/Assets/Reporting HTTP surface, and Phase 3 (MVP frontend). No
+next-milestone scope has been decided.

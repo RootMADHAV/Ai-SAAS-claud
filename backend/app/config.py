@@ -123,28 +123,38 @@ class Settings(BaseSettings):
         if self.worker_role is WorkerRole.API and self.jwt_secret is None:
             raise ValueError("JWT_SECRET is required for worker_role=api")
 
-        # Only the API actually runs RunScanWorkflowUseCase (Milestone 5's
-        # own "the pipeline runs synchronously inside the HTTP request
-        # handler" decision, unchanged by this milestone) -- so only the
-        # API role needs an AI provider credential today. Scoped to
-        # "anthropic" specifically, not every possible provider key at
-        # once: AnthropicProvider is the only adapter this milestone
-        # actually builds (PROJECT_STATE.md section 3's "don't build a
-        # registry for one real implementation" reasoning, applied here
-        # to config validation too) -- requiring, say, OPENAI_API_KEY
-        # before an OpenAI adapter exists would demand a credential
-        # nothing in this codebase can use yet. Pointing
-        # ai_default_provider at any other provider name currently fails
-        # at composition-root wiring time (app/main.py's _lifespan), not
-        # here, since that failure is about what adapter exists to
-        # construct, not about a missing credential.
+        # Milestone 7 update: RunScanWorkflowUseCase (and therefore
+        # AnalysisService/AnthropicProvider) now runs inside the
+        # ingestion_worker Celery task (app/workers/tasks.py), not
+        # inside the API's HTTP request handler -- the API process only
+        # ever checks a Scan's existence/scanner_name and dispatches a
+        # task (app/api/v1/scans.py's run_scan route); it never
+        # constructs AnalysisService itself anymore (see app/main.py's
+        # _lifespan, which correspondingly stopped constructing
+        # AnthropicProvider/AnalysisService/MinioStoragePort this
+        # milestone). So the AI-provider-credential requirement follows
+        # the process that actually needs it: ingestion_worker, not api.
+        # Still scoped to "anthropic" specifically, not every possible
+        # provider key at once -- AnthropicProvider remains the only
+        # adapter this codebase builds (PROJECT_STATE.md section 3's
+        # "don't build a registry for one real implementation"
+        # reasoning, applied here to config validation too) -- requiring,
+        # say, OPENAI_API_KEY before an OpenAI adapter exists would
+        # demand a credential nothing in this codebase can use yet.
+        # Pointing ai_default_provider at any other provider name
+        # currently fails at composition-root wiring time
+        # (app/workers/tasks.py's _run_scan_workflow_from_settings, the
+        # ingestion_worker's own composition root, mirroring
+        # app/main.py's _lifespan exactly), not here, since that failure
+        # is about what adapter exists to construct, not about a missing
+        # credential.
         if (
-            self.worker_role is WorkerRole.API
+            self.worker_role is WorkerRole.INGESTION_WORKER
             and self.ai_default_provider == "anthropic"
             and self.anthropic_api_key is None
         ):
             raise ValueError(
-                "ANTHROPIC_API_KEY is required for worker_role=api when "
+                "ANTHROPIC_API_KEY is required for worker_role=ingestion_worker when "
                 "AI_DEFAULT_PROVIDER=anthropic (the default)"
             )
 

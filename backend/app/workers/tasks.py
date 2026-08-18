@@ -1,0 +1,218 @@
+"""The Celery task that actually runs the scan pipeline off the HTTP
+request thread -- Milestone 7's core deliverable (PROJECT_STATE.md
+section 15; Technical debt item #10 in docs/implementation_progress.md).
+
+Three layers, deliberately kept separate so this module is testable at
+the same tier every other use case in this codebase already is (fully
+faked, against real Postgres, per PROJECT_STATE.md section 11):
+
+  1. :func:`execute_scan_workflow` -- a plain, fully-injectable async
+     function. Takes every dependency ``RunScanWorkflowUseCase`` needs as
+     an explicit parameter (a session factory plus the three Milestone 3/6
+     adapters) and does nothing more than open one RLS-scoped session
+     (``session_scoped_to_org``, exactly as ``app/api/dependencies.py``'s
+     ``get_org_session`` already does for the API process) and call
+     ``RunScanWorkflowUseCase.execute()``. No ``Settings``, no Celery, no
+     real adapter construction -- this is the function
+     ``tests/integration/test_scan_worker_task.py`` calls directly with
+     fakes, against a real test database, mirroring
+     ``tests/integration/test_scan_pipeline_orchestrator.py``'s existing
+     pattern for the use case itself.
+  2. :func:`_run_scan_workflow_from_settings` -- the worker-specific
+     composition root. Builds the real engine and the three adapters from
+     ``Settings`` (mirroring ``app/main.py``'s ``_lifespan``, but for
+     ``worker_role=ingestion_worker`` instead of ``worker_role=api`` --
+     see that module's docstring for why the API process no longer builds
+     these itself as of this milestone) and calls layer 1. This is the
+     layer that is hard to unit-test in isolation (it needs real
+     Settings/credentials) and is not unit-tested directly for that
+     reason -- the same judgment call already made for ``_lifespan``
+     itself, which ``tests/integration/test_main_lifespan.py`` verifies
+     by actually running it, not by re-implementing its logic in a test.
+  3. :data:`run_scan_workflow_task` -- the actual
+     ``@celery_app.task``-decorated entrypoint. Celery tasks are
+     ordinary synchronous callables; this one's entire body is
+     ``asyncio.run(...)`` around layer 2.
+
+A fresh ``AsyncEngine`` is constructed *inside* the same
+``asyncio.run()`` call that drives one task invocation, and disposed
+before that call returns -- never cached at module scope across
+invocations. This is not a style preference:
+``asyncio.run()`` creates a new event loop every call, and an asyncpg
+connection pool is bound to the loop it was created in, so reusing one
+engine across task invocations would break the moment two tasks ran in
+the same worker process, one after another -- the exact
+``another operation is in progress``-class failure this codebase already
+documented and deliberately avoided for exactly this reason in
+``tests/conftest.py``'s ``engine`` fixture (function-scoped there for the
+same underlying cause). The accepted cost -- one new connection pool per
+task invocation -- is deliberate, not an oversight: matching
+``tests/conftest.py``'s own stated reasoning ("the cost is one new
+connection pool per test, which is negligible at this suite's size"),
+scaled up to "per scan run" here, where a fresh pool is a small, one-time
+cost relative to the minutes-long scanner subprocess and AI-provider
+calls the task spends most of its time waiting on.
+
+Deliberately out of scope for this milestone -- see PROJECT_STATE.md
+section 3's Milestone 7 entry and Technical debt item #12 in
+docs/implementation_progress.md for the full account:
+  - No separate, network-isolated ``scanner_worker`` process. This
+    module wires exactly one worker role, ``ingestion_worker`` (already
+    defined in ``app/config.py`` since Milestone 1), running the
+    complete, unrestructured ``RunScanWorkflowUseCase`` -- including its
+    own call to the real scanner adapter. Splitting ``EXECUTE_SCANNER``
+    into its own DB-credential-free hop is real future work, not
+    attempted here; see ``run_scan_workflow.py``'s own module docstring,
+    which already anticipated exactly this deferral.
+  - No Celery ``autoretry_for``/``max_retries`` policy. A failed task
+    (a genuine bug, not an ordinary scan failure -- see below) is
+    reported to Celery as a task failure and left there; automatic
+    retry policy is a deliberate scope boundary for this milestone, not
+    an oversight -- the resumability story this codebase already has
+    (re-``POST .../run`` retries a failed scan from its failed step,
+    per ``RunScanWorkflowUseCase``'s own docstring) already gives a
+    human or a future scheduled job a correct way to retry, without
+    needing Celery's own retry machinery layered on top of it.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from typing import TYPE_CHECKING
+from uuid import UUID
+
+from app.ai_agents.analysis_service import AnalysisService
+from app.application.interfaces.scanner_port import ActiveScanner
+from app.application.interfaces.storage_port import StoragePort
+from app.application.scanning.run_scan_workflow import RunScanWorkflowUseCase
+from app.config import get_settings
+from app.infrastructure.ai_providers.anthropic_provider import AnthropicProvider
+from app.infrastructure.db.repositories.assets_repository import SqlAlchemyAssetRepository
+from app.infrastructure.db.repositories.findings_repository import SqlAlchemyFindingRepository
+from app.infrastructure.db.repositories.scanning_repository import SqlAlchemyScanRepository
+from app.infrastructure.db.session import (
+    create_engine,
+    create_session_factory,
+    session_scoped_to_org,
+)
+from app.infrastructure.storage.minio_storage import MinioStoragePort
+from app.scanner_engine.adapters.nuclei.adapter import NucleiAdapter
+from app.workers.celery_app import celery_app
+
+if TYPE_CHECKING:
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+
+async def execute_scan_workflow(
+    *,
+    session_factory: async_sessionmaker[AsyncSession],
+    active_scanner: ActiveScanner,
+    storage: StoragePort,
+    analysis_service: AnalysisService,
+    organization_id: UUID,
+    scan_id: UUID,
+) -> None:
+    """Open one RLS-scoped session for ``organization_id`` and run
+    ``RunScanWorkflowUseCase.execute(scan_id)`` against it -- every
+    dependency is passed in explicitly, so a test can supply fakes for
+    ``active_scanner``/``storage``/``analysis_service`` and a real
+    Postgres-backed ``session_factory``, exactly mirroring
+    ``tests/integration/test_scan_pipeline_orchestrator.py``'s existing
+    fixture for the use case this function wraps.
+    """
+    async with session_scoped_to_org(session_factory, organization_id) as session:
+        use_case = RunScanWorkflowUseCase(
+            scan_repository=SqlAlchemyScanRepository(session),
+            asset_repository=SqlAlchemyAssetRepository(session),
+            finding_repository=SqlAlchemyFindingRepository(session),
+            active_scanner=active_scanner,
+            storage=storage,
+            analysis_service=analysis_service,
+        )
+        await use_case.execute(scan_id)
+
+
+async def _run_scan_workflow_from_settings(organization_id: UUID, scan_id: UUID) -> None:
+    """The worker-specific composition root -- mirrors ``app/main.py``'s
+    ``_lifespan`` exactly, but for ``worker_role=ingestion_worker``
+    (this process's own role, not the API's) and built fresh per task
+    invocation rather than once at process startup, per this module's
+    docstring on why an engine/session factory cannot be cached across
+    ``asyncio.run()`` calls.
+    """
+    settings = get_settings()
+    # Settings.check_role_boundaries (app/config.py) already guarantees
+    # database_url/minio_*/anthropic_api_key (when ai_default_provider is
+    # left at its "anthropic" default) are not None for
+    # worker_role=ingestion_worker -- a genuinely missing value already
+    # raised at Settings() construction, before this function ever runs.
+    # These asserts exist for mypy strict's benefit, matching the
+    # identical pattern already used in app/main.py's _lifespan.
+    assert settings.database_url is not None
+    assert settings.minio_endpoint is not None
+    assert settings.minio_root_user is not None
+    assert settings.minio_root_password is not None
+    assert settings.minio_bucket is not None
+
+    if settings.ai_default_provider != "anthropic":
+        # Same fail-fast check app/main.py's _lifespan already makes for
+        # the API process -- AnthropicProvider is the only AIProviderPort
+        # implementation this codebase has (see run_scan_workflow.py's
+        # module docstring), and this worker is the process that
+        # actually constructs and calls it as of this milestone.
+        raise ValueError(
+            f"ai_default_provider={settings.ai_default_provider!r} has no adapter wired "
+            "as of Milestone 6 -- only 'anthropic' does"
+        )
+    assert settings.anthropic_api_key is not None
+
+    engine = create_engine(settings)
+    try:
+        await execute_scan_workflow(
+            session_factory=create_session_factory(engine),
+            active_scanner=NucleiAdapter(),
+            storage=MinioStoragePort(
+                endpoint=settings.minio_endpoint,
+                access_key=settings.minio_root_user,
+                secret_key=settings.minio_root_password,
+                bucket=settings.minio_bucket,
+            ),
+            analysis_service=AnalysisService(
+                provider=AnthropicProvider(
+                    api_key=settings.anthropic_api_key, model=settings.ai_model
+                )
+            ),
+            organization_id=organization_id,
+            scan_id=scan_id,
+        )
+    finally:
+        await engine.dispose()
+
+
+@celery_app.task(name="scanning.run_scan_workflow")
+def run_scan_workflow_task(organization_id: str, scan_id: str) -> None:
+    """The actual Celery entrypoint, dispatched by
+    ``app/api/v1/scans.py``'s ``run_scan`` route via
+    ``app/api/dependencies.py``'s ``get_scan_dispatcher`` seam.
+
+    Arguments are plain strings, not ``UUID``, because Celery task
+    arguments must be JSON-serializable for the default broker transport
+    -- parsed back into ``UUID`` immediately, so nothing past this one
+    line ever handles a raw string where a ``UUID`` belongs, matching
+    this codebase's existing convention everywhere else.
+
+    Any exception raised here (``LookupError``/``ScannerMismatchError``
+    from a scan or organization that no longer exists by the time this
+    task actually runs, or a genuine bug) propagates out of this
+    function and is recorded by Celery as a failed task -- it is not
+    caught and swallowed here. This is different from, and does not
+    conflict with, how ``RunScanWorkflowUseCase.execute()`` itself
+    already handles an *ordinary* scan failure (an unreachable target, a
+    scanner crash): that is recorded on the scan's own
+    ``ScanWorkflowStep`` rows and reflected in ``Scan.status``, and
+    ``execute()`` returns normally rather than raising -- so a normal
+    scan failure never reaches this function as an exception at all,
+    only genuine misuse does (see ``run_scan_workflow.py``'s own
+    docstring on this distinction).
+    """
+    asyncio.run(_run_scan_workflow_from_settings(UUID(organization_id), UUID(scan_id)))

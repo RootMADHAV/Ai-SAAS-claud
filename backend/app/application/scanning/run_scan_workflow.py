@@ -98,6 +98,15 @@ Deliberately out of scope for Milestone 6, and not built here:
     Milestone 7 wires Docker Compose end-to-end) can do so without
     changing this file. Which process that is, and how work crosses that
     boundary, is deployment wiring left to Milestone 7.
+
+Milestone 7 update: this file is unchanged. Milestone 7 decided (see
+PROJECT_STATE.md section 3's Milestone 7 entry and Technical debt item #12
+in docs/implementation_progress.md) to run this entire use case, exactly
+as written above, inside one ``ingestion_worker`` Celery task
+(``app/workers/tasks.py``) rather than inside the API's HTTP request
+handler. The scanner-worker/ingestion-worker network-isolated split
+described in the paragraph above remains future work -- this use case
+still is not, and does not need to be, restructured to support it.
 """
 
 from __future__ import annotations

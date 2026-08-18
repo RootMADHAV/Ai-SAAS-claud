@@ -1,0 +1,13 @@
+# Never bake secrets or local dev state into the image.
+.env
+.venv
+venv
+__pycache__
+*.pyc
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.coverage
+*.egg-info
+.git
+app.db

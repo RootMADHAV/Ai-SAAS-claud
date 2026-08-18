@@ -1,14 +1,197 @@
-# Placeholder -- full service definitions land in Milestone 7.
+# Full stack, wired end-to-end (Milestone 7 -- PROJECT_STATE.md section
+# 15). Two application services (`backend`, `worker`) share one image
+# (backend/Dockerfile) and differ only in `command:`/`WORKER_ROLE`; four
+# infrastructure services (`postgres`, `redis`, `minio`, `qdrant`).
 #
-# Target shape (see PROJECT_STATE.md, section 1 and "Design decisions"):
-#   - postgres, redis, minio, minio-init, qdrant   (infra, network: internal/queue)
-#   - backend, worker                              (network: internal, queue)
-#   - scanner-worker                                (network: scan-egress, queue --
-#                                                     deliberately NOT on `internal`,
-#                                                     no route to postgres)
-#   - frontend                                      (network: internal, Phase 3)
-#   - prometheus, grafana                           (behind `--profile observability`)
+# Network segmentation, as actually achievable by this milestone's
+# architecture (read this before assuming it matches the placeholder
+# comment this file replaces -- see the note below):
+#   - `internal` (internal: true, no route to the outside world):
+#     `postgres` and `backend`. As of Milestone 7, the API process
+#     genuinely never makes an outbound call to anything but Postgres
+#     and Redis (see app/main.py's module docstring -- it stopped
+#     constructing MinioStoragePort/AnthropicProvider this milestone),
+#     so giving it zero internet route is both correct and, unlike
+#     before, actually free -- not a restriction fought against
+#     elsewhere in the stack.
+#   - `queue`: `redis`, `minio`, `qdrant`, `backend`, `worker` -- the
+#     one network every service that needs to reach the message broker
+#     or object storage shares.
+#   - `worker-egress` (a plain, non-internal bridge -- genuine outbound
+#     internet access): `worker` only.
 #
-# Do not add real service definitions here outside of Milestone 7 --
-# see AI_ENGINEERING_RULES.md on never implementing more than one
-# milestone's worth of work in a session.
+# IMPORTANT design note, stated plainly rather than silently diverged
+# from: the placeholder this file replaces named a `scanner-worker`
+# service "network: scan-egress, queue -- deliberately NOT on internal,
+# no route to postgres", implying scanning and database access would be
+# split across two separate worker processes. This milestone
+# deliberately does NOT build that split (see PROJECT_STATE.md's
+# Milestone 7 entry and Technical debt item #12 in
+# docs/implementation_progress.md for the full account) --
+# RunScanWorkflowUseCase still runs as one unrestructured unit inside
+# the `worker` (ingestion_worker) service, and that use case's own
+# EXECUTE_SCANNER step needs to reach arbitrary user-supplied scan
+# targets over the network, exactly as its AI_ANALYZE step needs to
+# reach the Anthropic API. `worker` therefore genuinely needs both
+# database access AND outbound internet in this milestone's real
+# architecture -- it cannot be network-isolated from the internet the
+# way the placeholder envisioned, and this file does not pretend
+# otherwise. `worker-egress` names that real, current requirement
+# honestly; it is NOT the same thing as the future, more tightly-scoped
+# `scan-egress` network a real scanner-worker split would introduce,
+# and is named differently on purpose so the two are never confused.
+# Code-level scan-target safety (SSRF/private-IP rejection, argument-
+# list-only subprocess execution, enforced timeouts, non-root) is
+# unchanged and still fully enforced regardless -- see
+# app/infrastructure/security/target_validation.py and
+# app/scanner_engine/base_scanner.py; this network topology is a
+# defense-in-depth layer on top of those checks, not a replacement for
+# them, exactly as PROJECT_STATE.md section 3 already states for the
+# originally-envisioned split.
+#
+# No separate `minio-init`/`createbuckets` service: MinioStoragePort
+# already creates its bucket lazily on first write
+# (app/infrastructure/storage/minio_storage.py's `_ensure_bucket`), so a
+# one-shot init container would duplicate logic that already exists and
+# already runs, not add a capability this stack is missing.
+
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_SUPERUSER_PASSWORD:-change_me_dev_only}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      # Reuses the same bootstrap script docker-compose.dev.yml already
+      # uses for local development: creates app_user as NOSUPERUSER
+      # (never the Postgres bootstrap superuser -- a superuser bypasses
+      # Row-Level Security entirely, defeating the tenant-isolation
+      # guarantee this project is built around from day one) and the
+      # security_platform database it owns. See that script's own
+      # comment for the full rationale.
+      - ./docker/dev-init/01-create-app-role-and-test-db.sql:/docker-entrypoint-initdb.d/01-create-app-role-and-test-db.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - internal
+
+  redis:
+    image: redis:7
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - queue
+
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minio_admin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-change_me_dev_only}
+    volumes:
+      - minio_data:/data
+    ports:
+      # Only the admin console, for a human operator to inspect stored
+      # scan output -- the S3 API port (9000) is never exposed to the
+      # host; only `backend`/`worker` on the `queue` network reach it.
+      - "9001:9001"
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - queue
+
+  qdrant:
+    image: qdrant/qdrant:latest
+    volumes:
+      - qdrant_data:/qdrant/storage
+    networks:
+      - queue
+    # Running from day one per PROJECT_STATE.md section 2 ("Qdrant ...
+    # running from day one per requirement; unused until Phase 5 RAG"),
+    # not yet called by any application code -- no healthcheck-gated
+    # `depends_on` anywhere in this file waits on it, since nothing yet
+    # needs it to be ready.
+
+  backend:
+    build:
+      context: ./backend
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000
+    environment:
+      ENVIRONMENT: ${ENVIRONMENT:-development}
+      WORKER_ROLE: api
+      DATABASE_URL: postgresql+asyncpg://app_user:${APP_DB_PASSWORD:-app_password}@postgres:5432/security_platform
+      REDIS_URL: redis://redis:6379/0
+      # MinIO settings are still required by Settings.check_role_boundaries
+      # for every worker_role (app/config.py) even though this process
+      # never constructs MinioStoragePort itself as of this milestone --
+      # see that check's own comment for why the requirement stayed
+      # uniform across roles rather than narrowing per-role.
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minio_admin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-change_me_dev_only}
+      MINIO_BUCKET: ${MINIO_BUCKET:-scan-raw-output}
+      JWT_SECRET: ${JWT_SECRET:-change_me_dev_only}
+      # No ANTHROPIC_API_KEY here -- worker_role=api no longer requires
+      # or uses it (see app/config.py's check_role_boundaries and
+      # app/main.py's module docstring); it belongs to `worker` below.
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - internal
+      - queue
+
+  worker:
+    build:
+      context: ./backend
+    command: celery -A app.workers.celery_app worker --loglevel=info -Q scans
+    environment:
+      ENVIRONMENT: ${ENVIRONMENT:-development}
+      WORKER_ROLE: ingestion_worker
+      DATABASE_URL: postgresql+asyncpg://app_user:${APP_DB_PASSWORD:-app_password}@postgres:5432/security_platform
+      REDIS_URL: redis://redis:6379/0
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minio_admin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-change_me_dev_only}
+      MINIO_BUCKET: ${MINIO_BUCKET:-scan-raw-output}
+      AI_DEFAULT_PROVIDER: ${AI_DEFAULT_PROVIDER:-anthropic}
+      AI_MODEL: ${AI_MODEL:-claude-sonnet-4-5}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:?ANTHROPIC_API_KEY must be set -- see .env.example}
+      # No JWT_SECRET here -- only worker_role=api requires it
+      # (app/config.py); this process never issues or verifies a token.
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    networks:
+      - internal
+      - queue
+      - worker-egress
+
+networks:
+  internal:
+    internal: true
+  queue: {}
+  worker-egress: {}
+
+volumes:
+  postgres_data:
+  minio_data:
+  qdrant_data:

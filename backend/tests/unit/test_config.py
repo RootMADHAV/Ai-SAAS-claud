@@ -88,32 +88,53 @@ def test_ai_default_provider_and_model_have_sensible_defaults() -> None:
     assert settings.ai_model == "claude-sonnet-4-5"
 
 
-def test_api_role_requires_anthropic_api_key_when_provider_is_anthropic() -> None:
-    """Milestone 6 addition: RunScanWorkflowUseCase's AI_ANALYZE step now
-    does real work, and (Milestone 5's own unchanged decision) the API
-    process is the one that runs it -- so the API role needs a real
-    credential for whichever provider is configured, matching the
-    JWT_SECRET precedent."""
-    with pytest.raises(ValidationError, match="ANTHROPIC_API_KEY is required for worker_role=api"):
-        _settings(anthropic_api_key=None)
+def test_ingestion_worker_role_requires_anthropic_api_key_when_provider_is_anthropic() -> None:
+    """Milestone 7 update: RunScanWorkflowUseCase (and therefore
+    AnalysisService) now runs inside the ingestion_worker Celery task
+    (app/workers/tasks.py), not the API's HTTP request handler -- so the
+    credential requirement moved with it. See app/config.py's
+    check_role_boundaries docstring comment for the full account."""
+    with pytest.raises(
+        ValidationError,
+        match="ANTHROPIC_API_KEY is required for worker_role=ingestion_worker",
+    ):
+        _settings(worker_role=WorkerRole.INGESTION_WORKER, anthropic_api_key=None)
 
 
-def test_non_api_roles_do_not_require_anthropic_api_key() -> None:
-    """Only the API role currently runs RunScanWorkflowUseCase
-    (Milestone 5's synchronous-pipeline decision, unchanged) -- a worker
-    role has no use for an AI provider credential yet."""
-    settings = _settings(worker_role=WorkerRole.INGESTION_WORKER, anthropic_api_key=None)
+def test_api_role_does_not_require_anthropic_api_key() -> None:
+    """Milestone 7 update: the API process no longer constructs
+    AnalysisService/AnthropicProvider itself -- app/main.py's _lifespan
+    stopped doing so this milestone, since app/api/v1/scans.py's
+    run_scan route only checks a scan's existence/scanner_name and
+    dispatches a Celery task, never running the pipeline directly. A
+    process that never touches an AI provider has no need for its
+    credential -- least-privilege, not an oversight."""
+    settings = _settings(worker_role=WorkerRole.API, anthropic_api_key=None)
     assert settings.anthropic_api_key is None
 
 
-def test_api_role_with_non_anthropic_provider_does_not_require_anthropic_api_key() -> None:
+def test_scanner_worker_role_does_not_require_anthropic_api_key() -> None:
+    """Never did, and Milestone 7 does not change this -- scanner_worker
+    is not a role this codebase wires an AI provider into."""
+    settings = _settings(
+        worker_role=WorkerRole.SCANNER_WORKER, database_url=None, anthropic_api_key=None
+    )
+    assert settings.anthropic_api_key is None
+
+
+def test_ingestion_worker_with_non_anthropic_provider_skips_anthropic_key_check() -> None:
     """Scoped to "anthropic" specifically, not every possible provider
-    key at once -- AnthropicProvider is the only adapter this milestone
-    actually builds (see app/config.py's check_role_boundaries
-    docstring comment). Whether AI_DEFAULT_PROVIDER=openai is itself
-    usable is a composition-root concern (app/main.py's _lifespan
-    raises there), not something Settings validation polices."""
-    settings = _settings(ai_default_provider="openai", anthropic_api_key=None)
+    key at once -- AnthropicProvider is the only adapter this codebase
+    actually builds (see app/config.py's check_role_boundaries docstring
+    comment). Whether AI_DEFAULT_PROVIDER=openai is itself usable is a
+    composition-root concern (app/workers/tasks.py's
+    _run_scan_workflow_from_settings raises there, mirroring
+    app/main.py's _lifespan), not something Settings validation polices."""
+    settings = _settings(
+        worker_role=WorkerRole.INGESTION_WORKER,
+        ai_default_provider="openai",
+        anthropic_api_key=None,
+    )
     assert settings.anthropic_api_key is None
 
 
