@@ -18,7 +18,13 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from uuid import UUID
 
-from app.domain.identity.entities import AuditLogEntry, Organization, OrganizationMember, User
+from app.domain.identity.entities import (
+    AuditLogEntry,
+    Organization,
+    OrganizationMember,
+    RefreshToken,
+    User,
+)
 
 
 class OrganizationRepositoryPort(ABC):
@@ -103,3 +109,30 @@ class AuditLogRepositoryPort(ABC):
     async def list_for_organization(
         self, organization_id: UUID, limit: int = 100
     ) -> list[AuditLogEntry]: ...
+
+
+class RefreshTokenRepositoryPort(ABC):
+    """Persistence for ``RefreshToken`` rows. Not
+    org-scoped -- like ``UserRepositoryPort``, ``refresh_tokens`` carries
+    no ``organization_id`` column and has no RLS policy (see the initial
+    migration's module docstring on tables with no ``organization_id`` at
+    all)."""
+
+    @abstractmethod
+    async def add(self, token: RefreshToken) -> None: ...
+
+    @abstractmethod
+    async def get_by_token_hash(self, token_hash: str) -> RefreshToken | None:
+        """Look up by the natural key a client's raw refresh token hashes
+        to -- the only way this repository is ever queried, since a raw
+        refresh token is never itself persisted (see ``RefreshToken``'s
+        own docstring)."""
+        ...
+
+    @abstractmethod
+    async def revoke(self, token_id: UUID) -> None:
+        """Sets ``revoked_at``. Does not delete the row -- a revoked
+        token that is later replayed should still be recognizable as
+        "this token existed and was revoked," not indistinguishable from
+        one that never existed at all."""
+        ...

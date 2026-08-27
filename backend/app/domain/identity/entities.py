@@ -100,3 +100,31 @@ class OrganizationMember:
     status: MembershipStatus
     created_at: datetime
     updated_at: datetime
+
+
+@dataclass(slots=True)
+class RefreshToken:
+    """A JWT refresh-token record. ``token_hash`` is a
+    SHA-256 hex digest of the raw opaque token handed to the client --
+    the raw value itself is never persisted (mirrors ``User.
+    hashed_password``'s own "never store the plaintext secret"
+    principle, using a fast hash here rather than bcrypt since a refresh
+    token, unlike a password, is already high-entropy random data, not
+    something a human chose). ``revoked_at`` is this entity's own
+    lifecycle field (not soft-deleted, matching ``OrganizationMember.
+    status`` above) -- refresh-token rotation
+    (app/application/identity/tokens.py) revokes the presented token and
+    issues a fresh one rather than deleting rows outright, so a reused/
+    stolen token can still be recognized and rejected instead of
+    silently vanishing."""
+
+    id: UUID
+    user_id: UUID
+    token_hash: str
+    expires_at: datetime
+    created_at: datetime
+    revoked_at: datetime | None = None
+
+    @property
+    def is_active(self) -> bool:
+        return self.revoked_at is None

@@ -62,6 +62,21 @@ running inside the Celery task, ``app/workers/tasks.py``) -- duplicating
 it here would only save one wasted task dispatch for an edge case that
 costs nothing else to let the task itself short-circuit on, the same way
 it always has.
+
+Authentication update, resolving Technical Debt #9: every route now
+depends on ``require_organization_member`` (app/api/dependencies.py) --
+a request with no valid httpOnly ``access_token`` cookie gets 401
+(``get_current_user``, which ``require_organization_member`` itself
+depends on); a request from an authenticated user who is not an
+``ACTIVE`` member of ``organization_id`` gets 403. The existing 404
+(unknown organization/scan) and 409 (``ScannerMismatchError``) behavior
+is unchanged -- those checks still run exactly as before, just now
+after authentication/authorization has already passed. ``create_scan``
+additionally now passes ``current_user.id`` as ``triggered_by_user_id``
+to ``TriggerScanUseCase.execute`` -- a parameter that use case has
+supported since Milestone 4, previously always called with the default
+``None`` since no route had an authenticated caller to attribute a scan
+to until now.
 """
 
 from __future__ import annotations
@@ -73,15 +88,18 @@ from fastapi import APIRouter, Depends, HTTPException, Response, status
 from app.api.dependencies import (
     ScanDispatcher,
     get_active_scanner,
+    get_current_user,
     get_scan_dispatcher,
     get_scan_repository,
     get_trigger_scan_use_case,
+    require_organization_member,
 )
 from app.api.v1.schemas import ScanCreateRequest, ScanDetailResponse
 from app.application.interfaces.scanner_port import ActiveScanner
 from app.application.interfaces.scanning_repository import ScanRepositoryPort
 from app.application.scanning.run_scan_workflow import ScannerMismatchError
 from app.application.scanning.trigger_scan import TriggerScanUseCase
+from app.domain.identity.entities import OrganizationMember, User
 from app.domain.shared.enums import ScanStatus
 
 router = APIRouter(prefix="/organizations/{organization_id}/scans", tags=["scans"])
@@ -94,16 +112,25 @@ async def create_scan(
     response: Response,
     trigger_scan: TriggerScanUseCase = Depends(get_trigger_scan_use_case),
     scan_repository: ScanRepositoryPort = Depends(get_scan_repository),
+    current_user: User = Depends(get_current_user),
+    _member: OrganizationMember = Depends(require_organization_member),
 ) -> ScanDetailResponse:
     """Creates a ``Scan`` (status ``QUEUED``) plus its eight
     ``ScanWorkflowStep`` rows, all ``PENDING`` -- see
     ``TriggerScanUseCase``. Does not execute anything; call ``run``
     (below) to actually run the pipeline.
+
+    Requires an authenticated, active member of
+    ``organization_id`` (see ``require_organization_member``,
+    app/api/dependencies.py). ``current_user.id`` is passed through as
+    ``triggered_by_user_id``, attributing the scan to whoever actually
+    triggered it.
     """
     scan = await trigger_scan.execute(
         organization_id=organization_id,
         target=payload.target,
         scanner_name=payload.scanner_name,
+        triggered_by_user_id=current_user.id,
     )
     steps = await scan_repository.list_workflow_steps(scan.id)
     response.headers["Location"] = f"/api/v1/organizations/{organization_id}/scans/{scan.id}"
@@ -119,6 +146,7 @@ async def run_scan(
     active_scanner: ActiveScanner = Depends(get_active_scanner),
     scan_repository: ScanRepositoryPort = Depends(get_scan_repository),
     dispatch_scan: ScanDispatcher = Depends(get_scan_dispatcher),
+    _member: OrganizationMember = Depends(require_organization_member),
 ) -> ScanDetailResponse:
     """Validates, then dispatches the processing pipeline for an
     already-triggered scan to run asynchronously -- see module docstring
@@ -131,6 +159,10 @@ async def run_scan(
     resumability (every step except ``EXECUTE_SCANNER`` is recomputed;
     that one is skipped once already completed) is unaffected by *where*
     the use case runs.
+
+    Requires an authenticated, active member of
+    ``organization_id`` (see ``require_organization_member``,
+    app/api/dependencies.py).
 
     Poll ``GET .../scans/{scan_id}`` (below) to observe progress to
     completion.
@@ -155,6 +187,7 @@ async def run_scan(
 async def get_scan(
     scan_id: UUID,
     scan_repository: ScanRepositoryPort = Depends(get_scan_repository),
+    _member: OrganizationMember = Depends(require_organization_member),
 ) -> ScanDetailResponse:
     """A direct repository read -- there is no corresponding use case for
     "fetch a scan and its steps," and inventing one purely to satisfy a
@@ -164,6 +197,10 @@ async def get_scan(
     repositories" directly. As of Milestone 7, this is also how a client
     observes a dispatched ``run`` progressing to completion -- see
     ``run_scan`` above.
+
+    Requires an authenticated, active member of
+    ``organization_id`` (see ``require_organization_member``,
+    app/api/dependencies.py).
     """
     scan = await scan_repository.get_by_id(scan_id)
     if scan is None:

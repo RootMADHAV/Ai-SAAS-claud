@@ -28,3 +28,5 @@ node_modules/
 
 # temp docker file
 docker-compose.dev
+
+.claudeignore

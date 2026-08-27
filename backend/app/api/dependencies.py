@@ -1,5 +1,7 @@
 """FastAPI dependency providers -- the composition root's per-request
-wiring for the Scanning API (``app/api/v1/scans.py``).
+wiring for the Scanning API (``app/api/v1/scans.py``) and, since the
+Authentication work resolving Technical Debt #9, the Identity & Access
+authentication API (``app/api/v1/auth.py``).
 
 Everything here builds on already-existing, already-verified layers
 (Milestone 2's repositories, Milestone 3's ``ScannerPort`` adapter,
@@ -59,6 +61,41 @@ consequences, both applied here:
     needs them; a future milestone that adds one re-adds the provider it
     actually needs, the same way ``get_analysis_service`` itself was
     only ever added in the milestone that first needed it.
+
+Update (Authentication, resolving Technical Debt #9 -- "No
+authentication on any /api/v1 route"). Three additions, each described
+in more detail on the function/class itself:
+
+  - ``AuthConfig``/``get_auth_config`` -- the JWT signing secret and
+    token-lifetime settings, built once at startup from ``Settings``
+    (mirroring how ``active_scanner`` is built once and read via
+    ``get_active_scanner``) rather than re-reading ``get_settings()`` on
+    every request.
+  - ``get_identity_session`` -- a plain (non-RLS-scoped) transaction for
+    Identity & Access operations that are not tenant-scoped: ``users``
+    and ``refresh_tokens`` carry no ``organization_id`` column and have
+    no RLS policy at all (see their models' own docstrings, and the
+    initial migration's module docstring on tables with no
+    ``organization_id`` at all), so there is no ``app.current_org_id``
+    to set for these operations, unlike every
+    ``/api/v1/organizations/{organization_id}/...`` route.
+    Register/login/refresh use cases and ``get_current_user`` all depend
+    on this, not ``get_org_session`` -- none of them has an
+    ``organization_id`` in their URL path to scope a session to.
+  - ``get_current_user``/``require_organization_member`` -- the two
+    dependencies that actually secure a route. ``get_current_user``
+    verifies the httpOnly ``access_token`` cookie (the project's locked
+    auth-transport decision, PROJECT_STATE.md section 2; set by
+    ``app/api/v1/auth.py``'s ``login``/``refresh``) and loads the
+    corresponding ``User`` (401 if missing, malformed,
+    expired, or naming a user that no longer exists/is inactive).
+    ``require_organization_member`` additionally checks that user is an
+    ``ACTIVE`` member of the ``organization_id`` named in the URL path
+    (403 if not) -- composed from ``get_current_user`` plus
+    ``get_org_session`` (already open for the route's own repository
+    calls), not a new, separate database round trip. Every
+    ``/api/v1/organizations/{organization_id}/scans/...`` route
+    (app/api/v1/scans.py) now depends on ``require_organization_member``.
 """
 
 from __future__ import annotations
@@ -68,17 +105,33 @@ from dataclasses import dataclass
 from typing import cast
 from uuid import UUID
 
-from fastapi import Depends, HTTPException, Request
+from fastapi import Cookie, Depends, HTTPException, Request
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from app.application.identity.login_user import LoginUseCase
+from app.application.identity.refresh_token import RefreshTokenUseCase
+from app.application.identity.register_user import RegisterUserUseCase
+from app.application.interfaces.identity_repository import (
+    RefreshTokenRepositoryPort,
+    UserRepositoryPort,
+)
 from app.application.interfaces.scanner_port import ActiveScanner
 from app.application.interfaces.scanning_repository import ScanRepositoryPort
 from app.application.scanning.trigger_scan import TriggerScanUseCase
+from app.domain.identity.entities import OrganizationMember, User
+from app.domain.shared.enums import MembershipStatus
 from app.infrastructure.db.repositories.identity_repository import (
     SqlAlchemyOrganizationRepository,
+    SqlAlchemyRefreshTokenRepository,
+    SqlAlchemyUserRepository,
 )
 from app.infrastructure.db.repositories.scanning_repository import SqlAlchemyScanRepository
 from app.infrastructure.db.session import session_scoped_to_org
+from app.infrastructure.security.token_service import (
+    ACCESS_TOKEN_COOKIE_NAME,
+    InvalidAccessTokenError,
+    decode_access_token,
+)
 from app.workers.tasks import run_scan_workflow_task
 
 #: The signature ``run_scan`` (app/api/v1/scans.py) dispatches through --
@@ -88,6 +141,20 @@ from app.workers.tasks import run_scan_workflow_task
 #: ``app/workers/tasks.py``'s module docstring on why no Celery result is
 #: ever read back).
 ScanDispatcher = Callable[[UUID, UUID], None]
+
+
+@dataclass(slots=True, frozen=True)
+class AuthConfig:
+    """JWT signing secret and token lifetimes, read from
+    ``Settings`` once at startup (``app/main.py``'s ``_lifespan``) --
+    mirrors ``active_scanner``'s own "build once, read via a small
+    getter" pattern on ``AppState`` below, rather than every request
+    re-calling ``get_settings()`` for values that never change for the
+    life of the process."""
+
+    jwt_secret: str
+    access_token_expire_minutes: int
+    refresh_token_expire_days: int
 
 
 @dataclass(slots=True)
@@ -107,6 +174,7 @@ class AppState:
 
     session_factory: async_sessionmaker[AsyncSession]
     active_scanner: ActiveScanner
+    auth_config: AuthConfig
 
 
 def _state(request: Request) -> AppState:
@@ -131,6 +199,10 @@ def get_session_factory(request: Request) -> async_sessionmaker[AsyncSession]:
 
 def get_active_scanner(request: Request) -> ActiveScanner:
     return _state(request).active_scanner
+
+
+def get_auth_config(request: Request) -> AuthConfig:
+    return _state(request).auth_config
 
 
 def get_scan_dispatcher() -> ScanDispatcher:
@@ -191,3 +263,124 @@ def get_trigger_scan_use_case(
     scan_repository: ScanRepositoryPort = Depends(get_scan_repository),
 ) -> TriggerScanUseCase:
     return TriggerScanUseCase(scan_repository)
+
+
+async def get_identity_session(
+    session_factory: async_sessionmaker[AsyncSession] = Depends(get_session_factory),
+) -> AsyncIterator[AsyncSession]:
+    """A plain transaction for Identity & Access operations that are not
+    tenant-scoped -- see module docstring for why
+    ``users``/``refresh_tokens`` have no ``app.current_org_id`` to set,
+    unlike ``get_org_session``'s RLS-scoped transactions."""
+    async with session_factory() as session, session.begin():
+        yield session
+
+
+def get_user_repository(
+    session: AsyncSession = Depends(get_identity_session),
+) -> UserRepositoryPort:
+    return SqlAlchemyUserRepository(session)
+
+
+def get_refresh_token_repository(
+    session: AsyncSession = Depends(get_identity_session),
+) -> RefreshTokenRepositoryPort:
+    return SqlAlchemyRefreshTokenRepository(session)
+
+
+def get_register_user_use_case(
+    user_repository: UserRepositoryPort = Depends(get_user_repository),
+) -> RegisterUserUseCase:
+    return RegisterUserUseCase(user_repository)
+
+
+def get_login_use_case(
+    user_repository: UserRepositoryPort = Depends(get_user_repository),
+    refresh_token_repository: RefreshTokenRepositoryPort = Depends(get_refresh_token_repository),
+    auth_config: AuthConfig = Depends(get_auth_config),
+) -> LoginUseCase:
+    return LoginUseCase(
+        user_repository=user_repository,
+        refresh_token_repository=refresh_token_repository,
+        jwt_secret=auth_config.jwt_secret,
+        access_token_expire_minutes=auth_config.access_token_expire_minutes,
+        refresh_token_expire_days=auth_config.refresh_token_expire_days,
+    )
+
+
+def get_refresh_token_use_case(
+    user_repository: UserRepositoryPort = Depends(get_user_repository),
+    refresh_token_repository: RefreshTokenRepositoryPort = Depends(get_refresh_token_repository),
+    auth_config: AuthConfig = Depends(get_auth_config),
+) -> RefreshTokenUseCase:
+    return RefreshTokenUseCase(
+        user_repository=user_repository,
+        refresh_token_repository=refresh_token_repository,
+        jwt_secret=auth_config.jwt_secret,
+        access_token_expire_minutes=auth_config.access_token_expire_minutes,
+        refresh_token_expire_days=auth_config.refresh_token_expire_days,
+    )
+
+
+async def get_current_user(
+    access_token: str | None = Cookie(default=None, alias=ACCESS_TOKEN_COOKIE_NAME),
+    user_repository: UserRepositoryPort = Depends(get_user_repository),
+    auth_config: AuthConfig = Depends(get_auth_config),
+) -> User:
+    """Verifies the httpOnly ``access_token`` cookie (the project's
+    locked auth-transport decision, PROJECT_STATE.md section 2 -- set by
+    ``app/api/v1/auth.py``'s ``login``/``refresh``) and returns the
+    ``User`` it names.
+
+    Raises ``HTTPException(401)`` if the cookie is missing, the token is
+    malformed/expired/wrongly-signed (``InvalidAccessTokenError``, see
+    ``app/infrastructure/security/token_service.py``), or the token
+    names a user that no longer exists or is no longer active. Every one
+    of these maps to the same generic 401 message -- distinguishing
+    "no such user" from "token expired" in the response would leak more
+    than a caller needs to know to simply log in again.
+    """
+    if access_token is None:
+        raise HTTPException(status_code=401, detail="not authenticated")
+    try:
+        user_id = decode_access_token(access_token, secret=auth_config.jwt_secret)
+    except InvalidAccessTokenError as exc:
+        raise HTTPException(status_code=401, detail="invalid or expired access token") from exc
+
+    user = await user_repository.get_by_id(user_id)
+    if user is None or not user.is_active:
+        raise HTTPException(status_code=401, detail="invalid or expired access token")
+    return user
+
+
+async def require_organization_member(
+    organization_id: UUID,
+    current_user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_org_session),
+) -> OrganizationMember:
+    """Authorization, as distinct from ``get_org_session``'s
+    existence check (see that function's own docstring): confirms
+    ``current_user`` is an ``ACTIVE`` member of ``organization_id``
+    before a route proceeds. Every organization-scoped Scanning route
+    (app/api/v1/scans.py) depends on this now, resolving Technical Debt
+    #9's "any caller can act as any organization by supplying its id" --
+    a token that authenticates successfully (``get_current_user``) but
+    names a user with no membership in this organization still gets 403,
+    not access.
+
+    Reuses ``get_org_session``'s already-open transaction for this one
+    extra lookup rather than opening a second session -- FastAPI's
+    per-request dependency caching means every other dependency in this
+    request that also depends on ``get_org_session`` (e.g.
+    ``get_scan_repository``) shares this exact same session/transaction,
+    not a separate one.
+    """
+    member = await SqlAlchemyOrganizationRepository(session).get_member(
+        organization_id, current_user.id
+    )
+    if member is None or member.status is not MembershipStatus.ACTIVE:
+        raise HTTPException(
+            status_code=403,
+            detail=f"user {current_user.id} is not an active member of organization {organization_id}",
+        )
+    return member

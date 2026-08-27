@@ -30,6 +30,17 @@ never uses a credential should not hold it (see
 is unaffected and still constructed here -- it is credential-free and
 ``run_scan`` still needs its ``.name`` for the cheap scanner-mismatch
 check, unchanged from Milestone 5.
+
+Update: ``_lifespan`` now also builds an ``AuthConfig``
+(app/api/dependencies.py) from ``Settings`` and adds it to ``AppState``
+-- ``jwt_secret`` has been a required ``Settings`` field for
+``worker_role=api`` since Milestone 1 (forward-looking, unused until
+now); this work is what actually consumes it.
+``app/api/v1/auth.py``'s router is mounted at ``/api/v1/auth``, and two
+new global exception handlers are registered (``AuthenticationError``
+-> 401, ``EmailAlreadyRegisteredError`` -> 409), the same codebase-wide
+convention this module already established for ``LookupError`` -> 404
+and ``ScannerMismatchError`` -> 409.
 """
 
 from __future__ import annotations
@@ -41,13 +52,29 @@ from fastapi import FastAPI
 from fastapi.requests import Request
 from fastapi.responses import JSONResponse
 
-from app.api.dependencies import AppState
+from app.api.dependencies import AppState, AuthConfig
 from app.api.internal.health import router as health_router
+from app.api.v1.auth import router as auth_router
 from app.api.v1.scans import router as scans_router
+from app.application.identity.errors import AuthenticationError, EmailAlreadyRegisteredError
 from app.application.scanning.run_scan_workflow import ScannerMismatchError
-from app.config import get_settings
+from app.config import Settings, get_settings
 from app.infrastructure.db.session import create_engine, create_session_factory
 from app.scanner_engine.adapters.nuclei.adapter import NucleiAdapter
+
+
+def _build_auth_config(settings: Settings) -> AuthConfig:
+    """``settings.jwt_secret`` is guaranteed not-None by
+    ``check_role_boundaries`` (app/config.py) for ``worker_role=api`` --
+    the assert below exists for mypy strict's benefit, not because it
+    could meaningfully fail here, the same pattern already used for
+    ``settings.database_url`` in ``_lifespan`` below."""
+    assert settings.jwt_secret is not None
+    return AuthConfig(
+        jwt_secret=settings.jwt_secret,
+        access_token_expire_minutes=settings.access_token_expire_minutes,
+        refresh_token_expire_days=settings.refresh_token_expire_days,
+    )
 
 
 @asynccontextmanager
@@ -73,6 +100,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.wired = AppState(
         session_factory=create_session_factory(engine),
         active_scanner=NucleiAdapter(),
+        auth_config=_build_auth_config(settings),
     )
     try:
         yield
@@ -137,6 +165,30 @@ async def _scanner_mismatch_error_handler(request: Request, exc: Exception) -> J
     return JSONResponse(status_code=409, content={"detail": str(exc)})
 
 
+async def _authentication_error_handler(request: Request, exc: Exception) -> JSONResponse:
+    """Handles ``AuthenticationError`` and both its
+    subclasses (``InvalidCredentialsError``, ``InvalidRefreshTokenError``
+    -- app/application/identity/errors.py) -- one handler covers both
+    since both represent "the credential/token presented is not valid"
+    and both map to the same HTTP 401, the same "one handler per shared
+    base class" pattern this module already uses for ``LookupError``
+    covering several repositories' raise sites.
+
+    Typed as ``Exception`` for the same mypy-contravariance reason given
+    in ``_lookup_error_handler`` above.
+    """
+    return JSONResponse(status_code=401, content={"detail": str(exc)})
+
+
+async def _email_already_registered_handler(request: Request, exc: Exception) -> JSONResponse:
+    """A registration attempt for an email that already has
+    an active ``User`` row is a conflict with existing state -- 409, not
+    401 (see ``EmailAlreadyRegisteredError``'s own docstring on why it is
+    deliberately not part of the ``AuthenticationError`` hierarchy
+    above)."""
+    return JSONResponse(status_code=409, content={"detail": str(exc)})
+
+
 def create_app() -> FastAPI:
     """Factory, not a bare module-level ``FastAPI()`` -- tests call this
     directly and override ``app/api/dependencies.py``'s low-level
@@ -149,9 +201,12 @@ def create_app() -> FastAPI:
     """
     app = FastAPI(title="Security Platform API", lifespan=_lifespan)
     app.include_router(scans_router, prefix="/api/v1")
+    app.include_router(auth_router, prefix="/api/v1")
     app.include_router(health_router, prefix="/internal")
     app.add_exception_handler(LookupError, _lookup_error_handler)
     app.add_exception_handler(ScannerMismatchError, _scanner_mismatch_error_handler)
+    app.add_exception_handler(AuthenticationError, _authentication_error_handler)
+    app.add_exception_handler(EmailAlreadyRegisteredError, _email_already_registered_handler)
     return app
 
 

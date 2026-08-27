@@ -15,7 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.domain.assets.entities import Asset
 from app.domain.findings.entities import Finding
-from app.domain.identity.entities import Organization, User
+from app.domain.identity.entities import Organization, OrganizationMember, User
 from app.domain.scanning.entities import Scan
 from app.domain.shared.clock import utcnow
 from app.domain.shared.enums import (
@@ -23,6 +23,8 @@ from app.domain.shared.enums import (
     AssetType,
     ConfidenceLevel,
     FindingStatus,
+    MembershipStatus,
+    OrganizationRole,
     ScanStatus,
 )
 from app.domain.shared.ids import new_id
@@ -64,6 +66,26 @@ def make_user(**overrides: object) -> User:
     }
     defaults.update(overrides)
     return User(**defaults)  # type: ignore[arg-type]
+
+
+def make_member(organization_id: UUID, user_id: UUID, **overrides: object) -> OrganizationMember:
+    """Milestone 8 -- an ACTIVE membership by default, since that is the
+    common case every authenticated-route test needs
+    (``require_organization_member``, app/api/dependencies.py); pass
+    ``status=MembershipStatus.INVITED``/``REMOVED`` to exercise the
+    non-member-access-denied paths instead."""
+    now = utcnow()
+    defaults: dict[str, object] = {
+        "id": new_id(),
+        "organization_id": organization_id,
+        "user_id": user_id,
+        "role": OrganizationRole.OWNER,
+        "status": MembershipStatus.ACTIVE,
+        "created_at": now,
+        "updated_at": now,
+    }
+    defaults.update(overrides)
+    return OrganizationMember(**defaults)  # type: ignore[arg-type]
 
 
 def make_asset(organization_id: UUID, **overrides: object) -> Asset:

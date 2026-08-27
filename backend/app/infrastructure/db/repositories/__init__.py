@@ -11,6 +11,7 @@ from app.infrastructure.db.repositories.findings_repository import SqlAlchemyFin
 from app.infrastructure.db.repositories.identity_repository import (
     SqlAlchemyAuditLogRepository,
     SqlAlchemyOrganizationRepository,
+    SqlAlchemyRefreshTokenRepository,
     SqlAlchemyUserRepository,
 )
 from app.infrastructure.db.repositories.reporting_repository import SqlAlchemyReportRepository
@@ -21,6 +22,7 @@ __all__ = [
     "SqlAlchemyAuditLogRepository",
     "SqlAlchemyFindingRepository",
     "SqlAlchemyOrganizationRepository",
+    "SqlAlchemyRefreshTokenRepository",
     "SqlAlchemyReportRepository",
     "SqlAlchemyScanRepository",
     "SqlAlchemyUserRepository",

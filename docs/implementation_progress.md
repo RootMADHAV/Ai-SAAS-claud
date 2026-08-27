@@ -10,7 +10,10 @@ AI-Powered Cybersecurity SaaS Platform (working name; no product name
 chosen yet)
 
 ## Current version
-Pre-release, Milestone 7 (Docker Compose wired end-to-end) complete -- no version tag yet.
+Pre-release, Milestone 7 (Docker Compose wired end-to-end) complete;
+Authentication / Identity & Access work (Technical Debt #9, separate
+pre-Phase-3 backend scope, not an eighth Phase-2 milestone) also
+complete -- no version tag yet.
 
 ## Overall roadmap
 
@@ -39,24 +42,36 @@ Phase 2 is broken into its own milestones:
 | 6 | AI analysis service | Complete (dynamically verified) |
 | 7 | Docker Compose wired end-to-end | Complete (dynamically verified) |
 
+Separately, outside Phase 2's own Milestone 1-7 sequence: the
+Authentication / Identity & Access work (Technical Debt #9), additional
+pre-Phase-3 backend scope, is complete (dynamically verified) -- see
+"Completed milestones" below.
+
 ## Current phase
 Phase 2 (MVP backend)
 
 ## Current milestone
-Milestone 7 (Docker Compose wired end-to-end) -- complete.
-`app/workers/celery_app.py` (the Celery application instance) and
-`app/workers/tasks.py` (`execute_scan_workflow`,
-`_run_scan_workflow_from_settings`, `run_scan_workflow_task`) now run
-`RunScanWorkflowUseCase.execute()` -- itself unmodified this session
-except for one new module-docstring paragraph -- inside a real
-`ingestion_worker` Celery task instead of synchronously inside the HTTP
-request handler. `app/api/v1/scans.py`'s `run_scan` route now validates
-synchronously and dispatches, returning `202 Accepted`.
-`docker-compose.yml` (root, replacing the placeholder) wires the full
-stack: `postgres`, `redis`, `minio`, `qdrant`, `backend`, `worker`. 12
-new/updated tests this session (see "Completed milestones" below for
-the full account and the exact breakdown), clean Ruff, clean MyPy
-strict on every Milestone 7 module.
+None -- Milestone 7 is Phase 2's last milestone and remains complete.
+
+Separately: the Authentication / Identity & Access work (Technical
+Debt #9) is complete -- not an eighth Phase-2 milestone (Phase 2 ends at
+Milestone 7), tracked as its own pre-Phase-3 backend scope. Resolves
+Technical Debt #9 ("No authentication on any `/api/v1` route").
+Delivered: registration (`RegisterUserUseCase`), login
+(`LoginUseCase`), JWT access-token + opaque hashed-refresh-token
+authentication with rotation (`RefreshTokenUseCase`,
+`SqlAlchemyRefreshTokenRepository`), current-user authentication
+(`get_current_user`) and organization-membership authorization
+(`require_organization_member`) wired into every existing Scanning
+route (`app/api/v1/scans.py`), and three new public routes
+(`/api/v1/auth/{register,login,refresh}`). Tokens are delivered
+exclusively as httpOnly cookies (the locked auth-transport decision,
+PROJECT_STATE.md section 2), never in a JSON body. See
+"Completed milestones" below for the full account, including a targeted
+follow-up review that corrected two issues before this work was
+considered complete: the naming used to track it, and an initial,
+unapproved `Authorization: Bearer` implementation that was corrected
+back to httpOnly cookies.
 
 ## Completed milestones
 **Milestone 1 (Foundation) -- complete**, as of the prior session. See
@@ -598,12 +613,197 @@ improvement this milestone's credential-narrowing made possible, since
 the API process no longer has anything it would need internet access
 for.
 
+**Milestone 8 (Authentication / Identity & Access) -- complete.**
+Resolves Technical Debt #9 ("No authentication on any `/api/v1` route").
+Genuine fresh implementation this session. Delivered:
+- `app/domain/identity/entities.py` (extended) -- `RefreshToken` entity.
+  Not soft-deleted; `revoked_at` is its own lifecycle field, mirroring
+  `OrganizationMember.status`'s existing precedent in the same module.
+- `app/application/interfaces/identity_repository.py` (extended) --
+  `RefreshTokenRepositoryPort` (`add`, `get_by_token_hash`, `revoke`).
+  Not org-scoped, like `UserRepositoryPort` -- `refresh_tokens`, like
+  `users`, carries no `organization_id` and has no RLS policy.
+- `app/infrastructure/db/repositories/identity_repository.py`
+  (extended) -- `SqlAlchemyRefreshTokenRepository`, the same
+  row<->domain mapping convention every other repository in the module
+  already uses.
+- `app/infrastructure/security/password_hashing.py` (new) --
+  `hash_password`/`verify_password`, wrapping `bcrypt` directly (not
+  `passlib`, effectively unmaintained against current bcrypt releases).
+  Enforces bcrypt's 72-byte input limit explicitly with a clear message
+  rather than letting a library `ValueError` surface uncaught.
+- `app/infrastructure/security/token_service.py` (new) --
+  `create_access_token`/`decode_access_token` (signed JWT, PyJWT,
+  HS256, `InvalidAccessTokenError` on any failure) and
+  `generate_refresh_token`/`hash_refresh_token` (opaque
+  `secrets.token_urlsafe(32)` token; only its SHA-256 hash is ever
+  persisted); also `ACCESS_TOKEN_COOKIE_NAME`/`REFRESH_TOKEN_COOKIE_NAME`
+  constants, defined once here so `auth.py` (sets them) and
+  `dependencies.py` (reads them back) can never drift out of sync. Both
+  new security modules are imported directly into the
+  application layer, not hidden behind a new port -- deliberately
+  following the precedent `target_validation.py` already set (zero
+  framework/DB imports, exactly one real implementation, so a port
+  would be an abstraction with nothing to abstract over).
+- `app/application/identity/errors.py` (new) -- `AuthenticationError`
+  (base, -> 401 via a global handler) with `InvalidCredentialsError`/
+  `InvalidRefreshTokenError` subclasses; `EmailAlreadyRegisteredError`
+  (-> 409, deliberately not part of the `AuthenticationError` hierarchy
+  -- a conflict, not an authentication failure).
+- `app/application/identity/tokens.py` (new) -- `TokenPair` and
+  `issue_token_pair()`, the token-issuance logic shared by
+  `LoginUseCase` and `RefreshTokenUseCase`, factored out once.
+- `app/application/identity/register_user.py` (new) --
+  `RegisterUserUseCase`. Creates only a `User` -- deliberately does not
+  create an Organization/OrganizationMember (would either bypass the
+  ">= 1 Owner always" invariant or require enforcing it prematurely,
+  the same reasoning PROJECT_STATE.md's Milestone 5 note already gives
+  for deferring an org-creation endpoint).
+- `app/application/identity/login_user.py` (new) -- `LoginUseCase`.
+  Unknown email, inactive account, no password set, and wrong password
+  all raise the identical `InvalidCredentialsError` with the identical
+  message, verified by an explicit test, so a caller cannot enumerate
+  registered emails via response differences.
+- `app/application/identity/refresh_token.py` (new) --
+  `RefreshTokenUseCase`. Implements rotation: the presented token is
+  revoked before a new pair is issued, so a replayed/stolen token is
+  usable at most once. Family-wide revocation-on-reuse-detection is
+  explicitly not built -- flagged as future work, not silently assumed
+  solved. Reviewed on follow-up against "was this genuinely required":
+  kept, since the `refresh_tokens` table (including a pre-existing
+  `revoked_at` column) already existed before this work began and the
+  approved scope explicitly named "secure ... JWT access/refresh
+  authentication" -- without rotation a leaked refresh token would have
+  no revocation path at all until a future logout endpoint exists.
+- `app/api/v1/auth_schemas.py` (new) -- `RegisterRequest`, `UserResponse`,
+  `LoginRequest`. No `TokenResponse`/`RefreshRequest` -- tokens never
+  appear in a JSON body (see below).
+- `app/api/v1/auth.py` (new) -- `POST /auth/register` (201,
+  `UserResponse`, no cookies -- registration and login are kept as two
+  separate calls, not auto-issuing a session on signup, since a newly
+  registered user is not yet a member of any organization), `POST
+  /auth/login` (200, `UserResponse`, sets `access_token`/`refresh_token`
+  as `HttpOnly`/`Secure`/`SameSite=Lax` cookies via `_set_auth_cookies`),
+  `POST /auth/refresh` (200, `UserResponse`, reads the refresh token from
+  its own cookie -- not a request body -- and sets fresh rotated
+  cookies). Tokens are delivered exclusively via `Set-Cookie`, matching
+  the locked "JWT httpOnly cookies" auth-transport decision
+  (PROJECT_STATE.md section 2) -- never in a JSON response body, since a
+  script able to read the response (exactly what an XSS payload can do)
+  could otherwise recover the token, defeating the reason `HttpOnly` was
+  chosen. No logout route this session -- out of the approved
+  scope, which named registration/login/JWT access-refresh, not full
+  session management; `RefreshTokenRepositoryPort.revoke` is already
+  exercised by rotation regardless.
+- `app/api/dependencies.py` (extended) -- the composition root's
+  central change this work makes. New: `AuthConfig` (JWT secret + token
+  lifetimes, built once at startup, mirroring `active_scanner`'s own
+  pattern) and `get_auth_config`; `get_identity_session` (a plain,
+  non-RLS-scoped transaction, since `users`/`refresh_tokens` have no
+  `organization_id`/RLS policy); the register/login/refresh use-case
+  providers; and the two dependencies that actually resolve Technical
+  Debt #9: `get_current_user` (reads the httpOnly `access_token`
+  cookie, 401 on any failure) and `require_organization_member` (confirms
+  ACTIVE membership, 403 if not -- reuses `get_org_session`'s already-open
+  transaction, not a second database round trip). `AppState` gains a
+  required `auth_config: AuthConfig` field.
+- `app/api/v1/scans.py` (extended) -- every route now depends on
+  `require_organization_member`; existing 404/409/202 behavior is
+  unchanged in substance, just reached after auth passes now.
+  `create_scan` additionally depends on `get_current_user` and passes
+  `current_user.id` through as `TriggerScanUseCase.execute`'s
+  `triggered_by_user_id` -- a parameter that use case has accepted
+  since Milestone 4, previously always called with the default `None`
+  since no route had an authenticated caller to attribute a scan to
+  until now.
+- `app/main.py` (extended) -- `_lifespan` now also builds an
+  `AuthConfig` from `Settings`; `create_app()` mounts the new
+  `auth_router` at `/api/v1/auth` and registers two new global
+  exception handlers, `AuthenticationError` -> 401 and
+  `EmailAlreadyRegisteredError` -> 409, the same "one handler per
+  shared base class" convention already used for `LookupError`/
+  `ScannerMismatchError`.
+- `backend/pyproject.toml` -- `pyjwt`, `bcrypt`, `email-validator`
+  (required by Pydantic's `EmailStr`) added to `dependencies`.
+- `.env.example` -- new section: no new *required*
+  variable names (`JWT_SECRET` has been required since Milestone 5,
+  genuinely used for the first time now); `ACCESS_TOKEN_EXPIRE_MINUTES`/
+  `REFRESH_TOKEN_EXPIRE_DAYS` documented as optional overrides of their
+  existing code defaults.
+- 6 new test files: `tests/unit/test_password_hashing.py` (8 tests),
+  `tests/unit/test_token_service.py` (10 tests),
+  `tests/unit/test_register_user.py` (4 tests),
+  `tests/unit/test_login_user.py` (7 tests),
+  `tests/unit/test_refresh_token_use_case.py` (7 tests),
+  `tests/integration/test_api_auth.py` (11 tests, against real
+  Postgres, exercising register/login/refresh end-to-end over real
+  HTTP, asserting `HttpOnly`/`Secure`/`SameSite=Lax` cookie attributes
+  and that no token value ever appears in a JSON body). 4 existing test
+  files extended: `tests/integration/
+  test_identity_repository.py` (5 new tests covering
+  `SqlAlchemyRefreshTokenRepository`), `tests/integration/
+  test_api_scans.py` (rewritten to authenticate every existing test
+  while preserving every pre-existing 404/409/202 assertion, plus a new
+  `TestAuthenticationAndAuthorization` class, 7 tests), `tests/
+  integration/test_main_lifespan.py` (extended to assert `auth_config`
+  is built correctly), `tests/unit/test_api_dependencies.py` (extended
+  with `get_auth_config` and five `get_current_user` unit tests).
+  `tests/integration/support.py` gained one small, additive factory,
+  `make_member()`. See "Testing status" below for the full verification
+  account, including a Filesystem MCP outage and two genuine
+  investigations (one real, pre-existing RLS-sandbox-limitation
+  distinction; one that turned out to be a sandbox-only stale-file
+  artifact, not a real defect) resolved during this session.
+
+**Targeted follow-up review, applied before this work was considered
+complete.** After initial implementation, a review pass checked four
+things and corrected two:
+1. Confirmed this work must not be labeled "Milestone 8" -- Phase 2
+   ends at Milestone 7; every reference throughout this file,
+   `PROJECT_STATE.md`, `docs/session_state.md`, and stray code
+   docstrings that had used that label was corrected to describe this
+   as separate, additional pre-Phase-3 backend scope instead.
+2. Confirmed the canonical, locked JWT-transport decision
+   (`PROJECT_STATE.md` section 2) is httpOnly cookies. The initial
+   implementation had instead used `Authorization: Bearer` headers,
+   reasoning that no frontend yet existed to test a cookie flow against
+   -- an unapproved divergence, not a genuine implementation blocker (a
+   cookie-based flow does not require an existing frontend to implement
+   or test correctly, only a cookie-capable client, which the test suite
+   already is). Corrected: `login`/`refresh` now set
+   `HttpOnly`/`Secure`/`SameSite=Lax` cookies instead of returning
+   tokens in a JSON body; `get_current_user` reads the access-token
+   cookie instead of a Bearer header; `refresh` reads the refresh token
+   from its own cookie instead of a request body. The full test suite
+   affected by this change (`test_api_auth.py`, `test_api_scans.py`,
+   `test_api_dependencies.py`) was rewritten for cookies and
+   re-verified in a freshly rebuilt sandbox: 91 of 92 relevant tests
+   pass (the one failure is the same pre-existing, unrelated
+   RLS-sandbox-limitation test described below), Ruff and MyPy strict
+   both clean.
+3. Reviewed whether `RefreshToken` (entity/port/repository) and
+   rotation were genuinely required by the approved scope, or should be
+   simplified. Kept as-is: the `refresh_tokens` table (including a
+   `revoked_at` column) already existed in the schema before this work
+   began, the approved scope explicitly named "secure ... JWT access/
+   refresh authentication," and the implementation follows this
+   project's own established per-aggregate repository pattern rather
+   than inventing a shortcut.
+4. Re-ran the broadest practical test suite against the corrected,
+   real-repository content -- see "Testing status" below for exactly
+   what could and could not be executed given this project's
+   no-command-execution-tool constraint (PROJECT_STATE.md section 13),
+   stated plainly rather than glossed over.
+
 ## In-progress milestone
-None. Milestone 7 is now complete.
+None. Phase 2 (Milestones 1-7) and the separate Authentication /
+Identity & Access work (Technical Debt #9) are both complete.
 
 ## Remaining milestones
-Phases 3-10 (see roadmap table above) -- Phase 2's own milestone
-breakdown (Milestones 1-7) is now fully complete.
+Phases 3-10 (see roadmap table above). Phase 2's own milestone
+breakdown (Milestones 1-7) remains fully complete on its own; the
+Authentication work is tracked separately as pre-Phase-3 backend scope,
+also complete.
 
 ## Architecture status
 One amendment this session: the RLS + soft-delete predicate
@@ -677,6 +877,29 @@ its own header comment, not a locked architectural decision in the
 sense PROJECT_STATE.md section 14 protects). Everything else --
 `RunScanWorkflowUseCase` itself, the eight-stage pipeline, RLS, the
 repository/port pattern -- is unchanged.
+
+Authentication work: no changes to already-locked architecture. This
+work fills in exactly what Technical Debt #9 and PROJECT_STATE.md's
+own roadmap already deferred to "whichever session builds real auth"
+-- the bounded-context boundaries, the ports-and-adapters pattern, RLS,
+and every other locked decision in PROJECT_STATE.md section 3 are
+unchanged. Two new patterns established, both consistent
+with rather than divergent from existing precedent: (1) opaque, hashed,
+rotating refresh tokens plus stateless signed-JWT access tokens,
+delivered exclusively via httpOnly cookies (the already-locked
+auth-transport decision) -- not a new architectural layer, but the same
+shape `RefreshToken`'s own table (present, unused, since Milestone 2)
+was always going to need; (2) `password_hashing.py`/`token_service.py`
+imported directly into the application layer rather than behind a new
+port -- explicitly following the `target_validation.py` precedent
+PROJECT_STATE.md section 3 already establishes for single-implementation,
+framework-free infrastructure utilities, not a new exception to the
+dependency rule. A follow-up review corrected an initial,
+unapproved-divergence implementation of that first pattern
+(`Authorization: Bearer` headers instead of the locked httpOnly-cookie
+decision) before this work was considered complete -- see "Completed
+milestones" above and PROJECT_STATE.md section 3's dated entry for the
+full account.
 
 ## Testing status
 102 tests total (64 unit -- 55 from Milestone 1 unchanged plus 9 new for
@@ -935,6 +1158,85 @@ in the version of this file written to the real repository, called out
 in that file's own updated module docstring; a future session should
 check whether the same pattern exists elsewhere. Full account in
 `docs/session_state.md`.
+
+**Authentication work addendum.** 62 new/updated tests: 6 new test files
+(`test_password_hashing.py` 8, `test_token_service.py` 10,
+`test_register_user.py` 4, `test_login_user.py` 7,
+`test_refresh_token_use_case.py` 7, `test_api_auth.py` 11 -- integration,
+real Postgres) plus 4 existing files extended
+(`test_identity_repository.py` +5 tests, integration;
+`test_api_scans.py` rewritten, 21 tests total, integration;
+`test_main_lifespan.py` extended, integration; `test_api_dependencies.py`
++6 tests). Clean Ruff (`check` and `format --check`), clean MyPy strict
+on every module this work touches.
+
+Three verification-honesty notes, stated plainly rather than glossed
+over:
+
+1. **A mid-session Filesystem MCP outage**, the same full-disconnection
+   signature prior sessions' outages already document ("tool not
+   found" on every call including `list_allowed_directories`, spanning
+   multiple separate conversation turns) meant the real Alembic
+   migration could not be re-fetched verbatim for the sandbox
+   reconstruction. The identical fallback Milestone 5's session
+   already used was reused here: `Base.metadata.create_all()` instead
+   of `alembic upgrade head`, meaning the sandbox database
+   had no RLS policies. The one pre-existing (Milestone 2, unmodified
+   by this work) RLS-isolation test in `test_identity_repository.py`
+   fails in the sandbox specifically because of this -- not because of
+   anything this work changed; RLS itself is unaffected by this
+   work's own scope (`refresh_tokens`, like `users`, has never had
+   an RLS policy) and was already proven against real Postgres with the
+   real migration in Milestone 2's own session. Every other test
+   touched passed: 91 of 92 relevant tests in the sandbox's
+   final run (after the JWT-cookie correction described below).
+2. **A second, initially-alarming test failure was investigated to its
+   real root cause and found to be a sandbox-only artifact, not a real
+   defect.** `test_create_scan_returns_201_with_all_eight_steps_pending`
+   failed on a missing `Location` response header. Extensive isolated
+   bisection (minimal FastAPI reproductions, raw-ASGI header snooping,
+   testing each dependency in the actual chain individually and in
+   combination) traced this to a stale sandbox copy of
+   `app/api/v1/scans.py` -- written early before the real
+   file's pre-existing `response_model=ScanDetailResponse`/
+   `response: Response`/`Location`-header structure was discovered
+   during the transplant phase, and never re-synced. The real
+   repository's `create_scan` (read and confirmed correct multiple times
+   during the actual transplant) was never affected; re-syncing the
+   sandbox file from the real repository's actual content resolved the
+   failure for the correct reason.
+3. **A targeted follow-up review found and corrected the JWT-transport
+   divergence described above** (`Authorization: Bearer` instead of the
+   locked httpOnly-cookie decision). After correcting `app/api/v1/
+   auth.py`, `app/api/dependencies.py`, and `app/infrastructure/
+   security/token_service.py`, the affected test files
+   (`test_api_auth.py`, `test_api_scans.py`, `test_api_dependencies.py`)
+   were rewritten for cookie-based auth and the sandbox was rebuilt
+   fresh from the corrected real-repository content -- confirming
+   91 of 92 relevant tests pass (the one failure being the same
+   pre-existing RLS-sandbox-limitation test in note 1 above), Ruff
+   check/format clean, MyPy strict clean. This re-verification, like
+   every verification in this project, ran in Claude's own sandbox --
+   PROJECT_STATE.md section 13's no-command-execution-tool constraint
+   for `C:\Users\gamer\Downloads\claudeOnly` is unchanged and was not
+   worked around.
+
+A fourth finding, related but not itself a bug: four test files were
+initially drafted in the sandbox against an invented fixture
+convention (a `session_factory` fixture, ad hoc token helpers) before
+the real repository's actual, already-established integration-test
+conventions (`db_session`/`engine`/`postgres_available` in
+`tests/conftest.py`; `wired_app`/`_make_client`/`_create_organization`
+helpers already present in the real `test_api_scans.py`;
+`make_organization`/`make_user`/`make_scan`/`set_org_context` already
+present in `tests/integration/support.py`) could be read, due to the
+same Filesystem MCP outage above. Once the real files were read fresh
+during the transplant phase, all four modified test files plus the one
+new integration test file were rewritten to match the real, pre-existing
+conventions exactly, extending them rather than replacing them with an
+invented alternative -- `tests/integration/support.py` itself needed
+only one small, additive change (`make_member()`), not a rewrite. Full
+account of all findings in `docs/session_state.md`.
 
 ## Files created
 Code (Milestone 1, complete, all 16 files present, audited, and
@@ -1209,6 +1511,94 @@ Milestone 5 session, despite `implementation_progress.md` and
 see that file's own note on this, recorded there rather than silently
 smoothed over.
 
+Code (Authentication / Identity & Access work, complete, dynamically
+verified, genuine fresh implementation):
+- `backend/app/infrastructure/security/password_hashing.py` (new)
+- `backend/app/infrastructure/security/token_service.py` (new)
+- `backend/app/application/identity/errors.py` (new)
+- `backend/app/application/identity/tokens.py` (new)
+- `backend/app/application/identity/register_user.py` (new)
+- `backend/app/application/identity/login_user.py` (new)
+- `backend/app/application/identity/refresh_token.py` (new)
+- `backend/app/api/v1/auth_schemas.py` (new)
+- `backend/app/api/v1/auth.py` (new)
+- `backend/tests/unit/test_password_hashing.py` (new)
+- `backend/tests/unit/test_token_service.py` (new)
+- `backend/tests/unit/test_register_user.py` (new)
+- `backend/tests/unit/test_login_user.py` (new)
+- `backend/tests/unit/test_refresh_token_use_case.py` (new)
+- `backend/tests/integration/test_api_auth.py` (new)
+
+Modified (Authentication / Identity & Access work):
+- `backend/app/domain/identity/entities.py`: extended (not rewritten)
+  with the `RefreshToken` entity; `Organization`/`User`/`AuditLogEntry`/
+  `OrganizationMember` themselves unchanged.
+- `backend/app/application/interfaces/identity_repository.py`: extended
+  with `RefreshTokenRepositoryPort`.
+- `backend/app/infrastructure/db/repositories/identity_repository.py`:
+  extended with `SqlAlchemyRefreshTokenRepository` and its
+  `_refresh_token_to_domain` mapper.
+- `backend/app/infrastructure/db/repositories/__init__.py`: re-export
+  added for `SqlAlchemyRefreshTokenRepository`.
+- `backend/app/api/dependencies.py`: extended -- `AuthConfig` dataclass
+  and `get_auth_config`; `get_identity_session`;
+  `get_user_repository`/`get_refresh_token_repository`; the
+  register/login/refresh use-case providers; `get_current_user`;
+  `require_organization_member`. `AppState` gains a required
+  `auth_config: AuthConfig` field.
+- `backend/app/api/v1/scans.py`: every route gains a
+  `require_organization_member` dependency; `create_scan` additionally
+  gains `get_current_user` and passes `current_user.id` through as
+  `triggered_by_user_id`.
+- `backend/app/main.py`: `_lifespan` builds an `AuthConfig`;
+  `create_app()` mounts the new `auth_router` and registers the two new
+  exception handlers.
+- `backend/app/application/identity/__init__.py`,
+  `backend/app/infrastructure/security/__init__.py`,
+  `backend/app/api/v1/__init__.py`: docstrings updated to describe the
+  new modules, the same pattern every prior milestone's
+  placeholder-docstring fix has followed.
+- `backend/tests/integration/support.py`: `make_member()` factory
+  added (additive only -- every pre-existing factory unchanged).
+- `backend/tests/integration/test_identity_repository.py`: extended
+  with a `TestSqlAlchemyRefreshTokenRepository`-equivalent block of 5
+  new tests; every pre-existing test unchanged.
+- `backend/tests/integration/test_api_scans.py`: rewritten to
+  authenticate every existing test (a new `_create_authenticated_member`
+  helper, sending the resulting bearer token on every request) while
+  preserving every pre-existing 404/409/202 assertion unchanged, plus a
+  new `TestAuthenticationAndAuthorization` class (7 tests).
+- `backend/tests/integration/test_main_lifespan.py`: extended with
+  assertions that `wired.auth_config` is built correctly from real
+  environment variables.
+- `backend/tests/unit/test_api_dependencies.py`: extended with
+  `test_get_auth_config_reads_it_off_app_state` and five
+  `get_current_user` unit tests.
+- `backend/pyproject.toml`: added `pyjwt`, `bcrypt`, `email-validator`
+  to `dependencies`.
+- `.env.example`: added a new "Authentication" section documenting
+  that no new *required* variable names were introduced;
+  `ACCESS_TOKEN_EXPIRE_MINUTES`/
+  `REFRESH_TOKEN_EXPIRE_DAYS` documented as optional overrides of their
+  existing code defaults.
+
+Documentation (Authentication / Identity & Access work):
+`docs/session_state.md`, `docs/implementation_progress.md` (this file),
+`PROJECT_STATE.md` -- all three updated to record this work's
+completion, including the design decisions (registration creates
+only a User; opaque hashed rotating refresh tokens, not JWTs, delivered
+via httpOnly cookies; rotation on every refresh; the two new security
+modules imported directly into the application layer following the
+`target_validation.py` precedent; `require_organization_member` reusing
+`get_org_session`'s already-open transaction; no logout/RBAC/OAuth/MFA/
+password-reset/email-verification) and a targeted follow-up review's
+findings (the naming correction -- this is not "Milestone 8"; the
+JWT-transport correction from an initially-incorrect `Authorization:
+Bearer` implementation back to the locked httpOnly-cookie decision; the
+`RefreshToken` architecture reviewed and confirmed justified; the full
+test suite re-verified after the correction). Technical Debt item #9
+marked resolved below.
+
 ## Files pending
 - All actual domain/application/infrastructure code behind the scaffolded
   packages that Milestones 2-7 did not cover: use cases
@@ -1322,19 +1712,21 @@ smoothed over.
    needed, is most likely catching the unique-constraint violation on
    `add()` and re-fetching via `get_by_identity`, not a change to the
    sequential-retry logic this milestone already has right.
-9. **No authentication on any `/api/v1` route (Milestone 5).**
-   `organization_id` in the URL path is trusted as given -- any caller
-   can act as any organization by supplying its id. `get_org_session`'s
-   organization-existence check (app/api/dependencies.py) is a
-   data-integrity/UX safeguard (turns an unknown org into a clean 404
-   instead of a raw `IntegrityError`), not an authorization control; the
-   two must not be conflated. Not fixed speculatively -- Identity &
-   Access has no signup/login use case yet to build real JWT
-   verification against (`application/identity/` remains an empty
-   scaffold), and RBAC is Phase 6 on the roadmap, both well past this
-   milestone. This is the single most important gap to close before
-   this API is exposed to anything beyond local/trusted use -- flagged
-   here so it is not forgotten, not silently accepted as adequate.
+9. ~~**No authentication on any `/api/v1` route (Milestone 5).**~~ --
+   **resolved by the Authentication / Identity & Access work.**
+   `organization_id` in the URL path was
+   previously trusted as given; every `/api/v1/organizations/
+   {organization_id}/scans/...` route now depends on
+   `require_organization_member` (app/api/dependencies.py), which
+   requires a valid, cookie-delivered JWT access token naming an ACTIVE
+   member of that organization (401 if the token is missing/invalid,
+   403 if the authenticated caller is not an active member).
+   `get_org_session`'s
+   organization-existence check remains a separate data-integrity/UX
+   safeguard (404 for an unknown org), not itself an authorization
+   control -- the two are still not conflated, now that both exist.
+   Full account in `docs/session_state.md`'s Authentication entry and
+   PROJECT_STATE.md's dated decision log.
 10. **The scan pipeline runs synchronously inside the HTTP request
     handler for `POST .../{scan_id}/run` (Milestone 5), blocking for up
     to `DEFAULT_SCAN_TIMEOUT_SECONDS` (600s).** No task queue or worker
@@ -1406,13 +1798,19 @@ smoothed over.
   workflow" in PROJECT_STATE.md.
 
 ## Next planned task
-Phase 2 (MVP backend)'s own milestone breakdown is now fully complete
-(Milestones 1-7). Wait for explicit approval before beginning Phase 3
-(MVP frontend) or any other Phase 3-10 work -- none of it is Milestone
-7's concern and none of it should be started without a new, explicit
-go-ahead, per this project's own one-milestone-per-session rule. Local
-execution confirmation of Milestones 1-7 is done (see "Testing status"
-and "Completed milestones" above) -- Milestone 3's confirmation happened
-in the same session that discovered it was already implemented, not in
-the session that wrote it; Milestones 4, 5, 6, and 7 were each genuine
-fresh implementation and confirmation in the same session.
+Phase 2 (MVP backend)'s own milestone breakdown (Milestones 1-7) remains
+fully complete on its own; the separate Authentication / Identity &
+Access work (Technical Debt #9, pre-Phase-3 backend scope, not an
+eighth Phase-2 milestone) is also complete. Wait for explicit approval
+before beginning Phase 3
+(MVP frontend), RBAC, OAuth, MFA, password reset, email verification,
+Technical Debt item #12 (the network-isolated `scanner_worker` split),
+or any other further work -- none of it is in scope and
+none of it should be started without a new, explicit go-ahead, per this
+project's own one-milestone-per-session rule. Local execution
+confirmation of Milestones 1-7 plus the Authentication work is done (see
+"Testing status" and "Completed milestones" above) -- Milestone 3's
+confirmation happened in the same session that discovered it was
+already implemented, not in the session that wrote it; Milestones 4, 5,
+6, and 7, and the Authentication work, were each genuine fresh
+implementation and confirmation in their own sessions.

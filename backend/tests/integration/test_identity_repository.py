@@ -10,15 +10,19 @@ policy machinery on every org-scoped table (PROJECT_STATE.md section 3).
 
 from __future__ import annotations
 
+from datetime import timedelta
+
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.domain.identity.entities import AuditLogEntry, OrganizationMember
+from app.domain.identity.entities import AuditLogEntry, OrganizationMember, RefreshToken
+from app.domain.shared.clock import utcnow
 from app.domain.shared.enums import MembershipStatus, OrganizationRole
 from app.domain.shared.ids import new_id
 from app.infrastructure.db.repositories.identity_repository import (
     SqlAlchemyAuditLogRepository,
     SqlAlchemyOrganizationRepository,
+    SqlAlchemyRefreshTokenRepository,
     SqlAlchemyUserRepository,
 )
 from tests.integration.support import make_organization, make_user, set_org_context
@@ -197,3 +201,104 @@ async def test_audit_log_add_and_list_for_organization(db_session: AsyncSession)
     assert len(entries) == 1
     assert entries[0].action == "organization.created"
     assert entries[0].metadata == {"source": "integration-test"}
+
+
+# --- RefreshTokenRepositoryPort ---
+# Not org-scoped -- unlike every test above, these do not call
+# set_org_context first, since refresh_tokens (like users) carries no
+# organization_id column and has no RLS policy at all (see
+# RefreshTokenRepositoryPort's own docstring).
+
+
+async def test_refresh_token_add_and_get_by_token_hash_roundtrips(
+    db_session: AsyncSession,
+) -> None:
+    user = make_user()
+    await SqlAlchemyUserRepository(db_session).add(user)
+
+    now = utcnow()
+    token = RefreshToken(
+        id=new_id(),
+        user_id=user.id,
+        token_hash=new_id().hex,
+        expires_at=now + timedelta(days=30),
+        created_at=now,
+    )
+    repo = SqlAlchemyRefreshTokenRepository(db_session)
+    await repo.add(token)
+
+    fetched = await repo.get_by_token_hash(token.token_hash)
+    assert fetched is not None
+    assert fetched.id == token.id
+    assert fetched.user_id == user.id
+    assert fetched.revoked_at is None
+
+
+async def test_refresh_token_get_by_token_hash_returns_none_for_unknown_hash(
+    db_session: AsyncSession,
+) -> None:
+    repo = SqlAlchemyRefreshTokenRepository(db_session)
+    assert await repo.get_by_token_hash("no-such-hash") is None
+
+
+async def test_refresh_token_revoke_sets_revoked_at(db_session: AsyncSession) -> None:
+    user = make_user()
+    await SqlAlchemyUserRepository(db_session).add(user)
+
+    now = utcnow()
+    token = RefreshToken(
+        id=new_id(),
+        user_id=user.id,
+        token_hash=new_id().hex,
+        expires_at=now + timedelta(days=30),
+        created_at=now,
+    )
+    repo = SqlAlchemyRefreshTokenRepository(db_session)
+    await repo.add(token)
+
+    await repo.revoke(token.id)
+
+    fetched = await repo.get_by_token_hash(token.token_hash)
+    assert fetched is not None
+    assert fetched.revoked_at is not None
+
+
+async def test_refresh_token_revoke_raises_lookup_error_for_unknown_token(
+    db_session: AsyncSession,
+) -> None:
+    repo = SqlAlchemyRefreshTokenRepository(db_session)
+    with pytest.raises(LookupError):
+        await repo.revoke(new_id())
+
+
+async def test_refresh_token_hash_uniqueness_is_enforced(db_session: AsyncSession) -> None:
+    from sqlalchemy.exc import IntegrityError
+
+    user = make_user()
+    await SqlAlchemyUserRepository(db_session).add(user)
+
+    now = utcnow()
+    shared_hash = new_id().hex
+    repo = SqlAlchemyRefreshTokenRepository(db_session)
+    await repo.add(
+        RefreshToken(
+            id=new_id(),
+            user_id=user.id,
+            token_hash=shared_hash,
+            expires_at=now + timedelta(days=30),
+            created_at=now,
+        )
+    )
+
+    with pytest.raises(IntegrityError):
+        # add() flushes internally, so the unique-constraint violation
+        # surfaces here, not at a later commit().
+        await repo.add(
+            RefreshToken(
+                id=new_id(),
+                user_id=user.id,
+                token_hash=shared_hash,
+                expires_at=now + timedelta(days=30),
+                created_at=now,
+            )
+        )

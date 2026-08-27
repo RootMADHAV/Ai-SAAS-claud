@@ -21,6 +21,12 @@ root, ``_run_scan_workflow_from_settings`` (which does still need those,
 plus a real Anthropic-shaped key, for exactly the reasons this module's
 old version did), now lives in
 ``tests/integration/test_scan_worker_task.py``.
+
+Update: ``_lifespan`` now also builds an ``AuthConfig``
+(``app/api/dependencies.py``) from ``Settings`` and adds it to
+``AppState`` -- asserted below the same way ``active_scanner`` already
+is, since ``JWT_SECRET`` has been required for ``worker_role=api`` since
+Milestone 1 but was genuinely unused until this work.
 """
 
 from __future__ import annotations
@@ -54,6 +60,8 @@ async def test_lifespan_wires_app_state_with_working_objects(
     monkeypatch.setenv("MINIO_ROOT_PASSWORD", "a-real-minio-password")
     monkeypatch.setenv("MINIO_BUCKET", "scan-raw-output")
     monkeypatch.setenv("JWT_SECRET", "a-real-secret")
+    monkeypatch.setenv("ACCESS_TOKEN_EXPIRE_MINUTES", "20")
+    monkeypatch.setenv("REFRESH_TOKEN_EXPIRE_DAYS", "45")
     # No ANTHROPIC_API_KEY set -- and none is needed: as of Milestone 7,
     # worker_role=api no longer requires it (see
     # app/config.py's check_role_boundaries), since this process never
@@ -67,6 +75,9 @@ async def test_lifespan_wires_app_state_with_working_objects(
             assert isinstance(wired, AppState)
             assert isinstance(wired.active_scanner, ActiveScanner)
             assert isinstance(wired.active_scanner, NucleiAdapter)
+            assert wired.auth_config.jwt_secret == "a-real-secret"
+            assert wired.auth_config.access_token_expire_minutes == 20
+            assert wired.auth_config.refresh_token_expire_days == 45
 
             # The one part of AppState that does need to actually work
             # end-to-end here: a real query against the real test database,
