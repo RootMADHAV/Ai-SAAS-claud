@@ -41,24 +41,42 @@ new global exception handlers are registered (``AuthenticationError``
 -> 401, ``EmailAlreadyRegisteredError`` -> 409), the same codebase-wide
 convention this module already established for ``LookupError`` -> 404
 and ``ScannerMismatchError`` -> 409.
+
+Update (Phase 3 backend preparation, PROJECT_STATE.md): two additions,
+neither a new milestone --
+  - ``app/api/v1/organizations.py``'s router is mounted at
+    ``/api/v1/organizations``, plus a fourth exception handler
+    (``OrganizationSlugAlreadyTakenError`` -> 409), the same pattern as
+    ``EmailAlreadyRegisteredError`` immediately above it.
+  - ``create_app()`` now optionally takes ``cors_allowed_origins`` and
+    registers ``CORSMiddleware`` when any are configured -- see that
+    parameter's own docstring for why it defaults to
+    ``get_cors_allowed_origins()`` (app/config.py) rather than
+    ``Settings``.
 """
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.requests import Request
 from fastapi.responses import JSONResponse
 
 from app.api.dependencies import AppState, AuthConfig
 from app.api.internal.health import router as health_router
 from app.api.v1.auth import router as auth_router
+from app.api.v1.organizations import router as organizations_router
 from app.api.v1.scans import router as scans_router
-from app.application.identity.errors import AuthenticationError, EmailAlreadyRegisteredError
+from app.application.identity.errors import (
+    AuthenticationError,
+    EmailAlreadyRegisteredError,
+    OrganizationSlugAlreadyTakenError,
+)
 from app.application.scanning.run_scan_workflow import ScannerMismatchError
-from app.config import Settings, get_settings
+from app.config import Settings, get_cors_allowed_origins, get_settings
 from app.infrastructure.db.session import create_engine, create_session_factory
 from app.scanner_engine.adapters.nuclei.adapter import NucleiAdapter
 
@@ -189,7 +207,16 @@ async def _email_already_registered_handler(request: Request, exc: Exception) ->
     return JSONResponse(status_code=409, content={"detail": str(exc)})
 
 
-def create_app() -> FastAPI:
+async def _organization_slug_taken_handler(request: Request, exc: Exception) -> JSONResponse:
+    """A ``POST /api/v1/organizations`` naming a ``slug`` that already has
+    an active ``Organization`` row is a conflict with existing state --
+    409, mirroring ``_email_already_registered_handler`` immediately
+    above for the identical reason (uniqueness conflict, not a credential
+    failure or a missing resource)."""
+    return JSONResponse(status_code=409, content={"detail": str(exc)})
+
+
+def create_app(cors_allowed_origins: Sequence[str] | None = None) -> FastAPI:
     """Factory, not a bare module-level ``FastAPI()`` -- tests call this
     directly and override ``app/api/dependencies.py``'s low-level
     providers rather than ever running ``_lifespan`` for real, so
@@ -198,15 +225,56 @@ def create_app() -> FastAPI:
     ``app.main:app`` points at; every test builds its own via this
     function instead, so no test shares mutable state with another test
     or with a real deployment.
+
+    ``cors_allowed_origins``: an explicit override, mainly for tests
+    (``tests/unit/test_cors.py``) that want a deterministic value
+    regardless of the environment they happen to run in. Defaults to
+    ``get_cors_allowed_origins()`` (app/config.py) when not given --
+    deliberately not ``Settings``/``get_settings()``: this function runs
+    unconditionally on every import of this module (every test that does
+    ``from app.main import create_app``, plus the bottom-of-file
+    ``app = create_app()`` line), so it must not require a full,
+    production-shaped ``Settings()`` to succeed -- see
+    ``get_cors_allowed_origins()``'s own docstring for the full
+    reasoning.
     """
     app = FastAPI(title="Security Platform API", lifespan=_lifespan)
+
+    origins = (
+        list(cors_allowed_origins)
+        if cors_allowed_origins is not None
+        else get_cors_allowed_origins()
+    )
+    if origins:
+        # allow_credentials=True is required for the httpOnly auth
+        # cookies (PROJECT_STATE.md section 2's locked transport
+        # decision) to ever reach this API from a browser running the
+        # Phase 3 frontend on a different origin. Starlette rejects
+        # combining that with a wildcard allow_origins, which is also
+        # why an empty/unconfigured origins list disables CORS entirely
+        # here rather than silently falling back to "*". allow_methods/
+        # allow_headers stay scoped to what the public API actually uses
+        # today (GET/POST, JSON request bodies) rather than "*" -- widen
+        # both the day a route needs a different method or header.
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=origins,
+            allow_credentials=True,
+            allow_methods=["GET", "POST"],
+            allow_headers=["Content-Type"],
+        )
+
     app.include_router(scans_router, prefix="/api/v1")
     app.include_router(auth_router, prefix="/api/v1")
+    app.include_router(organizations_router, prefix="/api/v1")
     app.include_router(health_router, prefix="/internal")
     app.add_exception_handler(LookupError, _lookup_error_handler)
     app.add_exception_handler(ScannerMismatchError, _scanner_mismatch_error_handler)
     app.add_exception_handler(AuthenticationError, _authentication_error_handler)
     app.add_exception_handler(EmailAlreadyRegisteredError, _email_already_registered_handler)
+    app.add_exception_handler(
+        OrganizationSlugAlreadyTakenError, _organization_slug_taken_handler
+    )
     return app
 
 

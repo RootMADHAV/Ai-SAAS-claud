@@ -9,6 +9,13 @@ Authentication (resolving Technical Debt #9): ``auth.py`` (the Identity &
 Access bounded context's HTTP surface -- register, login, refresh) and
 ``auth_schemas.py`` (its request/response DTOs).
 
+Organization bootstrap (Phase 3 backend preparation, PROJECT_STATE.md):
+``organizations.py`` (``POST /organizations`` -- create an organization
+and become its Owner) and ``organization_schemas.py`` (its
+request/response DTOs). Not part of the Technical Debt #9 work above,
+and not a full org-management surface -- see organizations.py's own
+module docstring.
+
 Other bounded contexts (Findings, Assets, Reporting) have no routes here
 yet -- see PROJECT_STATE.md's Milestone 5 design-decision note on why:
 none of them has an application-layer use case built yet

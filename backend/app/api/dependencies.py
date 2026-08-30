@@ -96,6 +96,18 @@ in more detail on the function/class itself:
     calls), not a new, separate database round trip. Every
     ``/api/v1/organizations/{organization_id}/scans/...`` route
     (app/api/v1/scans.py) now depends on ``require_organization_member``.
+
+Update (Phase 3 backend preparation, PROJECT_STATE.md -- organization
+bootstrap): ``get_new_organization_id``/``get_org_bootstrap_session``/
+``get_organization_repository_for_bootstrap``/
+``get_create_organization_use_case``, at the end of this module, wire
+``POST /api/v1/organizations`` (app/api/v1/organizations.py) -- not a
+variant of ``get_org_session`` (which 404s when the named organization
+does not already exist, exactly backwards for a creation endpoint) and
+not a use case that generates its own id like every other identity use
+case does, because ``organizations``' RLS policy is self-referential
+(see ``get_new_organization_id``'s own docstring): the id must exist
+before the RLS-scoped session that inserts the row can even open.
 """
 
 from __future__ import annotations
@@ -108,10 +120,12 @@ from uuid import UUID
 from fastapi import Cookie, Depends, HTTPException, Request
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from app.application.identity.create_organization import CreateOrganizationUseCase
 from app.application.identity.login_user import LoginUseCase
 from app.application.identity.refresh_token import RefreshTokenUseCase
 from app.application.identity.register_user import RegisterUserUseCase
 from app.application.interfaces.identity_repository import (
+    OrganizationRepositoryPort,
     RefreshTokenRepositoryPort,
     UserRepositoryPort,
 )
@@ -120,6 +134,7 @@ from app.application.interfaces.scanning_repository import ScanRepositoryPort
 from app.application.scanning.trigger_scan import TriggerScanUseCase
 from app.domain.identity.entities import OrganizationMember, User
 from app.domain.shared.enums import MembershipStatus
+from app.domain.shared.ids import new_id
 from app.infrastructure.db.repositories.identity_repository import (
     SqlAlchemyOrganizationRepository,
     SqlAlchemyRefreshTokenRepository,
@@ -384,3 +399,55 @@ async def require_organization_member(
             detail=f"user {current_user.id} is not an active member of organization {organization_id}",
         )
     return member
+
+
+def get_new_organization_id() -> UUID:
+    """Generates the id a brand-new ``Organization`` row will use, ahead
+    of opening the RLS-scoped session that inserts it. ``organizations``'
+    own RLS policy is self-referential (``id =
+    current_setting('app.current_org_id')::uuid`` -- see the initial
+    migration's module docstring), so the id must be known and set as
+    the session's org context *before* the insert -- unlike every other
+    org-scoped route (app/api/v1/scans.py), whose ``organization_id``
+    already exists in the URL path, there is no existing id to scope to
+    here.
+
+    A plain FastAPI dependency, not a call inside the use case (unlike
+    every other identity use case's own id generation, e.g.
+    ``RegisterUserUseCase``), purely so this function and
+    ``get_org_bootstrap_session`` below -- and the route handler,
+    app/api/v1/organizations.py, which also depends on this function
+    directly to attach the same id to its response -- all resolve to the
+    *same* value within one request. FastAPI caches a dependency's
+    result per request by default, so every ``Depends(get_new_organization_id)``
+    call site in one request resolves once, not several different ids.
+    """
+    return new_id()
+
+
+async def get_org_bootstrap_session(
+    organization_id: UUID = Depends(get_new_organization_id),
+    session_factory: async_sessionmaker[AsyncSession] = Depends(get_session_factory),
+) -> AsyncIterator[AsyncSession]:
+    """An RLS-scoped transaction for creating a brand-new organization --
+    not ``get_org_session`` above, which 404s when the named organization
+    does not already exist (exactly backwards for a creation endpoint).
+    Opens ``session_scoped_to_org`` directly against the freshly
+    generated ``organization_id`` (see ``get_new_organization_id``'s own
+    docstring for why that id must exist before this session opens)."""
+    async with session_scoped_to_org(session_factory, organization_id) as session:
+        yield session
+
+
+def get_organization_repository_for_bootstrap(
+    session: AsyncSession = Depends(get_org_bootstrap_session),
+) -> OrganizationRepositoryPort:
+    return SqlAlchemyOrganizationRepository(session)
+
+
+def get_create_organization_use_case(
+    organization_repository: OrganizationRepositoryPort = Depends(
+        get_organization_repository_for_bootstrap
+    ),
+) -> CreateOrganizationUseCase:
+    return CreateOrganizationUseCase(organization_repository)

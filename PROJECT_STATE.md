@@ -1,1249 +1,495 @@
 # PROJECT_STATE.md
 
-The permanent memory of this project. Read this file first in any new
-session, before reading chat history or asking the user to re-explain
-anything already decided here. Update it whenever a decision changes --
-it should always reflect the *current* state, not the history of how it
-got there (that history lives in the Design decisions section as a dated
-log, but the rest of this file describes "how things are," not "how they
-became that way").
+Compact canonical current-state reference — read this first each session.
+Describes **how things are now**, not the history of how they got there;
+full narrative/rationale/verification detail lives in
+`docs/implementation_progress.md` (never pruned, cumulative). Latest
+single session's own account: `docs/session_state.md`.
 
-Companion files: `docs/implementation_progress.md` (cumulative build
-status across sessions), `docs/session_state.md` (most recent session
-only, overwritten each time).
+Compacted 2026-08-27 from ~1000 lines. No architectural decision was
+changed, added, or removed — only prose narrative already duplicated in
+`docs/implementation_progress.md` was cut from here.
 
 ---
 
-## 1. Approved architecture summary
+## 1. Current phase & status
 
-Clean Architecture, dependency rule enforced: `domain` has zero framework
-or database imports; `application` holds use cases and defines *ports*
-(interfaces) that outer layers implement; `infrastructure`,
-`scanner_engine`, and `ai_agents` are outer-layer adapters implementing
-those ports. `scanner_engine` and `ai_agents` are first-class top-level
-modules, not buried inside `infrastructure/`, because they are this
-product's core extensibility points.
+**Phase 2 (MVP backend), Milestones 1–7: complete.** Separately, the
+Authentication / Identity & Access work (Technical Debt #9, pre-Phase-3
+backend scope, *not* an eighth Phase-2 milestone) is also complete.
 
-Bounded contexts (Domain-Driven Design):
+**Phase 3 backend preparation (not a milestone, not Phase 3 itself):**
+two of three frontend-blockers resolved — CORS (`CORSMiddleware` wiring)
+and organization bootstrap (`POST /api/v1/organizations`). The third
+(httpOnly+Secure cookies cannot be set by a browser over plain
+`http://localhost` in local frontend dev) is **not resolved** — it
+conflicts with this file's own locked cookie-transport decision (§4) and
+requires an explicit human decision, not a silent code change. See §16.
 
-| Boundary | Owns | Reads from | Does not own |
-|---|---|---|---|
-| Identity & Access | orgs, users, roles, permissions, memberships, audit logs | -- | findings, scans |
-| Asset Intelligence | assets, asset observations, dedup/confidence, relationships | org_id from Identity | findings |
-| Scanning | scans, scan_scopes, workflow steps, adapter invocation | Identity, Asset Intelligence | findings |
-| Findings & Analysis | findings, finding_occurrences, finding_analyses, triage state machine | scan_id, asset_id | AI provider calls themselves |
-| AI Platform | agent orchestration, provider routing | Findings data via injected context | any entity -- a capability, not a domain |
-| Reporting | reports | Findings, Scanning | findings themselves |
+No Phase 3 (frontend) implementation approved or started yet. **Wait
+for explicit approval before starting new work** — see §16.
 
-This is a modular monolith, not microservices -- deliberate, for personal
-use and even early commercial use. Boundaries are enforced by import
-discipline, not network calls. Scanning is the most likely candidate to
-split into its own service later, precisely because the boundary is
-already clean.
+## 2. Architecture summary
 
-Event-driven processing: a lightweight in-process/Celery-backed domain
-event dispatcher, not a new message broker (Kafka etc. would be
-infrastructure the personal-use/Milestone-1 scale does not need).
-Subscriptions are registered explicitly at startup in one file that reads
-like a wiring diagram, not via decorator magic scattered across modules --
-traceability ("what happens when a finding is created") wins over
-convenience.
+Clean Architecture: `domain` has zero framework/DB imports;
+`application` holds use cases and defines *ports*; `infrastructure`,
+`scanner_engine`, `ai_agents` are outer-layer adapters. `scanner_engine`/
+`ai_agents` are top-level modules (core extensibility points), not
+buried in `infrastructure/`. Modular monolith, not microservices —
+boundaries enforced by import discipline, not network calls. Scanning
+is the most likely future service-split candidate.
 
-Ports defined so far: `ScannerPort` (ActiveScanner/ImportScanner split --
-not every scanner is invokable; Burp/ZAP manual exports have no execute()
-step), `AIProviderPort`, `EventBusPort`, `StoragePort`, repository ports
-per bounded context.
+Bounded contexts (DDD):
 
-## 2. Technology stack
+| Boundary | Owns | Reads from |
+|---|---|---|
+| Identity & Access | orgs, users, roles, permissions, memberships, audit logs | — |
+| Asset Intelligence | assets, observations, dedup/confidence, relationships | org_id from Identity |
+| Scanning | scans, scan_scopes, workflow steps, adapter invocation | Identity, Asset Intelligence |
+| Findings & Analysis | findings, finding_occurrences, finding_analyses, triage state machine | scan_id, asset_id |
+| AI Platform | agent orchestration, provider routing | Findings data via injected context |
+| Reporting | reports | Findings, Scanning |
+
+Ports defined: `ScannerPort` (`ActiveScanner`/`ImportScanner` split),
+`AIProviderPort`, `StoragePort`, `RefreshTokenRepositoryPort`, plus a
+repository port per bounded context. `EventBusPort` — planned
+(lightweight in-process/Celery dispatcher, not a broker), not yet built.
+
+## 3. Technology stack
 
 | Layer | Choice |
 |---|---|
-| Frontend | Next.js, TypeScript, TailwindCSS, shadcn/ui (Phase 3, not started) |
-| Backend | FastAPI, Python 3.12, SQLAlchemy (async), Alembic |
+| Frontend | Next.js/TS/Tailwind/shadcn (Phase 3 — not started) |
+| Backend | FastAPI, Python 3.12, SQLAlchemy async, Alembic |
 | Database | PostgreSQL with Row-Level Security |
-| Cache / queue | Redis, Celery |
-| Object storage | MinIO, behind StoragePort |
-| Vector database | Qdrant (running from day one per requirement; unused until Phase 5 RAG) |
-| AI providers | Anthropic, OpenAI, Ollama, OpenRouter, behind AIProviderPort |
-| Auth | JWT httpOnly cookies (access token) + opaque hashed/rotating refresh token (also httpOnly cookie); OAuth2 (deferred past Milestone 1) |
+| Cache/queue | Redis, Celery |
+| Object storage | MinIO, behind `StoragePort` |
+| Vector DB | Qdrant (running, unused until Phase 5 RAG) |
+| AI providers | Anthropic (built); OpenAI/Ollama/OpenRouter deferred, behind `AIProviderPort` |
+| Auth | JWT httpOnly cookies (access) + opaque hashed/rotating refresh token (also httpOnly cookie) |
 | IDs | ULID, generated in app code, stored as native Postgres UUID |
-| Testing | pytest, pytest-cov, Ruff, MyPy (strict) |
-| Containers | Docker Compose, with network segmentation (see Design decisions) |
+| Testing | pytest, pytest-cov, Ruff, MyPy strict |
+| Containers | Docker Compose, network-segmented |
 
-## 3. Design decisions
+## 4. Locked architectural decisions
 
-Dated log, most consequential first within each session. Do not
-relitigate these without a genuine implementation blocker -- see Rules.
+Revisit only with a genuine implementation blocker — explain before
+diverging (§14). Full rationale: `docs/implementation_progress.md`.
 
-- RLS for tenant isolation from day one, even in single-org personal use.
-  Retrofitting tenant isolation into a system not built for it is how
-  cross-tenant leaks happen; low current stakes make now the safe time to
-  validate it. RLS policy folded together with soft-delete filtering:
-  `USING (org_id = current_setting('app.current_org_id') AND deleted_at IS NULL)`.
-- Scanner adapter interface split into `ActiveScanner` (has `execute()`)
-  and `ImportScanner` (does not) -- Burp/ZAP manual exports have no "run"
-  step; forcing one interface would fake an execute() on import-only tools.
-- Event bus: lightweight dispatcher over existing Celery/Redis, not a
-  dedicated broker. Accepted trade-off: no replay/backfill if a future
-  consumer needs history that predates it existing -- would need a one-off
-  backfill script, not built speculatively.
-- `finding_analyses` is append-only (never overwritten), now with
-  `prompt_version`, `kb_version` (nullable -- no RAG until Phase 5), and
-  `model_metadata`, to support re-analysis history and "what changed."
-- OAuth2 deferred past Milestone 1 -- schema (`oauth_accounts`) exists,
-  flows do not, since personal use does not need multi-user login yet.
-- `scan_scopes` table exists now (structure), target-ownership enforcement
-  deferred (code) -- the concept costs one table today; retrofitting
-  authorization gating into every scan-trigger path later would cost more.
-- Scanner execution isolation: code-level protections now (argument-list
-  subprocess calls, never shell interpolation; enforced timeouts;
-  non-root; reject RFC1918/loopback/link-local/169.254.169.254 targets by
-  default). Network-level isolation designed via Docker Compose network
-  segmentation: a `scan-egress` network (scanner-worker only, has internet
-  access) separate from `internal` (Postgres, API, ingestion worker -- no
-  internet route), bridged only by Redis/MinIO on a shared `queue`
-  network. True OS-level sandboxing (gVisor, Firecracker) explicitly
-  deferred to Phase 9 -- Docker Compose alone cannot fully solve
-  SSRF/egress control, and this is stated rather than implied to be solved.
-- No graph database -- `asset_relationships` (many-to-many, typed) and
-  `parent_asset_id` (simple hierarchy) cover relationship modeling in
-  plain Postgres at current scale.
-- ULIDs adopted, generated in app code (`domain/shared/ids.py`), stored in
-  native `UUID` columns. No compatibility cost found: same 16 bytes, same
-  index type; buys time-ordered inserts (helps B-tree index locality on
-  high-insert tables) and natural sortability by creation time.
-- `StrEnum` over free-text status/type columns, mapped via
-  `native_enum=False` (VARCHAR + CHECK), not native Postgres `ENUM` --
-  avoids `ALTER TYPE` migration pain as the value set evolves.
-- Soft delete (`deleted_at`) on current-state tables (orgs, users, assets,
-  findings, scans, reports) only -- explicitly not on append-only logs
+- **RLS** enforces tenant isolation only (`organization_id`, or `id` for
+  `organizations`) — **not** combined with soft-delete filtering
+  (Postgres checks a table's `SELECT USING` clause against the *new*
+  row on every `UPDATE`, so `deleted_at IS NULL` in the policy makes a
+  soft delete reject itself). Soft-delete visibility is an explicit
+  `WHERE deleted_at IS NULL` in each repository's read methods instead.
+- `ActiveScanner`/`ImportScanner` split on `ScannerPort` — import-only
+  tools (Burp/ZAP manual export) have no `execute()`.
+- ULIDs, generated in `domain/shared/ids.py`, stored as native Postgres
+  `UUID` columns. `StrEnum` over free-text columns via
+  `native_enum=False` (VARCHAR + CHECK), not native Postgres `ENUM`.
+- Soft delete (`deleted_at`) on current-state tables only (orgs, users,
+  assets, findings, scans, reports) — never on append-only logs
   (`audit_logs`, `finding_status_history`, `asset_observations`,
-  `finding_analyses`) or tables with existing lifecycle fields
+  `finding_analyses`) or tables with their own lifecycle field
   (`organization_members.status`, `refresh_tokens.revoked_at`).
-- **Findings deduplication redesign** (discovered during implementation,
-  not part of the original approved design): a fingerprint column alone
-  let you *query* for recurrence but did not stop the same vulnerability
-  creating a fresh row every scan. Fix: `findings` keyed by
-  `(org_id, fingerprint)`; a recurrence updates the existing row's
-  `last_seen_at` instead of inserting a new one. `finding_occurrences`
-  (mirrors `asset_observations`) keeps full per-scan history underneath.
-- Asset Intelligence: `assets` is a current-state cache (identity =
-  `(org_id, asset_type, normalized value)`); `asset_observations` is the
-  append-only history (every scan's sighting, with a metadata snapshot).
-  `Asset.metadata`/`confidence` are a materialized view of the latest
-  observation -- small write-time duplication for cheap reads on the
-  common case. Confidence rule deliberately simple: most recent
-  observation's confidence, not a weighted blend -- no data yet to justify
-  anything fancier. No direct `finding -> asset_observation` foreign key:
-  derivable via shared `scan_id` + `asset_id`.
-- `domain/shared/enums.py` is a deliberate temporary staging area for
-  enums whose owning bounded context (`scanning/`, `assets/`, `identity/`,
-  `reporting/`) is not built yet. Move each enum into its owning module's
-  own `enums.py` as that context gets implemented.
-- AI: `AIProviderPort` built now (four named providers already in scope
-  justifies the interface). `BaseAgent` deliberately *not* built --
-  YAGNI. One concrete `AnalysisService` exists with no formal interface;
-  extract `BaseAgent` when a second agent's real shape is known, not
-  before.
-- Scanner capability registry: code-level (adapter name -> capability
-  metadata: active/import, output formats, asset types produced, egress
-  required), not a database table -- describes what is deployed, not
-  tenant data. Per-org enablement on top of it is a Phase 6 extension.
-- Feature flags / system settings: `system_settings` (key/value) and
-  `feature_flags` (key + nullable org override), Redis-cached since
-  read-heavy and write-rare.
-- Public/internal API split: two router modules (`/api/v1` public,
-  `/internal` health/metrics/admin) in code now; restricting `/internal`
-  at the network level is a Phase 10 concern.
-- Processing pipeline adopted verbatim: `validate_target -> execute_scanner
-  -> normalize -> deduplicate -> correlate -> enrich -> ai_analyze ->
-  persist`, implemented as explicit `scan_workflow_steps` rows (status,
-  retry count, timestamps per step) rather than one monolithic Celery
-  task -- gives resumability (retry from the failed step, not from
-  scratch) and near-free per-step timing metrics. AI Analysis is a direct
-  call in this sequence, not event-triggered: with one analysis service,
-  there is no second subscriber yet to justify decoupling it.
-  `FindingCreated` still publishes after persist, for future consumers.
-  No per-observation `AssetObserved` event -- too high-frequency, no
-  current consumer; a future consumer queries `asset_observations WHERE
-  scan_id = X` when it receives `ScanCompleted` instead. General rule for
-  what becomes an event: publish when >= 2 independent things need to
-  react, or a near-term low-frequency consumer is already known.
-- `utcnow()` is a plain function, not an injectable `Clock` class -- YAGNI
-  until something needs deterministic time in a test.
-- `DomainEvent` base is not `slots=True` (unlike the value objects) --
-  meant to be subclassed, and dataclass inheritance with `__slots__` has
-  enough sharp edges that the small memory saving is not worth it for
-  something created at "one per finding," not "millions per second."
-- **RLS + soft-delete redesign** (discovered during Milestone 2
-  implementation, not part of the original approved design): the
-  original predicate -- `USING (org_id = current_setting('app.
-  current_org_id') AND deleted_at IS NULL)` -- is unimplementable as a
-  single policy. PostgreSQL checks a table's `SELECT`-relevant `USING`
-  clause against the *new* row on every `UPDATE`, in addition to any
-  `WITH CHECK` given (confirmed against real Postgres 16, and against
-  the pgsql-hackers thread "Bug: RLS policy FOR SELECT is used to check
-  new rows," Oct 2023, which describes this as long-standing, not a
-  version-specific bug). With `deleted_at IS NULL` inside the policy,
-  the very `UPDATE` that performs a soft delete produces a row that
-  fails its own table's read policy -- Postgres rejects it with "new row
-  violates row-level security policy," and no per-command policy split
-  avoids this, since the `SELECT`-side check on the new row is
-  unconditional. Fix: RLS now enforces tenant isolation only
-  (`organization_id`, or `id` for `organizations` itself) --
-  `deleted_at` filtering moved to explicit `WHERE deleted_at IS NULL` in
-  the repository read methods for the five soft-delete tables
-  (`get_by_id`, `get_by_slug`/`get_by_email`/`get_by_identity`/
-  `get_by_fingerprint`, and `Report.list_by_scan`), the same way every
-  other query-level filter in this codebase is expressed. Tenant
-  isolation itself is unaffected -- still fully enforced by the
-  database, not by application code remembering a WHERE clause; only the
-  soft-delete display concern moved, and it never depended on RLS in the
-  first place (`users` has always been soft-deleted with no RLS policy
-  at all, since it has no `organization_id` column). Full account in the
-  DESIGN NOTE at the top of the initial-schema Alembic migration.
-- Every `datetime` column requires an explicit `DateTime(timezone=True)`
-  in its `mapped_column(...)` call (discovered during Milestone 2): a
-  bare `Mapped[datetime]` with no explicit column type silently produces
-  a timezone-*naive* `TIMESTAMP` column, and asyncpg then rejects
-  binding the timezone-aware values this codebase's `utcnow()` produces
-  ("can't subtract offset-naive and offset-aware datetimes"). Every
-  model in `app/infrastructure/db/models/` uses `DateTime(timezone=True)`
-  explicitly for this reason, including columns outside the
-  `TimestampMixin`/`SoftDeleteMixin` pair (which already did this
-  correctly from the start).
-- **Scan status derivation** (Milestone 4, filling the gap the Scan
-  domain-model row in section 5 always flagged as deferred):
-  `derive_scan_status(steps)` in `app/domain/scanning/entities.py` is a
-  pure function, not a method on `Scan` -- `Scan` does not hold a live
-  reference to its own `ScanWorkflowStep` rows, so a function taking
-  them as an explicit argument is the correct shape. Rule: any step
-  `FAILED` -> `FAILED`; every step `COMPLETED` or `SKIPPED` -> `COMPLETED`;
-  otherwise `RUNNING`; no steps at all -> `QUEUED` (defensive only).
-- **Processing pipeline orchestrator resumability, as actually
-  implemented** (Milestone 4): the eight pipeline steps split into two
-  groups. `EXECUTE_SCANNER` is the one step this codebase treats as
-  expensive and non-idempotent -- once its `ScanWorkflowStep` row is
-  `COMPLETED`, `RunScanWorkflowUseCase` never invokes the real scanner
-  again for that scan; it reads the already-durably-stored raw output
-  back from `StoragePort` instead (stored under a deterministic
-  `{scan_id}/raw-output` key, so no new column was needed to remember
-  where it went). Every other step (`normalize`, `deduplicate`,
-  `correlate`, `enrich`, `persist`) is treated as safe to recompute on
-  every invocation, because each is either a pure read (normalize,
-  deduplicate, enrich) or is guarded against duplicate writes on a
-  retried run: `correlate` checks for an existing `(scan_id, asset_id)`
-  observation before calling `add_observation`, and `persist` checks for
-  an existing `(scan_id, finding_id)` occurrence before calling
-  `add_occurrence`, using each repository's own natural-key lookups
-  (`get_by_identity`, `get_by_fingerprint`) to avoid re-creating an
-  `Asset` or `Finding` that a prior attempt already created. This gives
-  genuine resumability for the realistic case (a transient failure,
-  fixed, then the same scan retried) without solving fully general
-  exactly-once delivery -- see this milestone's technical debt entry in
-  `docs/implementation_progress.md` for the one edge case this does not
-  cover.
-- **`AI_ANALYZE` is unconditionally `SKIPPED` in Milestone 4, not
-  event-published, not backed by a scanner registry** -- three related,
-  deliberate scope boundaries, not oversights: (1) `AIProviderPort` and
-  an `AnalysisService` do not exist yet (Milestone 6), so
-  `RunScanWorkflowUseCase` marks this step `SKIPPED` -- a real,
-  already-modeled terminal state (PROJECT_STATE.md section 5), not a
-  fabricated result -- rather than guessing at AI behavior; a `SKIPPED`
-  step still counts as "done" for `derive_scan_status`, so scans
-  complete today without AI commentary. (2) No `FindingCreated`
-  event is published after persist, even though this file already named
-  that as planned ("still publishes after persist, for future
-  consumers") -- `EventBusPort` itself does not exist yet (section 4's
-  folder structure), and this milestone does not invent one purely to
-  satisfy that forward reference. (3) `RunScanWorkflowUseCase` is
-  constructed with exactly one `ActiveScanner` instance and raises
-  `ScannerMismatchError` if a `Scan`'s `scanner_name` does not match it,
-  rather than building a multi-adapter registry for a codebase that
-  still has exactly one adapter (`NucleiAdapter`) -- the same
-  "don't build it until a second real shape exists" reasoning this file
-  already applies to deferring `BaseAgent`.
-- **CVSS/severity provenance kept strictly separate from scanner-native
-  severity claims** (Milestone 4, discovered while implementing the
-  `enrich` step -- a real design consideration, not a bug fix):
-  `Finding.ai_severity_level` is named for what it is, an AI provider's
-  own estimate (Milestone 6) -- `enrich` never writes a scanner's raw,
-  self-reported severity string (e.g. nuclei's own `info.severity`) into
-  that field, since doing so would misrepresent the data's provenance.
-  A finding with no valid CVSS and no AI estimate yet legitimately has
-  no `effective_severity` -- that is correct today, not a gap to patch
-  around. The scanner's raw severity claim is not discarded, though: it
-  travels in `FindingOccurrence.raw_evidence` (the full raw scanner match
-  object), available to a human or a future AI process, just not
-  asserted as authoritative by this milestone.
-- **Normalization is nuclei-specific application-layer code, not a
-  `NormalizerPort`** (Milestone 4, `app/application/scanning/
-  normalization.py`): `ScanOutput`'s own docstring already commits
-  Scanning to stop at "here is exactly what the scanner said" and defer
-  interpretation to "the normalize pipeline step (Milestone 4)" -- so
-  turning nuclei's raw JSONL into structured data, including deciding
-  what a CVSS candidate or a severity string even means, could not live
-  in `scanner_engine/` without Scanning starting to own Findings
-  concepts. It lives in the application layer instead, dispatching on
-  `output_format` via a plain `if`, not an injectable port -- with
-  exactly one real output format wired (Milestone 3), a port with one
-  implementation would be an untested abstraction, revisited when Phase
-  4 adds a second scanner output format.
-- **Milestone 5's public API covers only the Scanning bounded context,
-  with no authentication.** Two related, deliberate scope boundaries:
-  (1) `/api/v1` exposes create/run/get for `Scan` only -- Findings,
-  Assets, and Reporting have no application-layer use cases yet
-  (`application/{findings,assets,reporting}/` remain empty scaffolds)
-  and no "list by organization" repository query for a read endpoint to
-  call even if one were added; Scanning is the one bounded context with
-  use cases *and* an adapter fully wired end-to-end (Milestones 3-4).
-  (2) No route verifies caller identity -- `organization_id` in the URL
-  path is trusted as given. Identity & Access has no signup/login use
-  case yet to build real JWT verification against
-  (`application/identity/` remains an empty scaffold, despite
-  `jwt_secret` existing in `Settings` since Milestone 1 as forward-
-  looking config), and RBAC is Phase 6 on the roadmap -- both well past
-  this milestone. Building either now would be exactly the kind of
-  future-milestone abstraction this project's session rules prohibit.
-  This is a real, currently-unenforced authorization gap, tracked as
-  Technical debt item #9 in `docs/implementation_progress.md`, not
-  silently left implicit. `get_org_session`'s organization-existence
-  check (a 404 for an unknown org, via the same
-  `OrganizationRepositoryPort.get_by_id` every other caller already
-  uses) is a data-integrity/UX safeguard, not an authorization control --
-  the two are not the same thing and must not be conflated.
-- **The scan pipeline runs synchronously inside the HTTP request
-  handler** (Milestone 5, `POST .../scans/{scan_id}/run`), blocking for
-  up to `DEFAULT_SCAN_TIMEOUT_SECONDS` (600s). No task queue or worker
-  process exists yet -- that wiring is Milestone 7's ("Docker Compose
-  wired end-to-end"), per the roadmap in `docs/implementation_progress.md`.
-  Building it now would be Milestone 7 work landing inside Milestone 5.
-  Tracked as Technical debt item #10.
-- **`create_scan` and `run_scan` are separate endpoints** (Milestone 5),
-  not a single combined call, because `TriggerScanUseCase` and
-  `RunScanWorkflowUseCase` are already separate for a reason (recording
-  intent to scan is not executing the pipeline), and keeping them
-  separate over HTTP is what makes Milestone 4's resumability visible to
-  a client: calling `run` again on a scan that failed partway retries
-  from the failed step, exactly as the use case already supports for a
-  direct caller.
-- **`minio_bucket` added to `Settings`, required for every
-  `worker_role`** (Milestone 5), alongside the other MinIO fields.
-  Milestone 5 is the first to actually construct `MinioStoragePort`
-  through `Settings` in a composition root (`app/main.py`'s lifespan)
-  rather than directly in a test with an explicit bucket argument
-  (Milestones 3-4's own tests) -- necessary, not speculative; the app
-  cannot be composed without it.
-- **The `AI_ANALYZE`-before-`PERSIST` ordering tension, and how
-  Milestone 6 resolved it without reordering the locked pipeline**: the
-  locked pipeline order (`... -> enrich -> ai_analyze -> persist`) runs
-  `AI_ANALYZE` before `PERSIST`, so no `Finding.id` exists yet for a
-  brand-new finding when analysis happens -- but `FindingAnalysis.
-  finding_id` requires one. Fix: `_ai_analyze` stashes its result in
-  memory on `_PipelineItem.ai_analysis`, exactly the same pattern
-  `_enrich` already uses for `item.cvss`; `_persist`, which already
-  resolves a real `finding.id` for every item (new or recurring) before
-  this data would need one, is what actually writes `Finding.
-  ai_severity_level` and appends the `FindingAnalysis` row. A per-
-  finding `AIProviderError`/`AnalysisError` is caught and logged inside
-  `_ai_analyze`, not allowed to fail the step -- AI commentary has
-  always been optional for a scan to be considered done (`SKIPPED`'s
-  own pre-Milestone-6 role here); any other exception still propagates.
-  `Finding.ai_severity_level` is set at Finding creation only, never
-  refreshed on a later re-detection, mirroring the existing precedent
-  for `cvss_score`/`cvss_vector`; `finding_analyses` remains append-only
-  regardless, gaining a fresh row every time `AI_ANALYZE` produces a
-  result.
-- **`AI_ANALYZE` is treated as safe-to-recompute (like `normalize`/
-  `deduplicate`/`enrich`), not exempted like `EXECUTE_SCANNER`**
-  (Milestone 6) -- considered giving it the same "skip once already
-  `COMPLETED`" treatment `EXECUTE_SCANNER` gets, to avoid re-calling the
-  AI provider on a scan retried after a later-step failure. Rejected:
-  `EXECUTE_SCANNER`'s exemption exists because re-running it means
-  re-scanning a live target -- a correctness/safety concern, not merely
-  a cost one. Re-analyzing a finding with an LLM again has no
-  correctness concern, only a cost one, and giving it the same exemption
-  would require a new durability mechanism (persisting in-progress AI
-  results somewhere retrievable across `execute()` invocations, since
-  `_PipelineItem`s are rebuilt from scratch every call) this milestone
-  does not otherwise need. Accepted the real, minor cost instead (a
-  retried scan re-calls the AI provider for every finding) and flagged
-  it as Technical debt item #11, rather than building speculative
-  infrastructure to avoid it.
-- **`anthropic_api_key` required for `worker_role=api` only when
-  `ai_default_provider == "anthropic"`, not unconditionally for every
-  possible provider** (Milestone 6). `AnthropicProvider` is the only
-  adapter this milestone builds -- requiring, say, `OPENAI_API_KEY`
-  before an OpenAI adapter exists would demand a credential nothing in
-  this codebase can use yet. Pointing `AI_DEFAULT_PROVIDER` at any other
-  provider name fails at composition-root wiring time (`app/main.py`'s
-  `_lifespan`) instead, since that failure is about which adapter
-  exists to construct, not about a missing credential.
-- **`run_scan` (`POST .../scans/{scan_id}/run`) now dispatches a Celery
-  task instead of executing `RunScanWorkflowUseCase` inside the HTTP
-  request handler, resolving Technical debt item #10** (Milestone 7).
-  The route performs the same two checks the use case's own `execute()`
-  always performed first (scan exists -> 404; `scanner_name` matches the
-  wired adapter -> 409, still via `ScannerMismatchError`, now raised
-  directly from the route), then dispatches
-  `app/workers/tasks.py::run_scan_workflow_task` via a new
-  `get_scan_dispatcher` seam (`app/api/dependencies.py`) and returns
-  `202 Accepted` with the scan's pre-execution state. A scan already
-  `RUNNING` is not re-dispatched -- a new, easy-to-trigger failure mode
-  this change introduces (dispatch returns almost instantly, so a
-  client can call `run` twice in rapid succession), addressed with the
-  smallest guard that closes it. `RunScanWorkflowUseCase` itself is
-  unmodified -- its own module docstring already anticipated exactly
-  this deployment-wiring decision being made in Milestone 7, not a
-  restructuring of the use case.
-- **The API process no longer constructs `MinioStoragePort` or
-  `AnthropicProvider`/`AnalysisService`, and no longer holds their
-  credentials** (Milestone 7) -- a direct, necessary consequence of the
-  dispatch change above, not unrelated cleanup: once `run_scan` no
-  longer calls `RunScanWorkflowUseCase` itself, the API process never
-  touches either adapter, so it has no further use for either
-  credential. `app/main.py`'s `_lifespan` correspondingly narrowed to
-  building only a session factory and `NucleiAdapter` (credential-free,
-  still needed for the cheap scanner-name check above); the
-  `ANTHROPIC_API_KEY`-required check in `app/config.py`'s
-  `check_role_boundaries` moved from `worker_role=api` to
-  `worker_role=ingestion_worker`, following the process that actually
-  constructs `AnalysisService` now (`app/workers/tasks.py`'s
-  `_run_scan_workflow_from_settings`, the worker's own composition
-  root, mirroring `_lifespan` almost exactly).
-- **No network-isolated `scanner_worker` split was built in Milestone
-  7, and `docker-compose.yml`'s network topology diverges from the
-  placeholder comment it replaces as a direct, discovered consequence.**
-  `RunScanWorkflowUseCase` runs completely unmodified inside one
-  `ingestion_worker` Celery task -- including its own `EXECUTE_SCANNER`
-  step, unrestructured. The placeholder this file's own `docker-
-  compose.yml` previously carried envisioned a `scanner-worker` on
-  `scan-egress`, isolated from `internal` (no route to Postgres) --
-  i.e., a worker with internet access but no database access. Given the
-  single, unsplit worker Milestone 7 actually builds needs *both*
-  database access (every pipeline step) *and* outbound internet access
-  (`EXECUTE_SCANNER`'s real scan targets, `AI_ANALYZE`'s calls to the
-  Anthropic API) inside the same process, that isolation is not
-  achievable without breaking the worker's own required functionality --
-  discovered while writing the compose file itself, not decided in
-  advance. Resolved honestly rather than silently: `worker` is attached
-  to `internal` (Postgres), `queue` (Redis/MinIO), and a new,
-  deliberately-differently-named `worker-egress` network (genuine
-  internet access) -- distinct from the placeholder's future
-  `scan-egress`, so the two are never confused as already having been
-  built. What *is* fully achievable now, and delivered: `backend` (the
-  API process) sits on `internal` with genuinely no internet route at
-  all, made possible by the credential-narrowing above. Building the
-  real split requires restructuring `RunScanWorkflowUseCase` into
-  independently-schedulable phases with a durable hand-off between them
-  -- a genuine architectural change, not "more Celery wiring," explicitly
-  out of scope for Milestone 7 and tracked as Technical debt item #12 in
-  `docs/implementation_progress.md`. Code-level scan-target safety
-  (`validate_target`'s SSRF/private-IP rejection, argument-list-only
-  subprocess execution, enforced timeouts, non-root execution) is
-  unchanged and fully enforced regardless -- this is network-level
-  defense-in-depth on top of those checks, not a gap in them, matching
-  this section's own original framing of the split.
-- **JWT auth transport implements the locked "httpOnly cookies" decision
-  (section 2) as specified -- access and refresh tokens are delivered
-  exclusively via `Set-Cookie`, never in a JSON response body.** A first
-  pass of this work initially implemented `Authorization: Bearer` header
-  delivery instead, reasoning that no frontend yet existed to build or
-  test a cookie-based flow against, and edited section 2 to describe the
-  Bearer-token approach as the current decision. On review, this was an
-  unapproved divergence, not a genuine implementation blocker -- the
-  locked decision does not require an existing frontend to implement
-  correctly against, only a client capable of sending/receiving cookies,
-  which the project's own test suite already is (`httpx.AsyncClient`).
-  Corrected before this work was considered complete: `login`/`refresh`
-  (`app/api/v1/auth.py`) set `access_token`/`refresh_token` as
-  `HttpOnly`, `Secure`, `SameSite=Lax` cookies (`_set_auth_cookies`);
-  `get_current_user` (`app/api/dependencies.py`) reads the access token
-  from its cookie, not a header; `refresh` reads the refresh token from
-  its own cookie, not a request body. Neither route returns a token
-  value in its JSON body -- doing so would let any script able to read
-  the response (exactly what an XSS payload can do) recover the token,
-  defeating the reason `HttpOnly` was chosen. `SameSite=Lax` is the
-  same-origin-API CSRF baseline this decision includes; a double-submit
-  CSRF token is not additionally built, since no frontend origin exists
-  yet to design one against -- flagged as follow-up work for whichever
-  session first builds Phase 3's frontend, not silently assumed solved.
-  Nothing about token *issuance* (`issue_token_pair`,
-  `RefreshTokenRepositoryPort`) needed to change for this correction --
-  only how the tokens reach the client.
-- **Refresh tokens are opaque, random, hashed values -- not JWTs --
-  while access tokens are stateless signed JWTs.** An
-  access token is verified by signature alone (no database round trip),
-  which is exactly why it must be short-lived (`Settings.
-  access_token_expire_minutes`, default 15) -- it cannot be revoked
-  before it expires. A refresh token is looked up by its SHA-256 hash
-  against the `refresh_tokens` table on every use, which is what makes
-  revocation and rotation possible at all: a self-contained JWT refresh
-  token could not be invalidated before its own expiry without a
-  separate denylist, which is exactly what the `refresh_tokens` table
-  (present, unused, since Milestone 2) already is. Rotation (the
-  presented token is revoked before a new pair is issued on every
-  `/auth/refresh` call) means a stolen-and-replayed token is usable at
-  most once before its own reuse is detectable. Full reuse-detection-
-  triggers-family-wide-revocation (revoking every token descended from a
-  reused one) is explicitly not built -- nothing in the
-  current scope consumes it yet; flagged as future work, not silently
-  assumed solved.
-- **`password_hashing.py`/`token_service.py` are imported directly into
-  the Identity & Access application-layer use cases, not hidden behind a
-  new port** -- deliberately following the precedent
-  `app/infrastructure/security/target_validation.py` already set for
-  `validate_target` (zero framework/DB imports, exactly one real
-  implementation, so a port would be an abstraction with nothing to be
-  abstract over -- this file's own "don't build it until a second real
-  shape exists" reasoning, applied here to password hashing and JWT/
-  refresh-token primitives rather than invented fresh).
-- **`RegisterUserUseCase` creates only a `User` row, never an
-  Organization or OrganizationMember.** Building an
-  organization-creation flow into registration would either silently
-  bypass the ">= 1 Owner always" invariant section 5 names, or require
-  enforcing it prematurely -- the identical reasoning this file's own
-  Milestone 5 entry already gives for deferring an organization-creation
-  HTTP endpoint. A registered user becomes a member of an organization
-  via a future invite/membership flow, not this work's `register`
-  route; every authenticated-route test this work added creates the
-  test membership directly via the repository, the same way this
-  project's existing tests already create test organizations directly
-  rather than through an HTTP endpoint that does not exist.
-- **`require_organization_member` (resolving Technical debt item #9)
-  reuses `get_org_session`'s already-open transaction, not a second
-  database connection.** FastAPI's per-request dependency
-  caching means every dependency in a request that also depends on
-  `get_org_session` (e.g. `get_scan_repository`) shares the exact same
-  session -- the ACTIVE-membership check this function performs is one
-  extra query inside a transaction already open for the route's own
-  work, not a new round trip. `get_org_session`'s own organization-
-  existence check (404 for an unknown org) remains a separate,
-  unrelated data-integrity/UX safeguard, not itself an authorization
-  control -- the two are still not conflated, now that both exist on
-  the same request path.
-- **`RefreshToken` (entity/port/repository) and rotation, reviewed
-  against "was this genuinely required, or should it be simplified,"
-  and kept as-is.** The `refresh_tokens` table -- including a
-  `revoked_at` column implying revocation was always the intended
-  design, not invented by this work -- already existed in the schema
-  (Milestone 2) before any of this work began; the approved scope
-  explicitly named "secure ... JWT access/refresh authentication," not
-  merely "authentication." Building a repository for an already-
-  scaffolded table, following this project's own established
-  per-aggregate pattern (every persisted concept here already has a
-  domain entity + port + SQLAlchemy repository -- `AuditLogEntry` is no
-  more "domain-rich" than `RefreshToken` and gets the identical
-  treatment), is the minimal correct completion of existing
-  architecture, not new scope invented beyond it. Rotation specifically
-  was also reviewed: without it, a refresh token would have no
-  meaningful revocation path at all until a future logout endpoint is
-  built (not part of this scope), leaving a leaked refresh token valid
-  for up to 30 days with nothing to detect or stop its reuse -- contrary
-  to the "secure" qualifier in the approved scope. Rotation is the
-  accepted minimum industry-standard way to make an opaque refresh token
-  meaningfully revocable without building full token-family tracking
-  (which was correctly not built -- see the entry above). No
-  simplification made.
+- Findings dedup: `findings` keyed by `(org_id, fingerprint)`; a
+  recurrence updates `last_seen_at` on the existing row.
+  `finding_occurrences` keeps per-scan history underneath.
+- Assets: `assets` is a current-state cache, identity =
+  `(org_id, asset_type, normalized value)`; `asset_observations` is
+  append-only history. No direct `finding → asset_observation` FK
+  (derivable via shared `scan_id` + `asset_id`).
+- **Eight-stage pipeline, locked order:** `validate_target →
+  execute_scanner → normalize → deduplicate → correlate → enrich →
+  ai_analyze → persist`, as explicit `scan_workflow_steps` rows (not one
+  monolithic task) — resumability + per-step timing. `EXECUTE_SCANNER`
+  alone is exempt from retry recomputation (never re-invokes the real
+  scanner once `COMPLETED`; re-reads raw output from `StoragePort`).
+  Every other step recomputes safely on retry (pure reads, or guarded
+  by natural-key/`(scan_id, …)` checks) — including `AI_ANALYZE` (cost,
+  not correctness/safety, concern — TD #11). `AI_ANALYZE`'s result is
+  stashed on `_PipelineItem.ai_analysis` (mirrors `_enrich`'s CVSS
+  pattern, since no `Finding.id` exists until `PERSIST`); `_persist`
+  writes `ai_severity_level` and appends `FindingAnalysis`. A
+  per-finding `AIProviderError`/`AnalysisError` is caught/logged, never
+  fails the step.
+- Scanner-native severity is never written to `Finding.ai_severity_level`
+  (that field means an AI provider's own estimate) — raw scanner
+  severity travels in `FindingOccurrence.raw_evidence` instead.
+- No `BaseAgent`/`NormalizerPort`/scanner registry yet — YAGNI, exactly
+  one concrete implementation exists for each; build the abstraction
+  only when a second real shape exists.
+- `POST .../scans/{scan_id}/run` dispatches Celery async, returns `202
+  Accepted` (resolved TD #10): checks scan exists (404) and
+  `scanner_name` matches the wired adapter (409) before dispatch; does
+  not re-dispatch an already-`RUNNING` scan. `RunScanWorkflowUseCase`
+  itself runs unmodified inside one `ingestion_worker` Celery task (no
+  scanner_worker split — TD #12).
+- Network segmentation (`docker-compose.yml`): `backend` (API) is on
+  `internal` only, no internet route, no MinIO/Anthropic credentials.
+  `worker` is on `internal` + `queue` + `worker-egress` — has both DB
+  and internet access, since `EXECUTE_SCANNER`/`AI_ANALYZE` both need
+  it and no split exists yet (TD #12).
+- **Auth transport: JWT delivered exclusively via httpOnly cookies**
+  (`Set-Cookie`), never a JSON body — locked; briefly implemented as
+  `Authorization: Bearer` before being corrected back. `SameSite=Lax`
+  is the CSRF baseline; a double-submit token awaits Phase 3's frontend
+  origin. Access tokens: stateless signed JWTs (15 min default,
+  unrevocable before expiry). Refresh tokens: opaque, random, hashed
+  values (not JWTs), looked up by SHA-256 hash, rotated (revoked and
+  reissued) on every `/auth/refresh` call. Family-wide
+  revocation-on-reuse-detection not built (flagged, not solved).
+  `password_hashing.py`/`token_service.py` are imported directly into
+  the application layer, not behind a port — same precedent as
+  `target_validation.py` (zero framework/DB imports, one real impl).
+- `RegisterUserUseCase` creates only a `User` row — never an
+  Organization/OrganizationMember (would bypass or prematurely enforce
+  the "≥ 1 Owner always" invariant). Org membership is a future
+  invite/membership flow.
+- `require_organization_member` reuses `get_org_session`'s already-open
+  transaction — not a second DB connection.
+- Every `datetime` column requires explicit `DateTime(timezone=True)` —
+  the bare SQLAlchemy default is timezone-naive and asyncpg rejects this
+  codebase's timezone-aware `utcnow()` values against it (a real,
+  previously-hit bug, not a style preference).
+- `DomainEvent` base is not `slots=True`; `utcnow()` is a plain function,
+  not an injectable `Clock` — both YAGNI until a real need appears.
 
-## 4. Folder structure
+## 5. Folder structure (current)
 
-```
-<project root>/
-├── PROJECT_STATE.md
-├── README.md, docker-compose.yml, .env.example,
-│   AI_ENGINEERING_RULES.md, LICENSE   (root placeholders)
-├── .gitignore
-├── docs/
-│   ├── implementation_progress.md, session_state.md
-│   └── architecture.md, roadmap.md, decisions.md, database.md, api.md,
-│       coding_standards.md, testing_strategy.md, security_model.md
-│       (pending -- described in chat history, not yet written as files;
-│        this document is the interim consolidated substitute)
-├── backend/
-│   ├── pyproject.toml, Dockerfile (done -- multi-stage, shared by backend+worker Compose services, Milestone 7)
-│   ├── alembic.ini, alembic/env.py, alembic/script.py.mako,
-│   │   alembic/versions/ (initial schema migration, with RLS policies)
-│   ├── app/
-│   │   ├── main.py (done -- FastAPI app factory + lifespan, Milestone 5; extended Milestone 6 to construct AnthropicProvider/AnalysisService; narrowed Milestone 7 -- no longer constructs MinioStoragePort/AnthropicProvider/AnalysisService), config.py
-│   │   ├── domain/
-│   │   │   ├── shared/        (ids, clock, fingerprint, events, enums -- staging, see decisions)
-│   │   │   ├── findings/      (value_objects.py, entities.py -- done)
-│   │   │   ├── scanning/, assets/, identity/, reporting/   (entities.py done; behavior/state machines pending)
-│   │   ├── application/
-│   │   │   ├── interfaces/    (repository ports for all 5 bounded contexts -- done; ScannerPort/StoragePort done (Milestone 3); AIProviderPort done (Milestone 6); RefreshTokenRepositoryPort done; EventBusPort pending)
-│   │   │   ├── scanning/      (done -- trigger_scan.py, run_scan_workflow.py, normalization.py, Milestone 4; run_scan_workflow.py's AI_ANALYZE step extended Milestone 6; run_scan_workflow.py itself unchanged Milestone 7 -- now invoked from app/workers/tasks.py instead of app/api/v1/scans.py)
-│   │   │   ├── identity/      (done -- errors.py, tokens.py, register_user.py, login_user.py, refresh_token.py; invite_member and org-membership use cases still scaffolded, empty)
-│   │   │   ├── assets/, findings/, reporting/  (use cases -- scaffolded, empty)
-│   │   ├── api/
-│   │   │   ├── dependencies.py  (done -- composition-root DI providers, Milestone 5; extended Milestone 6 for get_analysis_service; narrowed Milestone 7 -- get_storage/get_analysis_service/get_run_scan_workflow_use_case/get_asset_repository/get_finding_repository removed, get_scan_dispatcher added; extended for Authentication -- AuthConfig/get_auth_config, get_identity_session, get_current_user (reads the httpOnly access_token cookie), require_organization_member, register/login/refresh use-case providers)
-│   │   │   ├── v1/  (done -- schemas.py, scans.py -- the public Scanning API, Milestone 5; scans.py's run_scan rewritten Milestone 7 for async dispatch/202; scans.py's routes gain auth; auth.py, auth_schemas.py -- the public Identity & Access API, delivering tokens via httpOnly Set-Cookie, never in a JSON body)
-│   │   │   └── internal/  (done -- health.py; metrics/admin pending observability/RBAC, Milestone 5)
-│   │   ├── infrastructure/
-│   │   │   ├── db/{base.py, session.py, models/, repositories/}  (done -- all 19 tables, all 5 repositories; identity_repository.py extended with SqlAlchemyRefreshTokenRepository)
-│   │   │   ├── storage/  (done -- MinioStoragePort, Milestone 3)
-│   │   │   ├── security/  (done -- target_validation.py, Milestone 3; password_hashing.py, token_service.py -- the latter also defines the httpOnly-cookie name constants shared by auth.py/dependencies.py)
-│   │   │   ├── ai_providers/  (done -- anthropic_provider.py, Milestone 6; OpenAI/Ollama/OpenRouter adapters pending a second real provider shape)
-│   │   │   ├── vector_store/, event_bus/, observability/  (all scaffolded, empty)
-│   │   ├── scanner_engine/
-│   │   │   ├── base_scanner.py  (done -- run_scanner_subprocess, Milestone 3)
-│   │   │   └── adapters/{nuclei,nmap,burp,zap,reconx,bughunter,sqlmap}/
-│   │   │       (nuclei/ done -- NucleiAdapter, Milestone 3; the rest
-│   │   │        remain scaffolded, empty Phase 4 stubs)
-│   │   ├── ai_agents/   (done -- analysis_service.py, Milestone 6; no BaseAgent interface yet -- YAGNI)
-│   │   └── workers/     (done -- celery_app.py, tasks.py, Milestone 7; runs RunScanWorkflowUseCase inside an ingestion_worker Celery task -- see decisions)
-│   └── tests/
-│       ├── conftest.py  (async Postgres fixtures -- rewritten in Milestone 2; see docs/implementation_progress.md for the discovered stray-file note)
-│       ├── unit/    (config, ids, clock, fingerprint, events, value_objects,
-│       │         domain_entities, base_scanner, target_validation,
-│       │         minio_storage, nuclei_adapter, scan_status_derivation,
-│       │         normalization, trigger_scan, run_scan_workflow,
-│       │         api_schemas, health, anthropic_provider, analysis_service,
-│       │         celery_app, api_dependencies, password_hashing,
-│       │         token_service, register_user, login_user,
-│       │         refresh_token_use_case -- all twenty-six done)
-│       └── integration/  (support.py + repository/session integration suite,
-│                 plus test_scan_pipeline_orchestrator.py (Milestone 4;
-│                 AI-provider fake added Milestone 6),
-│                 plus test_api_scans.py, test_health_ready.py,
-│                 test_main_lifespan.py (Milestone 5; both extended
-│                 Milestone 6 for AI-provider wiring; test_api_scans.py
-│                 rewritten and test_main_lifespan.py simplified
-│                 Milestone 7 for the async-dispatch contract;
-│                 test_api_scans.py rewritten again and
-│                 test_main_lifespan.py extended for the Authentication
-│                 work), plus test_scan_worker_task.py (Milestone 7),
-│                 plus test_identity_repository.py extended and
-│                 test_api_auth.py added, all
-│                 against real Postgres)
-└── frontend/   (Phase 3, not started)
-```
+Root: `PROJECT_STATE.md`, `README.md`, `docker-compose.yml`,
+`.env.example`, `AI_ENGINEERING_RULES.md`, `LICENSE`, `docs/`
+(companions to this file; eight other planned `docs/*.md` files still
+pending — §13), `frontend/` (Phase 3, not started).
 
-## 5. Domain model summary
+`backend/`: `pyproject.toml`, `Dockerfile`, `.dockerignore`,
+`alembic.ini`, `alembic/env.py`,
+`alembic/versions/6bdbf0ab25b0_initial_schema.py` (19 tables + RLS).
+
+`backend/app/` (`main.py`, `config.py` at top level), mirroring the
+bounded contexts in §2 under each layer:
+- `domain/{shared,findings,scanning,assets,identity,reporting}/` —
+  entities/value objects done for all six.
+- `application/interfaces/` (all repository ports + `ScannerPort`,
+  `StoragePort`, `AIProviderPort`, `RefreshTokenRepositoryPort`;
+  `EventBusPort` pending), `application/scanning/` (done),
+  `application/identity/` (done; invite/membership pending),
+  `application/{assets,findings,reporting}/` (empty scaffolds).
+- `api/dependencies.py`,
+  `api/v1/{schemas,scans,auth,auth_schemas,organizations,organization_schemas}.py`,
+  `api/internal/health.py` (metrics/admin pending).
+- `infrastructure/db/{base,session,models/,repositories/}` (19 tables,
+  5 aggregate + refresh_token repos), `infrastructure/storage/`
+  (`MinioStoragePort`), `infrastructure/security/` (`target_validation`,
+  `password_hashing`, `token_service`), `infrastructure/ai_providers/`
+  (`anthropic_provider`; OpenAI/Ollama/OpenRouter pending),
+  `infrastructure/{vector_store,event_bus,observability}/` (empty).
+- `scanner_engine/adapters/nuclei/` (done); `nmap`/`burp`/`zap`/
+  `reconx`/`bughunter`/`sqlmap` (empty Phase-4 stubs).
+- `ai_agents/analysis_service.py` (no `BaseAgent` yet);
+  `workers/{celery_app,tasks}.py`.
+
+`backend/tests/`: `conftest.py`; `unit/` (28 files); `integration/`
+(`support.py` + 13 files, against real Postgres).
+
+## 6. Domain model summary
 
 | Entity | Lives in | Key invariant / behavior |
 |---|---|---|
-| Organization / Membership | identity/ | >= 1 Owner always; cannot remove the last one (rule not yet enforced -- see below) |
-| Finding | findings/ | state machine `new -> triaged -> {confirmed, false_positive} -> {fixed, accepted_risk, wont_fix}`; `effective_severity` prefers CVSS over an AI estimate -- **implemented, tested** |
-| Severity (value object) | findings/ | ordered: info < low < medium < high < critical -- **implemented, tested** |
-| CVSS (value object) | findings/ | validates 0.0-10.0 + vector format; derives band from score -- **implemented, tested** |
-| Asset | assets/ | current-state cache; identity = `(org_id, asset_type, normalized value)` -- **implemented, tested** |
-| AssetObservation | assets/ | append-only; recording one updates the Asset cache -- **implemented, tested** |
-| Scan | scanning/ | state machine `queued -> running -> {completed, failed, cancelled}`, derived from its workflow steps -- **implemented, tested** (derivation logic itself is Milestone 4; this row previously said "Milestone 3" -- a stale reference caught and corrected during Milestone 4, since Milestone 3's actual delivered scope, per section 6/7 below, never touched Scan status derivation) |
-| WorkflowStep | scanning/ | `pending -> running -> {completed, failed, skipped}`, independently retryable -- **implemented, tested** |
+| Organization / Membership | identity/ | ≥ 1 Owner always (not yet enforced by a use case) |
+| RefreshToken | identity/ | opaque hash + `revoked_at`; not soft-deleted |
+| Finding | findings/ | state machine `new → triaged → {confirmed, false_positive} → {fixed, accepted_risk, wont_fix}`; `effective_severity` prefers CVSS over AI estimate |
+| Severity (VO) | findings/ | ordered info < low < medium < high < critical |
+| CVSS (VO) | findings/ | validates 0.0–10.0 + vector format; derives band |
+| Asset | assets/ | current-state cache; identity = `(org_id, asset_type, normalized value)` |
+| AssetObservation | assets/ | append-only; recording one updates the Asset cache |
+| Scan | scanning/ | state machine `queued → running → {completed, failed, cancelled}`, derived from workflow steps via `derive_scan_status()` |
+| WorkflowStep | scanning/ | `pending → running → {completed, failed, skipped}`, independently retryable |
 
-As of this update, all entities listed above are implemented as plain
-data-carrying dataclasses (Milestone 2) -- see
-`app/domain/*/entities.py`. "Implemented, tested" here means the entity
-shape and any already-decided computed properties (e.g.
-`Finding.effective_severity`); it does **not** mean the state-machine
-transition rules or the aggregate-level `>= 1 Owner` invariant are
-enforced yet -- those require application-layer use cases (repository
-ports and their SQLAlchemy implementations exist as of Milestone 2;
-the use cases that call them do not, and are future-milestone work, per
-the scope note in each `entities.py`).
+All entities are plain dataclasses (`app/domain/*/entities.py`) — shape
+and computed properties are implemented/tested; most state-machine
+transition *enforcement* still requires future use cases.
 
-## 6. Current implementation status
+## 7. Completed milestones
 
-Milestone 1 (Foundation) is complete: all 16 expected files exist,
-content audited (imports traced, naming/domain-purity/documentation
-checked), and dynamically executed -- pytest, Ruff (lint + format), and
-MyPy strict all run and passing against these exact file contents.
+| # | Milestone | Delivered |
+|---|---|---|
+| 1 | Foundation | config system, ULID ids, fingerprint hashing, DomainEvent base, Severity/CVSS value objects |
+| 2 | Persistence layer | ORM models (19 tables), domain entities (5 contexts), repository ports + SQLAlchemy impls, Alembic migration + RLS |
+| 3 | Scanner engine | `ScannerPort`, `StoragePort`, `run_scanner_subprocess`, `validate_target`, `MinioStoragePort`, `NucleiAdapter` |
+| 4 | Pipeline orchestrator | `derive_scan_status`, `TriggerScanUseCase`, `normalize_scan_output`, `RunScanWorkflowUseCase` |
+| 5 | API layer | `api/dependencies.py`, `v1/scans.py` (Scanning only, no auth yet), `internal/health.py`, `main.py` |
+| 6 | AI analysis service | `AIProviderPort`, `AnthropicProvider`, `AnalysisService`; `AI_ANALYZE` wired for real |
+| 7 | Docker Compose | `workers/celery_app.py`/`tasks.py`, async `run_scan` dispatch (202), full compose topology |
+| — | Auth / Identity & Access (TD #9, pre-Phase-3, not "Milestone 8") | `RefreshToken` entity/port/repo, password hashing, JWT/refresh tokens + rotation, `register`/`login`/`refresh` routes, `get_current_user`/`require_organization_member` wired into all Scanning routes |
+| — | Phase 3 backend preparation (not a milestone) | `get_cors_allowed_origins()` (app/config.py) + `create_app(cors_allowed_origins=...)` CORS wiring; `CreateOrganizationUseCase` + `POST /api/v1/organizations` (org-bootstrap: creates an Organization and an OWNER/ACTIVE membership for the caller in one call). Third blocker (Secure cookies over local HTTP) explicitly **not** resolved — see §1/§16. |
 
-Milestone 2 (persistence layer) is complete as of this session: SQLAlchemy
-async ORM models for all 19 tables across all six bounded contexts, plain
-domain entities for all five bounded contexts, repository ports
-(`*RepositoryPort` ABCs) and their SQLAlchemy-backed implementations for
-all five aggregates, and a hand-written initial Alembic migration
-including Row-Level Security policies. 102 tests (55 unit carried over
-from Milestone 1 unchanged, 9 new unit tests for domain entities, 38
-integration tests against a real PostgreSQL 16 instance), 100% coverage,
-clean Ruff (lint + format), clean MyPy strict. The migration was applied
-to a real Postgres instance, exercised by the full integration suite,
-downgraded to nothing, and re-upgraded cleanly (`alembic downgrade base`
-then `alembic upgrade head`), proving reversibility rather than assuming
-it. RLS tenant isolation was proven both by raw SQL (two sessions scoped
-to different orgs, each seeing only its own row) and by the automated
-`test_rls_isolates_*_between_tenants` tests. Two genuine implementation
-gaps were discovered and fixed during this milestone -- see section 3's
-dated entries ("RLS + soft-delete redesign" and the `DateTime(timezone=
-True)` note) for the full account of each, since both count as design
-gaps under section 12's workflow rule, not ordinary bugs.
-
-As with Milestone 1's verification, this execution ran in Claude's own
-sandboxed environment (with a local PostgreSQL 16 instance installed for
-the purpose), not on `C:\Users\gamer\Downloads\claudeOnly` directly --
-this Filesystem MCP still has no command-execution tool (see section 13).
-Every file was then written to this repository via the Filesystem MCP
-file-by-file, matching the sandbox-verified content exactly (spot-checked
-by byte count on at least one large file, the initial migration). Local
-re-verification on the actual machine remains a one-time manual step if
-bit-for-bit confirmation there matters -- see the self-verification
-command in `docs/implementation_progress.md`.
-
-Milestone 3 (Scanner engine -- Nuclei adapter -- + StoragePort + target
-validation) is complete. Process note, recorded per section 12's
-verification-honesty rule: the implementation -- `ScannerPort`
-(`ActiveScanner`/`ImportScanner` split), `StoragePort`,
-`run_scanner_subprocess` (argument-list-only, enforced timeout, non-root
-guard), `validate_target` (DNS-rebinding-aware SSRF/private/loopback/
-link-local/cloud-metadata guard), `MinioStoragePort` (official
-synchronous `minio` SDK wrapped in `asyncio.to_thread`), and
-`NucleiAdapter` -- was already present on disk, complete and correct, at
-the start of the session that closed this milestone out, despite this
-file and `docs/implementation_progress.md` both stating Milestone 3 as
-"not started" going into that session. That session's actual work was:
-discovering the discrepancy by inspecting the repository before writing
-anything (per this file's own instruction that the repository is ground
-truth over documents that may lag), auditing the existing code against
-every relevant locked decision in section 3, dynamically verifying it in
-a sandbox for the first time (105 unit tests total, 100% coverage on
-every Milestone 3 module, clean Ruff, clean MyPy strict on all 74 source
-files), fixing one stale docstring (`scanner_engine/adapters/__init__.py`
-still read "Not yet implemented"), and this documentation update -- not
-fresh implementation, since none was needed. Full account in
-`docs/session_state.md`. The Postgres integration suite (38 tests) was
-not re-executed in that session, since Milestone 3 touched no
-persistence-layer code; `MinioStoragePort` and `NucleiAdapter` are
-currently verified only against unit-level mocks of their external
-dependency (no real MinIO server or `nuclei` binary was reachable in
-that environment) -- see `docs/implementation_progress.md`'s Technical
-debt list.
-
-Milestone 4 (Processing pipeline orchestrator) is complete. Delivered:
-`derive_scan_status()` and the `PIPELINE_STEP_ORDER` constant, added to
-`app/domain/scanning/entities.py` (domain layer -- pure, zero framework
-imports); `TriggerScanUseCase` (`app/application/scanning/
-trigger_scan.py` -- creates a `Scan` plus its eight `ScanWorkflowStep`
-rows, all `PENDING`, in the locked order); `normalize_scan_output()` and
-`NormalizedFinding` (`app/application/scanning/normalization.py` -- the
-nuclei-JSONL-specific normalize step, see section 3's dated entry for
-why this is a plain function rather than a port); and
-`RunScanWorkflowUseCase` (`app/application/scanning/
-run_scan_workflow.py` -- the orchestrator itself, walking all eight
-steps, wired to the Milestone 3 `ScannerPort`/`NucleiAdapter` and the
-Milestone 2 repository layer exactly as section 15 called for). 44 new
-tests (41 unit across four files, 3 integration against real Postgres),
-100% coverage on every Milestone 4 module, clean Ruff (lint + format),
-clean MyPy strict. Two design decisions worth flagging explicitly
-because they resolve a genuine tension rather than following a locked
-decision verbatim -- both recorded in section 3's dated log rather than
-silently resolved: `AI_ANALYZE` is unconditionally `SKIPPED` (Milestone
-6 builds the `AnalysisService` this step actually needs), and a
-scanner's raw self-reported severity is never written into
-`Finding.ai_severity_level` (a field name that specifically means an AI
-provider's own estimate). One stale cross-reference was also found and
-corrected: section 5's `Scan` row said its status-derivation logic was
-"Milestone 3" -- it was never part of that milestone's actual delivered
-scope (see the paragraph above), and is corrected to "Milestone 4" in
-section 5 now that the function exists.
-
-As with every previous milestone, execution ran in Claude's own sandbox,
-not on `C:\Users\gamer\Downloads\claudeOnly` directly (section 13). The
-sandbox reconstruction for this milestone was more extensive than usual
--- essentially the full backend, since `RunScanWorkflowUseCase` legitimately
-depends on the domain entities, config, all six ORM model modules, and
-all five repository implementations from Milestones 1-2 plus the
-ScannerPort/StoragePort/target_validation/NucleiAdapter surface from
-Milestone 3 -- reconstructed from this repository's own verbatim file
-contents read through the Filesystem MCP, not from memory. Stated
-plainly per the verification-honesty rule: this session did not re-run
-the original Milestone 1-3 test files verbatim (they were not copied
-into the sandbox; only their source modules were, for import purposes),
-so this is not a renewed byte-for-byte re-verification of those
-milestones' own test suites, which were already verified in their own
-sessions. What it does newly confirm is that the real, unmodified
-Milestone 2 repository implementations (`SqlAlchemyScanRepository`,
-`SqlAlchemyAssetRepository`, `SqlAlchemyFindingRepository`,
-`SqlAlchemyOrganizationRepository`) still work correctly end-to-end
-against a real, RLS-enabled Postgres 16 instance when driven by this
-milestone's new orchestrator -- exercised by the 3 new integration
-tests, not merely assumed unchanged. Every new and modified file was
-then written into this repository via the Filesystem MCP, verified
-byte-count-identical against the sandbox-verified source for every new
-file (not just one, this time) -- see `docs/session_state.md` for the
-exact counts.
-
-Milestone 5 (API layer -- public + internal split) is complete.
-Delivered: `app/api/dependencies.py` (the composition root's per-request
-DI providers -- `AppState`, `get_org_session`, and the repository/use-
-case providers built on top of it), `app/api/v1/schemas.py` and
-`scans.py` (the public Scanning API -- create/run/get, mapping 1:1 onto
-Milestone 4's two use cases plus a direct repository read, exactly as
-section 15's queue specified), `app/api/internal/health.py`
-(liveness/readiness), and `app/main.py` (the `create_app()` factory,
-lifespan wiring, and two global exception handlers). 28 new/updated
-tests across 5 files, clean Ruff (lint + format), clean MyPy strict on
-every Milestone 5 module. Four design/scope decisions worth flagging
-explicitly, each recorded in section 3's dated log: the public API
-covers only the Scanning bounded context (Findings/Assets/Reporting have
-no use cases yet to call); no authentication exists on any route
-(`organization_id` in the URL path is trusted as given -- a real,
-currently-unenforced gap, tracked as Technical debt item #9); the
-pipeline runs synchronously inside the HTTP request handler (no task
-queue exists before Milestone 7, Technical debt item #10); and
-`minio_bucket` was added to `Settings` (necessary for this milestone's
-composition root to actually construct `MinioStoragePort`).
-
-As with every previous milestone, execution ran in Claude's own sandbox,
-not on `C:\Users\gamer\Downloads\claudeOnly` directly (section 13). A
-mid-session Filesystem MCP outage meant the real Alembic migration could
-not be re-fetched verbatim in time for the sandbox reconstruction;
-rather than reconstruct SQL from memory, the sandbox schema was created
-via `SQLAlchemy Base.metadata.create_all()` instead of
-`alembic upgrade head` this session only, meaning RLS policies were not
-present in this session's own sandbox database. Judged not to undermine
-what Milestone 5 needed to verify (RLS tenant isolation itself is
-unchanged and was already proven by Milestone 2's real-Postgres suite;
-this milestone reuses `session_scoped_to_org` exactly as built, without
-introducing new RLS-relevant behavior) -- stated plainly rather than
-glossed over, per the verification-honesty rule. Full account, including
-a separate `coverage`/SQLAlchemy-async-greenlet measurement-gap
-investigation, in `docs/session_state.md` and
+Full per-milestone delivery detail, file lists, verification narrative:
 `docs/implementation_progress.md`.
 
-Milestone 6 (AI analysis service) is complete. Delivered:
-`AIProviderPort`/`AICompletionResult`/`AIProviderError`
-(`app/application/interfaces/ai_provider_port.py` -- a minimal,
-provider-agnostic "send a prompt, get text back" port, mirroring
-`ScannerPort`'s division of responsibility); `AnthropicProvider`
-(`app/infrastructure/ai_providers/anthropic_provider.py` -- the first
-concrete implementation, wrapping the official `anthropic` SDK's async
-client, whose actual installed API -- message content block types,
-exception hierarchy -- was confirmed empirically in the verification
-sandbox rather than assumed from memory); and `AnalysisService`
-(`app/ai_agents/analysis_service.py` -- the one concrete AI agent
-section 3 already named as planned, still with no formal `BaseAgent`
-interface). `RunScanWorkflowUseCase`'s `AI_ANALYZE` step
-(`app/application/scanning/run_scan_workflow.py`) now calls
-`AnalysisService` for real instead of unconditionally marking itself
-`SKIPPED` -- see section 3's two Milestone 6 dated entries for the
-ordering-tension resolution and the recomputation-cost trade-off this
-required working through. 84 new/updated tests (65 unit, 19
-integration against real Postgres), 100% coverage on every Milestone 6
-module, clean Ruff (lint + format), clean MyPy strict.
+## 8. API contracts (current, `/api/v1`)
 
-As with every previous milestone, execution ran in Claude's own sandbox,
-not on `C:\Users\gamer\Downloads\claudeOnly` directly (section 13),
-including installing the `anthropic` SDK there to confirm its actual API
-before writing `AnthropicProvider` against it. One verification-honesty
-note, stated plainly rather than glossed over: this session's own
-hand-retyped sandbox copy of the real Alembic migration had a
-transcription error in the `organizations` table's RLS policy (missing
-`missing_ok=true`; too-strict `WITH CHECK`), which broke organization
-creation via the raw, unscoped session every integration test in this
-project uses to provision a test organization -- a pattern documented as
-passing against the real migration in every prior session's own
-real-repository test runs. Corrected the sandbox's own copy to unblock
-this session's verification; the real repository's actual migration
-file was read-only this entire session and was never touched. Full
-account in `docs/session_state.md`.
+**Scanning** (`/organizations/{organization_id}/scans`, all routes
+require `require_organization_member`):
+- `POST /` — create scan (`TriggerScanUseCase`); `scanner_name:
+  Literal["nuclei"]`; also depends on `get_current_user`, passes
+  `current_user.id` as `triggered_by_user_id`.
+- `POST /{scan_id}/run` — dispatches Celery task, returns `202
+  Accepted` with pre-execution state; 404 if missing, 409 on
+  `scanner_name` mismatch; no-op (still 202) if already `RUNNING`.
+- `GET /{scan_id}` — direct repository read (`ScanDetailResponse`).
 
-Milestone 7 (Docker Compose wired end-to-end) is complete. Delivered:
-`app/workers/celery_app.py` (the Celery application instance) and
-`app/workers/tasks.py` (`execute_scan_workflow`, `_run_scan_workflow_
-from_settings`, `run_scan_workflow_task`), so `RunScanWorkflowUseCase.
-execute()` -- itself unmodified except for one new module-docstring
-paragraph -- now runs inside a real `ingestion_worker` Celery task
-instead of synchronously inside the HTTP request handler.
-`app/api/v1/scans.py`'s `run_scan` route now performs the same
-existence/scanner-name checks synchronously and dispatches, returning
-`202 Accepted`, resolving Technical debt item #10. `app/api/
-dependencies.py` and `app/main.py` narrowed accordingly -- the API
-process no longer constructs or holds credentials for `MinioStoragePort`
-or `AnthropicProvider`/`AnalysisService`, per the least-privilege design
-decision this milestone made. `docker-compose.yml` (root, replacing the
-placeholder) wires the full stack: `postgres`, `redis`, `minio`,
-`qdrant`, `backend`, `worker`. 12 new/updated tests, clean Ruff (lint +
-format), clean MyPy strict on every Milestone 7 module. See section 3's
-four new Milestone 7 dated entries for the full design-decision account,
-including the network-segmentation divergence discovered while writing
-the compose file (a `scanner_worker` split, as the placeholder this file
-replaces envisioned, is not achievable for the single, unsplit worker
-this milestone actually builds -- tracked as Technical debt item #12).
+**Auth** (`/auth`, no membership required):
+- `POST /register` — 201, `UserResponse`, no cookies (User only, not org).
+- `POST /login` — 200, `UserResponse`, sets `access_token`/
+  `refresh_token` httpOnly/Secure/SameSite=Lax cookies.
+- `POST /refresh` — 200, `UserResponse`, reads refresh token from its
+  cookie, sets fresh rotated cookies. Tokens never appear in a JSON body.
 
-As with every previous milestone, execution ran in Claude's own sandbox,
-not on `C:\Users\gamer\Downloads\claudeOnly` directly (section 13). A
-mid-session Filesystem MCP outage occurred after all implementation and
-sandbox verification was already complete, while updating a
-documentation detail -- handled per this project's standing guidance
-(stopped retrying immediately, continued sandbox-only work, resumed the
-transplant once the connector recovered; no file was left in a
-partially-written state, since nothing had been transplanted yet when
-the outage began). A genuine, pre-existing defect unrelated to this
-milestone's own scope was also found and fixed: a test helper
-(`test_api_scans.py`'s `_create_organization()`) that did not set the
-RLS org-context GUC before inserting, which a direct empirical check
-against real Postgres 16 confirmed genuinely fails against
-`organizations`' own RLS policy. Fixed in the file already being
-rewritten for this milestone's own reasons, flagged explicitly rather
-than silently folded in. Full account of both, plus a coverage-gap
-investigation that closed a real, novel gap in `app/api/dependencies.py`,
-in `docs/session_state.md` and `docs/implementation_progress.md`.
+**Organizations** (`/organizations`, requires `get_current_user` only —
+no membership check, since none can exist yet):
+- `POST /` — 201, `OrganizationResponse` (`id`/`name`/`slug`);
+  `CreateOrganizationUseCase` creates the `Organization` plus an
+  OWNER/ACTIVE `OrganizationMember` for the caller in one call; 409 on a
+  duplicate `slug`. The only mechanism to obtain an `organization_id` at
+  all post-registration — no list/get/rename/member-management routes
+  exist (deliberately narrow, Phase 3 backend preparation, not a full
+  org-management surface).
 
-The Authentication / Identity & Access work is complete, resolving
-Technical debt item #9 ("No authentication on any `/api/v1` route") --
-not part of Phase 2's own Milestone 1-7 sequence (Phase 2 ends at
-Milestone 7; this is separate, additional pre-Phase-3 backend work,
-tracked on its own rather than folded into that numbered sequence).
-Delivered: `RefreshToken` (`app/domain/identity/entities.py`) and
-`RefreshTokenRepositoryPort`/`SqlAlchemyRefreshTokenRepository`;
-`password_hashing.py`/`token_service.py` (`app/infrastructure/security/`
--- bcrypt password hashing, signed-JWT access tokens, opaque hashed
-refresh tokens); `RegisterUserUseCase`/`LoginUseCase`/
-`RefreshTokenUseCase` (`app/application/identity/` -- registration,
-credential verification and token issuance, and refresh-token rotation);
-three new public routes (`POST /api/v1/auth/{register,login,refresh}`);
-and, resolving Technical debt item #9 itself, `get_current_user`/
-`require_organization_member` (`app/api/dependencies.py`) wired into
-every existing Scanning route (`app/api/v1/scans.py`), turning the
-previously-trusted `organization_id` URL parameter into one a caller
-must present a valid, cookie-delivered JWT for an ACTIVE member of to
-use. 61 new/updated tests, clean Ruff, clean MyPy strict on every
-module this work touches. See section 3's dated entries for the full
-design-decision account, including the correction of an initially-
-incorrect `Authorization: Bearer` implementation back to the locked
-"JWT httpOnly cookies" decision (section 2), and the review confirming
-the `RefreshToken` entity/port/repository/rotation architecture is
-genuinely required by the approved scope, not unjustified scope
-creep.
+**Internal**: `GET /health/live`, `GET /health/ready` (`SELECT 1`).
+`/internal/metrics`, `/internal/admin` not implemented (need
+observability/RBAC). Findings/Assets/Reporting HTTP surface and a
+logout endpoint are not yet built — see §13.
 
-As with every previous milestone, execution ran in Claude's own sandbox,
-not on `C:\Users\gamer\Downloads\claudeOnly` directly (section 13). A
-mid-session Filesystem MCP outage -- the same full-disconnection
-signature ("tool not found" on every call including
-`list_allowed_directories`) prior sessions already document, this time
-spanning two separate conversation turns -- meant the real Alembic
-migration could not be re-fetched verbatim for the sandbox
-reconstruction; the identical `Base.metadata.create_all()` fallback
-Milestone 5's session already used was reused here, meaning this
-session's sandbox database had no RLS policies. The one pre-existing
-(Milestone 2, unmodified this session) RLS-isolation test fails in the
-sandbox specifically because of this, not because of anything this
-work changed -- RLS itself is unaffected by this work's own
-scope (`refresh_tokens`, like `users`, has never had an RLS policy).
-Two further verification-honesty findings, stated plainly rather than
-glossed over: a second, initially-alarming test failure (a missing
-`Location` response header) was investigated via isolated minimal
-reproductions and traced to a stale sandbox copy of `app/api/v1/scans.py`
--- written before the real file's own pre-existing `response_model`/
-`Location`-header structure was discovered during the transplant phase
-and never re-synced -- not a real defect in the actual repository, which
-was read and confirmed correct multiple times during the transplant
-itself; and four test files were initially drafted in the sandbox
-against an invented fixture convention before the real repository's
-actual, already-established conventions (`db_session`/`engine` fixtures,
-`wired_app`/`_make_client` helpers, `make_organization`/`make_user`/
-`set_org_context` factories) could be read, due to the same outage --
-corrected by rewriting all four plus the one new integration test file
-against the real conventions once the connector recovered, rather than
-transplanting the sandbox's own invented version.
+## 9. Authentication state
 
-A targeted follow-up review corrected two further issues, both applied
-before this work was considered complete rather than left standing:
-(1) the naming above ("Milestone 8") was itself wrong -- Phase 2 ends
-at Milestone 7, and this work is separate pre-Phase-3 scope, not an
-eighth Phase-2 milestone; every reference to it throughout this file,
-`docs/implementation_progress.md`, `docs/session_state.md`, and stray
-code docstrings that had used the same incorrect label was corrected.
-(2) the `Authorization: Bearer` implementation described above and
-originally recorded in section 2 was an unapproved divergence from the
-locked "JWT httpOnly cookies" decision -- corrected to httpOnly cookies
-as originally specified (see section 3's dated entry for the full
-account), and the test suite (`test_api_auth.py`, `test_api_scans.py`,
-`test_api_dependencies.py`) rewritten accordingly and re-verified: 91 of
-92 relevant tests pass in a freshly-rebuilt sandbox (the one failure is
-the same pre-existing RLS-sandbox-limitation test described above,
-unrelated to this correction), Ruff and MyPy strict both clean. This
-re-verification ran in Claude's sandbox, as every verification in this
-project has (section 13's no-execution-tool constraint is unchanged) --
-stated plainly rather than implied to be more than it is.
+Fully wired on all Scanning routes. `get_current_user` reads the
+httpOnly `access_token` cookie (401 on any failure).
+`require_organization_member` additionally confirms ACTIVE membership
+(403) — reuses the request's already-open `get_org_session` transaction
+(a separate data-integrity 404, not itself an authorization control).
+RBAC/OAuth/MFA/password-reset/email-verification/logout/CSRF
+double-submit — not built; see §13.
 
-## 7. Completed work
+## 10. Configuration & dependencies
 
-Milestone 1: config system (role-based, fail-fast), ULID id generation,
-fingerprint hashing, DomainEvent base, domain enums (staged),
-Severity/CVSS value objects with full test coverage, full repository
-directory scaffold (37 directories, 34 `__init__.py` placeholders),
-three permanent-memory documents, and a full static audit of the above
-(imports, naming, architecture-layer purity, documentation) with zero
-issues found.
+Key runtime deps (`backend/pyproject.toml`): `pydantic`/
+`pydantic-settings`, `python-ulid`, `sqlalchemy[asyncio]`, `asyncpg`,
+`alembic`, `minio`, `fastapi`, `uvicorn[standard]`, `anthropic`,
+`celery`, `pyjwt`, `bcrypt`, `email-validator`. Dev: `pytest`,
+`pytest-cov`, `pytest-asyncio`, `ruff`, `mypy`, `httpx`, `celery-types`.
+No dependency added until code actually imports it.
 
-Milestone 2: SQLAlchemy async ORM models for all 19 tables (identity.py,
-assets.py, scanning.py, findings.py, reporting.py, platform.py), plain
-domain entities for all five bounded contexts (identity, assets,
-scanning, findings, reporting), repository ports and SQLAlchemy-backed
-implementations for all five aggregates, Alembic migration infrastructure
-(alembic.ini, async env.py, initial migration with hand-written RLS
-policies), and a corrected `tests/conftest.py` (see
-`docs/implementation_progress.md` for why the previous version was
-replaced). 102 tests total (64 unit, 38 integration), 100% coverage,
-clean Ruff, clean MyPy strict -- verified in the sandbox (with a local
-PostgreSQL 16 instance) and transplanted file-by-file into this
-repository via the Filesystem MCP; not re-executed in this location
-since, per the same caveat that has applied since Milestone 1's
-completion (no execution tool available through this connector).
+Required env vars (see `.env.example` for full annotation):
+`DATABASE_URL`, `TEST_DATABASE_URL`, `REDIS_URL`, `MINIO_ENDPOINT`,
+`MINIO_ROOT_USER`, `MINIO_ROOT_PASSWORD`, `MINIO_BUCKET`, `JWT_SECRET`,
+`AI_DEFAULT_PROVIDER` (default `anthropic`), `AI_MODEL` (default
+`claude-sonnet-4-5`), `ANTHROPIC_API_KEY` (required for
+`worker_role=ingestion_worker` when provider is anthropic — not `api`).
+Optional: `ACCESS_TOKEN_EXPIRE_MINUTES` (15), `REFRESH_TOKEN_EXPIRE_DAYS`
+(30), `CORS_ALLOWED_ORIGINS` (comma-separated, unset/empty = CORS
+disabled entirely; read by `app/config.py`'s `get_cors_allowed_origins()`
+directly, deliberately **not** through `Settings` — see that function's
+own docstring). Role-based fail-fast validation lives in `app/config.py`.
 
-Milestone 3: `ScannerPort` (`ActiveScanner`/`ImportScanner` split),
-`StoragePort`, `run_scanner_subprocess` (argument-list-only subprocess
-execution, enforced timeout, non-root guard), `validate_target`
-(DNS-rebinding-aware SSRF/private/loopback/link-local/cloud-metadata
-guard), `MinioStoragePort`, and `NucleiAdapter`. 105 unit tests total
-(41 new this milestone), 100% coverage on every Milestone 3 module,
-clean Ruff, clean MyPy strict. See section 6 for the process note on how
-this milestone was closed out -- the implementation was found already
-complete on disk and was audited and dynamically verified rather than
-written from scratch.
+## 11. Testing state
 
-Milestone 4: `derive_scan_status()`/`PIPELINE_STEP_ORDER`
-(`app/domain/scanning/entities.py`), `TriggerScanUseCase`
-(`trigger_scan.py`), `normalize_scan_output()`/`NormalizedFinding`
-(`normalization.py`), and `RunScanWorkflowUseCase`
-(`run_scan_workflow.py`) -- the last three all new files in
-`app/application/scanning/`. 44 new tests (41 unit, 3 integration
-against real Postgres), 100% coverage on every Milestone 4 module, clean
-Ruff, clean MyPy strict. See section 6 for the full account, including
-the two flagged design decisions (`AI_ANALYZE` unconditionally
-`SKIPPED`; scanner-native severity never written to
-`Finding.ai_severity_level`) and the stale Milestone-3 cross-reference
-this session corrected in section 5.
+29 unit test files, 14 integration test files (+ `support.py` fixture
+factory) under `backend/tests/`, against real PostgreSQL 16 for
+integration tests. Most recent full verification (auth work,
+post-correction): **91 of 92 relevant tests passing** — the one failure
+is a pre-existing, unrelated RLS-sandbox-limitation artifact (sandbox
+schema built via `Base.metadata.create_all()` instead of
+`alembic upgrade head` due to a mid-session tool outage; not a code
+defect). Ruff (lint + format) and MyPy strict both clean on every
+module touched.
 
-Milestone 5: `app/api/dependencies.py` (composition-root DI providers),
-`app/api/v1/schemas.py`/`scans.py` (the public Scanning API),
-`app/api/internal/health.py` (liveness/readiness), and `app/main.py`
-(FastAPI app factory + lifespan). 28 new/updated tests across 5 files,
-clean Ruff, clean MyPy strict on every Milestone 5 module. See section 6
-for the full account, including the four flagged design/scope decisions
-(Scanning-only API surface; no authentication yet; synchronous pipeline
-execution; `minio_bucket` added to `Settings`) and this session's two
-verification-honesty notes (a mid-session Filesystem MCP outage that
-changed how the sandbox schema was created; a `coverage`/SQLAlchemy-
-async-greenlet measurement-gap investigation).
+**Phase 3 backend preparation — full real verification (follow-up
+session, superseding this section's earlier, more limited claim for
+this same work).** The full `app/` package (all six bounded contexts,
+infrastructure, workers, scanner_engine) and a real PostgreSQL 16
+instance were reconstructed in Claude's sandbox, the Alembic migration
+was applied, and the relevant existing test files
+(`test_api_scans.py`, `test_api_auth.py`, `test_identity_repository.py`,
+`test_api_dependencies.py`, `test_main_lifespan.py`, `test_health.py`,
+`test_register_user.py`) plus every new one
+(`test_create_organization.py`, `test_cors.py`, `test_config.py`'s new
+cases, `test_api_organizations.py`) were run together for real:
+**101 of 101 passed**, against a genuinely non-superuser Postgres role
+(RLS actually enforced — see the correction below on why that
+distinction mattered). Ruff and MyPy strict both clean on every
+new/modified file (`create_organization.py`, `errors.py`, `config.py`,
+`dependencies.py`, `main.py`, `organizations.py`,
+`organization_schemas.py`, plus the four test files), except the one
+pre-existing, untouched `E501` finding noted below.
 
-Milestone 6: `AIProviderPort`/`AICompletionResult`/`AIProviderError`
-(`ai_provider_port.py`), `AnthropicProvider` (`anthropic_provider.py`),
-and `AnalysisService`/`FindingAnalysisInput`/`FindingAnalysisResult`/
-`AnalysisError`/`PROMPT_VERSION` (`analysis_service.py`) -- three new
-files across `app/application/interfaces/`, `app/infrastructure/
-ai_providers/`, and `app/ai_agents/` respectively -- plus
-`run_scan_workflow.py`'s `AI_ANALYZE` step wired to call
-`AnalysisService` for real. 84 new/updated tests (65 unit, 19
-integration against real Postgres), 100% coverage on every Milestone 6
-module, clean Ruff, clean MyPy strict. See section 6 for the full
-account, including the two flagged design decisions (the
-`AI_ANALYZE`-before-`PERSIST` ordering resolution; the
-safe-to-recompute-not-exempted recomputation-cost trade-off, Technical
-debt item #11) and this session's verification-honesty note (a sandbox-
-only Alembic-migration transcription error, corrected in the sandbox
-and never propagated to the real repository).
+**A real bug was found and fixed by this verification, not just
+confirmed clean** — worth recording precisely, the same way the initial
+migration's own DESIGN NOTE records a discovered RLS limitation:
+`CreateOrganizationUseCase`'s first version pre-checked `get_by_slug`
+before inserting, expecting to catch a duplicate slug before it reached
+the database (mirroring `RegisterUserUseCase`'s duplicate-email check).
+That pre-check cannot work: `organizations`' RLS policy is
+self-referential (`id = current_setting('app.current_org_id')::uuid`),
+and `CreateOrganizationUseCase`'s session is scoped to the *new*,
+not-yet-existing organization's own id — so a query against
+`organizations` from inside it can only ever see a row whose id equals
+the new org's id, never any *other* organization's row, regardless of
+what slugs already exist. The pre-check silently returned "not found"
+for every real duplicate, letting the INSERT fail with a raw, unhandled
+`IntegrityError` (an opaque 500) instead of a clean 409 — invisible
+under a superuser role (which bypasses RLS entirely) and only surfaced
+once verification used a properly-privileged, non-superuser role. Fixed
+by relying on the database's own `UNIQUE(slug)` constraint instead:
+`add()` is now wrapped, and a duplicate-key violation is translated into
+`OrganizationSlugAlreadyTakenError` — the same fix TD #8 below already
+prescribes for an analogous RLS/uniqueness interaction, applied here for
+real. A second, smaller test-only bug (a direct `organization_members`
+read in `test_api_organizations.py` missing its own `set_org_context`
+call) was found and fixed the same way.
 
-Milestone 7: `app/workers/celery_app.py` (the Celery application
-instance) and `app/workers/tasks.py` (`execute_scan_workflow`,
-`_run_scan_workflow_from_settings`, `run_scan_workflow_task`) so
-`RunScanWorkflowUseCase.execute()` -- itself unmodified except for one
-new module-docstring paragraph -- now runs inside a real
-`ingestion_worker` Celery task instead of synchronously inside the HTTP
-request handler. `app/api/v1/scans.py`'s `run_scan` route rewritten to
-dispatch the task and return `202 Accepted`, resolving Technical debt
-item #10. `app/api/dependencies.py` and `app/main.py` narrowed (API
-process no longer constructs or holds credentials for `MinioStoragePort`
-or `AnthropicProvider`/`AnalysisService`). `backend/Dockerfile` (new,
-multi-stage, non-root, shared by both Compose services) and
-`backend/.dockerignore` (new). `docker-compose.yml` (root, replacing
-the placeholder) wires the full stack: `postgres`, `redis`, `minio`,
-`qdrant`, `backend`, `worker`. 12 new/updated tests (3 new unit files,
-1 new integration file, 3 existing files rewritten/simplified), clean
-Ruff, clean MyPy strict on every Milestone 7 module. See section 6 for
-the full account, including the four new section 3 dated entries
-(async-dispatch/202 contract; API least-privilege credential narrowing;
-no network-isolated scanner-worker split built; network-segmentation
-divergence from the placeholder) and the two verification-honesty notes
-(a mid-session Filesystem MCP outage after all implementation was
-already complete; a pre-existing test-helper correctness defect found
-and fixed while rewriting `test_api_scans.py`). The
-network-isolated `scanner_worker` split named in the roadmap was not
-built -- tracked as Technical debt item #12.
+Incidental finding, not fixed (out of this session's scope —
+pre-existing, unmodified code): `app/api/dependencies.py`'s
+`require_organization_member` has one line (`user {current_user.id} is
+not an active member...`) that Ruff's `E501` measures at 103 characters
+against this project's 100-character limit. Not introduced or touched by
+this session; flagged for a future session rather than silently fixed as
+a drive-by change.
 
-Authentication / Identity & Access work (Technical Debt #9, not part of
-Phase 2's own Milestone 1-7 sequence): `RefreshToken` entity
-(`app/domain/identity/entities.py`),
-`RefreshTokenRepositoryPort`/`SqlAlchemyRefreshTokenRepository`,
-`password_hashing.py`/`token_service.py`
-(`app/infrastructure/security/`), `RegisterUserUseCase`/`LoginUseCase`/
-`RefreshTokenUseCase`/`TokenPair`/`issue_token_pair`/the
-`AuthenticationError` hierarchy (`app/application/identity/`), and
-`app/api/v1/auth.py`/`auth_schemas.py` (three new routes:
-`/auth/register`, `/auth/login`, `/auth/refresh`, delivering tokens via
-httpOnly `Set-Cookie`, never a JSON body) -- all new files.
-`app/api/dependencies.py` extended with `AuthConfig`/`get_auth_config`,
-`get_identity_session`, the register/login/refresh use-case providers,
-and -- resolving Technical debt item #9 -- `get_current_user` (reads the
-httpOnly access-token cookie)/`require_organization_member`, now
-depended on by every route in `app/api/v1/scans.py`. `app/main.py`
-extended to build `AuthConfig` at startup and mount the new router plus
-two new exception handlers. 61 new/updated tests (36 pure-unit/
-fake-repository, 15 integration against real Postgres, 6 unit for the
-extended `app/api/dependencies.py`), clean Ruff, clean MyPy strict on
-every module this work touches. See section 6 for the full account,
-including the dated entries in section 3 and a targeted follow-up review
-that corrected the naming (this is not "Milestone 8") and an initially-
-incorrect `Authorization: Bearer` implementation back to the locked
-"JWT httpOnly cookies" decision. Technical debt item #9 is now resolved.
+**Standing constraint:** the Filesystem MCP connector has no
+command-execution tool. All verification runs in Claude's own sandbox
+against file content read verbatim from this repository, then
+transplanted — never executed on `C:\Users\gamer\Downloads\claudeOnly`
+directly. Each session normally reconstructs and re-runs only the test
+files it touches/depends on, not the full suite; this session's own
+verification was broader than that norm (see above) because the initial
+blind spot (superuser bypassing RLS) was only found by widening scope.
+Per-milestone verification scope and exact historical pass counts:
+`docs/implementation_progress.md`. Self-verify locally, or use an
+environment with execution access (e.g. Claude Code), for a true
+full-suite run against the other ~75 test files not reconstructed this
+session.
 
-## 8. Remaining work
+## 12. Active technical debt
 
-Everything else -- see the milestone roadmap below and "Files pending" in
-`docs/implementation_progress.md` for the exhaustive list.
+1. `domain/shared/enums.py` — staging area for enums belonging to
+   `scanning/`/`assets/`/`identity/`/`reporting/`; move each into its
+   owning module's own `enums.py` as that context's behavior is built.
+5. Repository `update()`/`soft_delete()` fetch via `session.get()`
+   (unfiltered by `deleted_at`) while `get_by_id`/lookups filter it —
+   deliberate (an update must target a soft-deleted row too), but
+   nothing prevents accidentally "reviving" one. Not yet triggered by
+   any existing use case.
+6. `MinioStoragePort` verified only against a mocked `Minio` client — no
+   real MinIO server reachable in the verification environment.
+7. `NucleiAdapter` verified only against a patched
+   `run_scanner_subprocess` — no real `nuclei` binary reachable.
+8. **Concurrent-scan race**: two scans for the same org targeting the
+   same host, run truly concurrently, could both pass a `get_by_identity`
+   "no existing Asset" check before either commits; the second `add()`
+   fails on the unique constraint with an unhandled `IntegrityError`.
+   Sequential retries of the *same* scan are safe; concurrent execution
+   of *different* scans is not. No concurrent execution exists yet.
+   Likely fix: catch the unique-constraint violation and re-fetch.
+9. ~~No authentication on any `/api/v1` route~~ — **resolved** by the
+   Auth / Identity & Access work.
+10. ~~Scan pipeline ran synchronously in the HTTP handler~~ —
+    **resolved** in Milestone 7 (async Celery dispatch, `202 Accepted`).
+11. **`AI_ANALYZE` re-invokes the AI provider on every retry** of a scan
+    whose later steps fail, even for findings already analyzed earlier
+    — accepted cost, not exempted like `EXECUTE_SCANNER` (§4). Would
+    need a new durability mechanism to fix.
+12. **No network-isolated `scanner_worker` split.**
+    `RunScanWorkflowUseCase` runs as one atomic call inside
+    `ingestion_worker` — `EXECUTE_SCANNER` (arbitrary scan targets) and
+    `AI_ANALYZE` (Anthropic API) both run from the same process holding
+    DB credentials. Fix requires restructuring the use case into
+    independently-schedulable phases with a durable hand-off — a
+    genuine architectural change. Code-level scan-target safety
+    (`validate_target`'s SSRF/private-IP checks, argument-list
+    subprocess, timeouts, non-root) is unaffected and fully enforced.
 
-## 9. Milestone roadmap
+## 13. Deferred / excluded work
 
-See `docs/implementation_progress.md`, section "Overall roadmap" -- kept
-there rather than duplicated here since it changes every session and this
-file should not need editing that often.
+- Findings/Assets/Reporting application-layer use cases and HTTP routes.
+- `EventBusPort` and its implementation; `FindingCreated` publication
+  (planned, no port yet).
+- Remaining 14 scanner adapters (Phase 4 — nmap, burp, zap, reconx,
+  bughunter, sqlmap, etc.).
+- OpenAI/Ollama/OpenRouter `AIProviderPort` implementations (deferred
+  until a second real provider shape is known).
+- Network-isolated `scanner_worker` split (TD #12).
+- RBAC, OAuth, MFA, password reset, email verification, logout
+  endpoint, CSRF double-submit token (Phase 3+/Phase 6).
+- Full organization management (list/get/rename organizations, invite/
+  remove members, role changes) — `POST /api/v1/organizations` (Phase 3
+  backend preparation) only ever creates a new org and makes the caller
+  its Owner; it is not that surface.
+- `CORS_ALLOWED_ORIGINS` is not yet added to `docker-compose.yml`'s
+  `backend` service environment — harmless by default (unset = CORS
+  disabled, matching pre-existing behavior), but will need adding
+  alongside real Phase 3 frontend deployment.
+- **httpOnly+Secure cookies over plain local HTTP** (Phase 3 frontend
+  blocker #2) — explicitly not resolved; conflicts with §4's locked
+  `secure=True`-unconditional decision. Requires an explicit human
+  decision (local HTTPS dev setup, or an approved, documented
+  environment-conditional relaxation) before Phase 3 frontend
+  implementation can begin — see §1/§16.
+- Qdrant/RAG integration (Phase 5).
+- The eight `docs/*.md` files named in §5 — described only in chat
+  history, never written; this file is the interim substitute.
+- Phase 3 (frontend) — not started.
 
-## 10. Coding standards
+## 14. Coding standards & rules that must never change
 
-- Python: Ruff (lint + format) + MyPy strict; full type hints on every
-  function; every module gets a docstring explaining *why*, not just
-  *what*.
-- Domain layer has zero framework imports (no SQLAlchemy, no FastAPI, no
-  AI SDK inside `domain/`).
-- Value objects validate on construction (dataclass `__post_init__` /
-  `frozen=True`) -- an invalid instance should never be constructible.
-- Repository pattern for all database access; no business logic inside
-  FastAPI route handlers -- routes call application-layer use cases only.
-- No dependency is added to `pyproject.toml` until code in the repo
-  actually imports it.
-- TypeScript (Phase 3, not yet exercised): ESLint + Prettier, strict mode.
-
-## 11. Testing requirements
-
-- Test pyramid: many unit tests, fewer integration tests, few end-to-end
-  API tests.
-- Unit tests for every new function/class in the same session it is
-  written -- never deferred.
-- AI outputs: schema-validate the response, use golden-set regression
-  checks; never assert exact text match against an LLM's output.
-- Scanner adapters: golden-file tests against real captured sample output.
-- Fake/spy implementations of ports (`EventBusPort`, `AIProviderPort`) for
-  unit tests; real implementations reserved for a smaller integration
-  suite.
-- Every test that touches configuration passes explicit values and
-  disables real env-file loading, so the machine running the tests can
-  never leak into an assertion.
-
-## 12. Development workflow
-
-- Vertical-slice first: one thin end-to-end path before breadth.
-- One milestone per session -- do not start milestone N+1 in the same
-  session that finishes milestone N without explicit approval.
-- Fix lint/type issues the moment they are found, in the same session --
-  do not carry them forward as "fix later."
-- Document technical debt explicitly the moment it is introduced (see
-  `docs/implementation_progress.md`, "Technical debt") -- never let it
-  accumulate silently.
-- When implementation reveals a real design gap, explain it before
-  adopting the fix (see the findings-deduplication redesign above as the
-  standing example of how this should look).
-- Do not mark a milestone "complete" on a lesser standard of verification
-  than is actually available -- state precisely what was and wasn't
-  checked (this rule added after Milestone 1's completion session, where
-  "content-complete and statically verified" was used deliberately
-  instead of an unqualified "complete," since dynamic execution was not
-  possible in this environment).
-
-## 13. Filesystem workflow
-
-Project root: `C:\Users\gamer\Downloads\claudeOnly` (no space; every
-prior reference to "claude only" with a space was a documentation typo
-from an earlier session, caught by comparing against
-`list_allowed_directories`, which is the authoritative source), accessed
-via the Filesystem MCP (not the sandbox -- the sandbox is a disposable
-verification environment used per-session, never the source of truth).
-
-Tools available: `list_allowed_directories`, `list_directory`,
-`list_directory_with_sizes`, `directory_tree`, `get_file_info`,
-`read_file`, `read_text_file`, `read_multiple_files`, `write_file`,
-`create_directory`, `move_file`, `edit_file`, `copy_file_user_to_claude`
-(one-directional: user's machine -> sandbox only, never the reverse).
-
-Known quirks, confirmed empirically, not assumed:
-- `create_directory` does **not** create a full nested path in one call
-  despite its description implying otherwise -- every directory in this
-  project was created one level at a time, shallowest first.
-- There is **no command-execution tool** for this filesystem. Pytest,
-  Ruff, and MyPy cannot be run against these files through this
-  connector. "Testing status" in the progress doc reflects sandbox
-  verification, transplanted, not re-run in place. Self-verify locally,
-  or use an environment with execution access (e.g. Claude Code).
-- No bulk write/create operation exists -- one file or directory per call.
-- Re-confirmed during Milestone 1's completion session: still no
-  execution tool, still no bulk operation. Not re-assumed each time --
-  checked again and found unchanged.
-- Confirmed this session: the lack of a command-execution tool here can
-  be worked around by reading files verbatim through this connector and
-  writing identical copies into Claude's own sandboxed bash environment,
-  then running pytest/Ruff/MyPy there. This confirms the code executes
-  correctly against these exact file contents, but is not the same as
-  confirming it on `C:\Users\gamer\Downloads\claudeOnly` directly --
-  state that distinction plainly whenever this workaround is used, per
-  section 12's verification-honesty rule.
-
-## 14. Rules that must never change during implementation
-
+- Ruff (lint + format) + MyPy strict; full type hints; every module
+  docstring explains *why*, not just *what*. Domain layer: zero
+  framework imports. Value objects validate on construction. Repository
+  pattern for all DB access — no business logic in route handlers,
+  routes call use cases only.
+- One milestone per session; fix lint/type issues immediately, never
+  "later"; document technical debt the moment it's introduced. Unit
+  tests for every new function/class in the same session it's written.
+  Fake/spy port implementations for unit tests; real implementations
+  reserved for a smaller integration suite. Never assert exact-text
+  match against an LLM output.
 - Do not redesign approved architecture without a genuine implementation
-  blocker, and explain any such blocker before adopting a fix.
-- Bounded context boundaries (section 1) and the ports-and-adapters
-  pattern are locked.
-- RLS for tenant isolation, the ActiveScanner/ImportScanner split, the
-  append-only-history pattern (`finding_analyses`, `finding_status_history`,
-  `asset_observations`, `audit_logs`), fingerprint-based deduplication,
-  scanner network segmentation, ULID-as-UUID, and StrEnum-over-free-text
-  are all locked decisions -- revisit only with a genuine blocker, not a
-  preference.
+  blocker; explain any such blocker before adopting a fix. Bounded
+  context boundaries (§2) and every decision in §4 are locked.
 - Production-quality code only; never recreate completed work; extend
-  rather than rewrite unless rewriting is unavoidable; never skip tests;
-  never introduce undocumented technical debt; never modify more than one
-  milestone per session.
-- This file (`PROJECT_STATE.md`) is the source of truth over chat history.
-  If a future session's instructions conflict with what is written here,
-  flag the conflict explicitly rather than silently picking one.
+  rather than rewrite; never skip tests; never modify more than one
+  milestone per session. State precisely what was/wasn't verified —
+  never claim a clean pass that wasn't run.
+- This file is the source of truth over chat history; the repository is
+  ground truth over this file — always re-read real files before
+  editing, and flag any conflict explicitly rather than silently
+  picking one.
 
-## 15. Current Implementation Queue
+## 15. Filesystem workflow notes
 
-Status: The Authentication / Identity & Access work is complete,
-resolving Technical debt item #9 -- separate, additional pre-Phase-3
-backend scope, not part of Phase 2's own Milestone 1-7 sequence (Phase 2
-ends at Milestone 7). `RegisterUserUseCase`/`LoginUseCase`/
-`RefreshTokenUseCase` (`app/application/identity/`) deliver
-registration, password-hashed login, and JWT access/opaque-hashed-
-refresh-token authentication with rotation, exposed at
-`POST /api/v1/auth/{register,login,refresh}`. Tokens are delivered
-exclusively as httpOnly cookies (`Set-Cookie`), matching the locked
-auth-transport decision (section 2) -- never in a JSON response body.
-`get_current_user`/`require_organization_member`
-(`app/api/dependencies.py`) now secure every route in
-`app/api/v1/scans.py` -- a request needs a valid, cookie-delivered
-access token naming an ACTIVE member of the target organization
-(401/403), with every pre-existing 404/409/202 behavior otherwise
-unchanged. 61 new/updated tests, clean Ruff (lint + format), clean MyPy
-strict on every module this work touches. See section 6 for the full
-account, including the dated entries in section 3 and a targeted
-follow-up review that (1) corrected the naming used to track this work
-(not "Milestone 8" -- Phase 2 ends at Milestone 7), (2) corrected an
-initially-incorrect `Authorization: Bearer` implementation back to the
-locked "JWT httpOnly cookies" decision, re-verifying the full test suite
-after the correction (91/92 passing, one pre-existing unrelated sandbox
-limitation), and (3) reviewed and confirmed the `RefreshToken` entity/
-port/repository/rotation architecture as genuinely required by the
-approved scope rather than unjustified scope creep.
+Project root: `C:\Users\gamer\Downloads\claudeOnly` (no space), via the
+Filesystem MCP (not the sandbox — sandbox is disposable per-session
+verification only). `create_directory` does not create nested paths in
+one call (create shallowest-first). No command-execution tool exists
+(see §11). No bulk write/create — one file/directory per call.
 
-Phase 2 (MVP backend) milestone breakdown (Milestones 1-7) remains fully
-complete on its own; the Authentication work above is tracked separately
-as pre-Phase-3 backend scope. Next work requires explicit approval
-before beginning -- likely candidates include RBAC (Phase 6),
-OAuth/MFA/password reset/email verification, a logout endpoint, a CSRF
-double-submit token (once Phase 3's frontend origin is known), the
-network-isolated scanner-worker split (Technical debt item #12),
-Findings/Assets/Reporting HTTP surface, and Phase 3 (MVP frontend). No
-next-milestone scope has been decided.
+## 16. Current next step
+
+Milestones 1–7, the Auth work, and two of three Phase 3 frontend
+blockers (CORS, organization bootstrap) are complete. **The third
+blocker — httpOnly+Secure cookies cannot be set by a browser over plain
+`http://localhost` — is not resolved and requires an explicit human
+decision before Phase 3 frontend implementation can begin:**
+  - Serve local frontend dev over HTTPS (e.g. `mkcert`-issued certs) —
+    no backend code change, `secure=True` stays exactly as locked; or
+  - Explicitly approve relaxing `secure` to be environment-conditional
+    for non-production — a real change to a decision §4 documents as
+    deliberately *not* relaxed for local/test convenience, so this
+    needs sign-off, not a silent code change.
+
+**Await explicit approval before starting further work.** Candidates
+requiring a scope decision: the cookie blocker above, RBAC, OAuth/MFA/
+password reset/email verification, a logout endpoint, a CSRF
+double-submit token, TD #12 (scanner_worker split),
+Findings/Assets/Reporting HTTP surface, full organization management, or
+Phase 3 (frontend) itself.

@@ -17,6 +17,7 @@ substitute for the network isolation.
 
 from __future__ import annotations
 
+import os
 from enum import StrEnum
 from functools import lru_cache
 
@@ -178,3 +179,39 @@ def get_settings() -> Settings:
     """Cached so Settings() -- which reads the environment -- only runs
     once per process, not once per request."""
     return Settings()  # type: ignore[call-arg]
+
+
+def get_cors_allowed_origins() -> list[str]:
+    """Comma-separated ``CORS_ALLOWED_ORIGINS``, read directly from the
+    environment rather than through ``Settings`` above -- deliberately,
+    not an oversight or a lapse in "centralized, typed configuration."
+
+    ``Settings()`` requires ``WORKER_ROLE`` (no default) plus every other
+    field ``check_role_boundaries`` demands for that role (``DATABASE_URL``,
+    ``REDIS_URL``, the MinIO settings, ...) before it will construct at
+    all -- the fail-fast design this module's own docstring describes.
+    ``app/main.py``'s ``create_app()`` is called argument-free,
+    unconditionally, by every existing test in this codebase
+    (``from app.main import create_app`` runs the module body, including
+    the bottom-of-file ``app = create_app()`` line, on import) -- routing
+    CORS origins through ``Settings`` would make importing ``app.main``
+    itself require a complete, production-shaped environment, which is
+    not true today (see ``create_app()``'s own docstring on why it must
+    not require a database connection to succeed) and must not become
+    true as a side effect of adding CORS support.
+
+    Also a genuinely different kind of setting than everything else in
+    this file: CORS matters only to ``worker_role=api`` (the one process
+    that ever serves browser traffic at all) and is not a secret --
+    neither property this module's shared ``check_role_boundaries``
+    validation (built for credentials and per-role required
+    infrastructure) is designed around. A narrow, explicitly-justified
+    exception to "not read from os.getenv() scattered through the code,"
+    not a precedent for reading other settings this way.
+
+    Unset or empty -> ``[]`` (CORS disabled entirely -- the same
+    zero-cross-origin-browser-access behavior this API had before this
+    setting existed), not a wildcard fallback.
+    """
+    raw = os.environ.get("CORS_ALLOWED_ORIGINS", "")
+    return [origin.strip() for origin in raw.split(",") if origin.strip()]

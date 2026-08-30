@@ -10,7 +10,7 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 
-from app.config import Environment, Settings, WorkerRole, get_settings
+from app.config import Environment, Settings, WorkerRole, get_cors_allowed_origins, get_settings
 
 
 def _settings(**overrides: object) -> Settings:
@@ -205,3 +205,43 @@ def test_get_settings_reads_from_real_environment_variables(
     assert settings.worker_role is WorkerRole.API
     assert settings.database_url == "postgresql+asyncpg://u:p@localhost/db"
     get_settings.cache_clear()
+
+
+def test_get_cors_allowed_origins_defaults_to_empty_when_unset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("CORS_ALLOWED_ORIGINS", raising=False)
+    assert get_cors_allowed_origins() == []
+
+
+def test_get_cors_allowed_origins_parses_a_single_origin(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CORS_ALLOWED_ORIGINS", "http://localhost:3000")
+    assert get_cors_allowed_origins() == ["http://localhost:3000"]
+
+
+def test_get_cors_allowed_origins_parses_multiple_comma_separated_origins(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(
+        "CORS_ALLOWED_ORIGINS", "http://localhost:3000, https://app.example.com"
+    )
+    assert get_cors_allowed_origins() == [
+        "http://localhost:3000",
+        "https://app.example.com",
+    ]
+
+
+def test_get_cors_allowed_origins_ignores_a_trailing_comma(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CORS_ALLOWED_ORIGINS", "http://localhost:3000,")
+    assert get_cors_allowed_origins() == ["http://localhost:3000"]
+
+
+def test_get_cors_allowed_origins_treats_whitespace_only_as_unset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CORS_ALLOWED_ORIGINS", "   ")
+    assert get_cors_allowed_origins() == []

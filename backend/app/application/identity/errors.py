@@ -42,3 +42,12 @@ class EmailAlreadyRegisteredError(ValueError):
     """Raised by ``RegisterUserUseCase`` when the requested email already
     has an active ``User`` row. Maps to HTTP 409, not 401 -- see module
     docstring."""
+
+
+class OrganizationSlugAlreadyTakenError(ValueError):
+    """Raised by ``CreateOrganizationUseCase`` (Phase 3 backend
+    preparation, PROJECT_STATE.md) when the requested slug already has an
+    active ``Organization`` row. Maps to HTTP 409, not part of the
+    ``AuthenticationError`` hierarchy -- same reasoning as
+    ``EmailAlreadyRegisteredError`` above: a uniqueness conflict, not a
+    credential failure."""
