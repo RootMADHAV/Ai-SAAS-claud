@@ -17,6 +17,8 @@ venv/
 # Node / frontend (Phase 3)
 node_modules/
 .next/
+frontend/certs/*.pem
+.env.local
 
 # Data volumes, if ever run outside Docker
 *.sqlite3

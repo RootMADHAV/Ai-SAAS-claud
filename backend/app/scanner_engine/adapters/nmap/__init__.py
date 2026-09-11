@@ -1,1 +1,3 @@
-"""Nmap adapter -- Phase 4 stub. Not yet implemented -- see PROJECT_STATE.md."""
+"""Nmap adapter -- Phase 4's ``ActiveScanner`` implementation.
+
+See ``adapter.py`` (``NmapAdapter``)."""

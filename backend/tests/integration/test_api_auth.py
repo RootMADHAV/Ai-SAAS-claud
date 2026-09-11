@@ -8,11 +8,11 @@ own docstring for why, not Starlette's ``TestClient``).
 
 Only ``get_session_factory`` and ``get_auth_config`` are overridden --
 everything built on top of them (``get_identity_session``, the
-repository/use-case providers, ``register``/``login``/``refresh``
-themselves) runs for real, the same "override exactly the providers with
-a real external dependency" principle app/api/dependencies.py's module
-docstring already states and ``test_api_scans.py`` already follows for
-the Scanning routes.
+repository/use-case providers, ``register``/``login``/``refresh``/
+``logout`` themselves) runs for real, the same "override exactly the
+providers with a real external dependency" principle
+app/api/dependencies.py's module docstring already states and
+``test_api_scans.py`` already follows for the Scanning routes.
 
 Tokens are delivered exclusively as httpOnly cookies, not in the JSON
 response body (the project's locked auth-transport decision,
@@ -78,6 +78,19 @@ def _extract_cookie(response: httpx.Response, name: str) -> str:
     value = response.cookies.get(name)
     assert value is not None, f"expected a {name!r} cookie on the response, found none"
     return value
+
+
+async def _register_and_login(client: httpx.AsyncClient, email: str) -> str:
+    """Registers and logs in a fresh user, returning the refresh-token
+    cookie value -- the common setup every logout test below needs."""
+    await client.post(
+        "/api/v1/auth/register",
+        json={"email": email, "password": "correct-password", "full_name": "Test User"},
+    )
+    login_response = await client.post(
+        "/api/v1/auth/login", json={"email": email, "password": "correct-password"}
+    )
+    return _extract_cookie(login_response, REFRESH_TOKEN_COOKIE_NAME)
 
 
 async def test_register_returns_201_and_the_created_user_with_no_cookies(
@@ -268,3 +281,104 @@ async def test_refresh_with_no_cookie_at_all_returns_401(wired_app: FastAPI) -> 
         response = await client.post("/api/v1/auth/refresh")
 
     assert response.status_code == 401
+
+
+# --- logout ---
+
+
+async def test_logout_returns_204_and_clears_both_cookies_with_matching_attributes(
+    wired_app: FastAPI,
+) -> None:
+    async with await _make_client(wired_app) as client:
+        refresh_token = await _register_and_login(client, _unique_email())
+
+        response = await client.post(
+            "/api/v1/auth/logout", cookies={REFRESH_TOKEN_COOKIE_NAME: refresh_token}
+        )
+
+    assert response.status_code == 204
+    assert response.content == b""
+
+    set_cookie_headers = response.headers.get_list("set-cookie")
+    access_cookie_header = next(h for h in set_cookie_headers if h.startswith("access_token="))
+    refresh_cookie_header = next(h for h in set_cookie_headers if h.startswith("refresh_token="))
+    for header in (access_cookie_header, refresh_cookie_header):
+        # Same attributes _set_auth_cookies used originally -- see
+        # _clear_auth_cookies's own docstring on why that match matters.
+        assert "HttpOnly" in header
+        assert "Secure" in header
+        assert "samesite=lax" in header.lower()
+        # Starlette's delete_cookie expires the cookie immediately.
+        assert "max-age=0" in header.lower()
+
+
+async def test_logout_revokes_the_refresh_token_so_a_later_refresh_fails(
+    wired_app: FastAPI,
+) -> None:
+    async with await _make_client(wired_app) as client:
+        refresh_token = await _register_and_login(client, _unique_email())
+
+        logout_response = await client.post(
+            "/api/v1/auth/logout", cookies={REFRESH_TOKEN_COOKIE_NAME: refresh_token}
+        )
+        assert logout_response.status_code == 204
+
+        refresh_after_logout = await client.post(
+            "/api/v1/auth/refresh", cookies={REFRESH_TOKEN_COOKIE_NAME: refresh_token}
+        )
+
+    assert refresh_after_logout.status_code == 401
+
+
+async def test_logout_with_no_refresh_token_cookie_still_returns_204(wired_app: FastAPI) -> None:
+    """Logging out with nothing to log out of is still success, not an
+    error -- see LogoutUseCase's own docstring on why."""
+    async with await _make_client(wired_app) as client:
+        response = await client.post("/api/v1/auth/logout")
+
+    assert response.status_code == 204
+
+
+async def test_logout_with_an_unknown_token_still_returns_204(wired_app: FastAPI) -> None:
+    async with await _make_client(wired_app) as client:
+        response = await client.post(
+            "/api/v1/auth/logout",
+            cookies={REFRESH_TOKEN_COOKIE_NAME: "a-token-that-was-never-issued"},
+        )
+
+    assert response.status_code == 204
+
+
+async def test_logout_is_idempotent_when_called_twice_with_the_same_token(
+    wired_app: FastAPI,
+) -> None:
+    async with await _make_client(wired_app) as client:
+        refresh_token = await _register_and_login(client, _unique_email())
+
+        first = await client.post(
+            "/api/v1/auth/logout", cookies={REFRESH_TOKEN_COOKIE_NAME: refresh_token}
+        )
+        second = await client.post(
+            "/api/v1/auth/logout", cookies={REFRESH_TOKEN_COOKIE_NAME: refresh_token}
+        )
+
+    assert first.status_code == 204
+    assert second.status_code == 204
+
+
+async def test_logout_does_not_require_a_valid_access_token(wired_app: FastAPI) -> None:
+    """The whole point of not depending on get_current_user (see
+    app/api/v1/auth.py's logout docstring): an already-expired access
+    token -- ordinary after 15 minutes -- must not make logout itself
+    fail. Simulated here by simply never sending an access-token cookie
+    at all, since an absent one and an expired one hit get_current_user
+    the same way (both 401 there); logout must depend on neither."""
+    async with await _make_client(wired_app) as client:
+        refresh_token = await _register_and_login(client, _unique_email())
+
+        response = await client.post(
+            "/api/v1/auth/logout",
+            cookies={REFRESH_TOKEN_COOKIE_NAME: refresh_token},
+        )
+
+    assert response.status_code == 204

@@ -15,7 +15,7 @@ dependencies = [
     "fastapi>=0.111",
     "uvicorn[standard]>=0.30",
     "anthropic>=0.120",
-    "celery>=5.4",
+    "celery[redis]>=5.4",
     "pyjwt>=2.8",
     "bcrypt>=4.1",
 ]
