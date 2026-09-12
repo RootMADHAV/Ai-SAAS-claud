@@ -5,124 +5,151 @@ recent session only. Cumulative history: `docs/implementation_progress.md`.
 Permanent architecture/decisions reference: `PROJECT_STATE.md`.
 
 ## Date
-2026-09-10
+2026-09-13
 
 ## Last completed task
-Phase 4 — Nmap scanner adapter. An out-of-sequence session run on
-explicit direct instruction (not the Step 5 frontend-tests decision
-`PROJECT_STATE.md` §16 had flagged as the standing next step) — scoped
-tightly to exactly one adapter, with an explicit stop-after-Nmap
-instruction honored: no `ScannerPort` redesign, no pipeline changes, no
-adapter registry, no new generic abstractions, and no other adapter
-(ZAP/Burp/SQLMap/ReconX/BugHunter) touched.
+Implemented TD #16: the Nmap XML normalizer. A third, directly
+following out-of-sequence explicit-instruction session — the first
+built `NmapAdapter`, the second wired adapter *selection* into the
+scan pipeline/API, this one wires adapter *normalization* in, which is
+what actually lets an nmap-scoped scan reach `Scan.status is COMPLETED`
+end-to-end for the first time. Still ahead of the Phase 3 frontend
+Step 5 decision, which remains untouched.
 
-`app/scanner_engine/adapters/nmap/adapter.py` — `NmapAdapter(ActiveScanner)`,
-built to the exact same shape as `NucleiAdapter`:
-- Routes through the existing `validate_target` and
-  `run_scanner_subprocess` — no new subprocess/security-boundary code.
-- Returns the existing `ScanOutput` shape (`scanner_name="nmap"`,
-  `output_format="nmap-xml"`) — no second pipeline, no new domain type.
-- Scan type pinned to `-sT -Pn` (TCP connect + skip host discovery),
-  never `-sS`/`-sU`/`-O`/`--traceroute` — the "no privileged/raw-packet
-  scanning" requirement made concrete in code, layered on top of (not
-  instead of) `run_scanner_subprocess`'s existing non-root guard.
-- Target is always the single already-validated, already-resolved
-  hostname `validate_target` returns, appended last in argv — never a
-  CIDR range or host list, so no target-expansion surface exists
-  through this adapter regardless of what a caller passes to
-  `execute()`.
-- Handles, explicitly and distinctly: missing binary (`FileNotFoundError`
-  from `asyncio.create_subprocess_exec`, which `run_scanner_subprocess`
-  does not itself catch — caught here and re-raised as
-  `ScannerExecutionError`, not a raw `OSError`); timeout (propagates
-  `ScannerTimeoutError` from `run_scanner_subprocess` uncaught, same as
-  every other failure mode that module already owns); non-zero exit
-  (always a hard failure for nmap — deliberately stricter than
-  `NucleiAdapter`'s tolerant "non-zero + output present = still a
-  success" classification, since nmap has no equivalent benign-warning
-  case; documented in the adapter's own comment, not just here); empty
-  output; and malformed/non-XML output (a shallow `<nmaprun` substring
-  sanity check — real XML parsing stays normalization's job, per
-  `PROJECT_STATE.md` §1's Scanning/Findings boundary, matching how
-  `NucleiAdapter` also stops at raw bytes).
+Explicit scope constraints honored: no `ScannerPort` redesign, no
+`NormalizerPort` or other new pipeline/scanner abstraction (an explicit
+if/elif dispatch branch was added instead, mirroring the
+`_select_active_scanner` precedent from the prior session), no pipeline
+changes, no changes to any other adapter or to `RunScanWorkflowUseCase`
+itself.
+
+**Changes made** (1 source file):
+- `app/application/scanning/normalization.py` — `normalize_scan_output`
+  gained a second dispatch branch for `"nmap-xml"`. New functions:
+  `_parse_nmap_xml` (top-level entry, stdlib `xml.etree.ElementTree`,
+  no new dependency), `_nmap_host_value` (prefers a resolved hostname
+  over the raw IP, mirroring nuclei's own host/ip fallback),
+  `_nmap_port_to_normalized` (one `NormalizedFinding` per open port),
+  `_nmap_service_description` (folds `product`/`version`/`extrainfo`
+  service attributes into a description string when present). Design
+  decisions, each documented in the code itself:
+  - Only `state="open"` ports become findings — closed/filtered/
+    `open|filtered` ports are excluded as noise, not partially parsed.
+  - A host with `<status state!="up">` contributes no findings at all.
+  - Every nmap-derived finding is `raw_severity="info"` with no CVE ids
+    and no CVSS candidate — an honest reflection of what a plain
+    `-sT -Pn` TCP-connect scan with no NSE vulnerability scripts
+    (`NmapAdapter`'s own deliberate scope) actually detects, not a
+    placeholder pending more parsing effort.
+  - `template_id="open-port-{protocol}-{portid}"` — a stable,
+    per-port-type identifier so the same open port recurring across
+    scans maps to the same `Finding` row via `compute_fingerprint`,
+    mirroring the role nuclei's own `template-id` already plays there.
+  - Module docstring updated to explain why a second format still
+    doesn't get a `NormalizerPort`: the module's own prior version had
+    flagged "a second format" as the natural point to build one, but
+    this specific piece of work was explicitly scoped not to introduce
+    new pipeline/scanner abstractions, so the if/elif was kept exactly
+    as extensible as `_select_active_scanner`'s precedent instead. A
+    third real format is the more natural next trigger to revisit that.
+
+**Test changes**: `tests/unit/test_normalization.py` — 10 new nmap-xml
+test cases (single/multiple open ports, closed/filtered-port exclusion,
+down-host exclusion, hostname-vs-address preference, missing-service
+handling, empty input, malformed XML, multi-host). One pre-existing
+test fixed: `test_unsupported_output_format_raises` previously asserted
+`"nmap-xml"` itself was unsupported — no longer true, so it was changed
+to assert `"burp-xml"` instead (a real, still-genuinely-unsupported
+format, matching the project's existing pattern of picking a realistic
+not-yet-wired example over a nonsense string).
+
+`tests/integration/test_scan_worker_task.py` — a direct, in-scope
+consequence of implementing the normalizer, not scope creep: the prior
+session's nmap-selection test used a fake scanner that always emitted
+nuclei-JSON-shaped output regardless of which adapter persona it stood
+in for. With a real nmap-xml normalizer now in place, that fake's XML
+claim would have been exposed as false the moment the test ran (a
+malformed-XML error, not the old "unsupported format" one) — so
+`_FakeActiveScanner.execute()` was updated to emit output shaped like
+whichever `output_format` it is actually configured to report, and the
+nmap-selection test's own assertion was upgraded from "the
+`EXECUTE_SCANNER` step completed" to genuine `Scan.status is COMPLETED`
+— matching its nuclei sibling test, and actually exercising the new
+normalizer in its real pipeline context rather than working around its
+prior absence.
 
 ## Files changed
-New: `backend/app/scanner_engine/adapters/nmap/adapter.py`,
-`backend/tests/unit/test_nmap_adapter.py`.
-Modified (docstring-only, no logic): `backend/app/scanner_engine/adapters/nmap/__init__.py`
-(stub → implementation pointer), `backend/app/scanner_engine/adapters/__init__.py`
-and `backend/app/scanner_engine/__init__.py` (adapter-count/roster
-accuracy — "only one adapter exists" → "two adapters exist"), `PROJECT_STATE.md`
-(§5 folder structure, §7 milestone table, §11 testing state, §12 new TD
-#15, §13 deferred-work count, §16 next-step note).
+Modified: `backend/app/application/scanning/normalization.py`,
+`backend/tests/unit/test_normalization.py`,
+`backend/tests/integration/test_scan_worker_task.py`, `PROJECT_STATE.md`.
+
+Zero changes to: `ScannerPort`, `NmapAdapter`, `NucleiAdapter`,
+`RunScanWorkflowUseCase`, `execute_scan_workflow`, the 8-step pipeline,
+`app/api/v1/schemas.py`, `app/api/dependencies.py`, `app/main.py`,
+`app/api/v1/scans.py`, `app/workers/tasks.py`, or any scanner adapter
+other than the two already wired — confirmed by direct diff review.
 
 ## Verification — exact results
-Same reconstruct-in-sandbox approach as every prior backend session (no
-command-execution tool exists against the real repository — §15):
-`NmapAdapter` plus its four direct dependencies (`ScannerPort`/
-`ScanOutput`, `validate_target`, `run_scanner_subprocess`, `utcnow`)
-were reconstructed verbatim in Claude's sandbox, alongside the
-**unmodified** `NucleiAdapter` and `base_scanner` test files, specifically
-to check for regressions on code this session did not touch.
+Reused the still-intact full-package sandbox reconstruction from the
+prior (wiring) session — `normalization.py` and `test_normalization.py`
+were freshly re-read from the real repository and diffed against the
+sandbox copies before editing, to rule out drift from that earlier
+session's own state.
 
-- **`pytest tests/unit/ -q` → 20 passed, 0 failed.** 9 new
-  `test_nmap_adapter.py` cases (argv construction with/without
-  `extra_args`, missing binary, timeout propagation, non-zero exit,
-  empty output, malformed output, target-validated-before-subprocess-call,
-  name/output_format) + 6 `test_base_scanner.py` + 5
-  `test_nuclei_adapter.py` cases — the latter two confirming zero
-  regression on the shared code `NmapAdapter` builds on.
-- Ruff (lint + format): clean on `adapter.py` and `test_nmap_adapter.py`
-  (one round-trip: 8 `E501` lines in the initial test draft from an
-  un-wrapped `monkeypatch.setattr(...)` call, fixed, then a `ruff
-  format` pass reflowed one `raise` in `adapter.py` — both fixed
-  in-session, not left for later, per standing rule).
-- MyPy `--strict`: clean, 0 issues, on both new files and the full
-  reconstructed `app/` slice (17 source files).
-- **Byte-count integrity check** (`get_file_info` on the real repo vs.
-  sandbox `wc -c`) confirmed an exact-match transplant for both new
-  files: `adapter.py` — 5061 bytes both sides; `test_nmap_adapter.py` —
-  7183 bytes both sides.
-- **Not verified:** a real `nmap` binary (same documented gap as
-  `NucleiAdapter`, TD #7 — now also TD #15). No integration-level test
-  was added — per instruction ("only if it fits the existing
-  architecture"), and nothing in the existing integration suite
-  exercises scanner adapters directly; they're exercised indirectly via
-  `RunScanWorkflowUseCase`, which this session did not touch and did
-  not need to reconstruct.
-- Confirmed by direct diff review: no API-layer file, no pipeline file,
-  no other adapter, and no `ScannerPort` file were changed. The
-  `scans.py` route's `scanner_name: Literal["nuclei"]` is untouched —
-  `NmapAdapter` exists and is tested but is not yet wired into anything
-  reachable over HTTP; that wiring was explicitly out of this session's
-  scope, not an oversight.
+- **`pytest tests/ -q` → 89 passed, 0 failed.** 19
+  `test_normalization.py` cases (9 pre-existing nuclei-path regression
+  cases + 10 new nmap-xml cases); 70 pre-existing cases across every
+  other test file, confirming zero regression on code this session did
+  not touch (the composition-root/wiring files from the prior session
+  were untouched this session).
+- Ruff: `--fix` applied for three auto-fixable findings (unnecessary
+  `.encode("utf-8")` calls where `.encode()` suffices, one line-length
+  violation resolved by the accompanying reformat) in the new test
+  fixture's XML-building helper. Lint + format clean on all three
+  changed files after that.
+- MyPy `--strict`: one real finding — a list-comprehension couldn't be
+  narrowed by mypy across two separate `Element.get()` calls (the value
+  expression and the filter condition each called `.get(attr)`
+  independently); fixed with a walrus-operator rewrite
+  (`if (value := service_el.get(attr))`) so the narrowing happens in one
+  place. Clean afterward on all three changed files individually, and
+  on the full reconstructed `app/` package (102 source files) as a
+  whole-package sweep.
+- **Byte-count integrity check** (`get_file_info` vs. sandbox `wc -c`)
+  confirmed an exact-match transplant for all three files
+  (`normalization.py`: 11424 bytes; `test_normalization.py`: 10419
+  bytes; `test_scan_worker_task.py`: 18813 bytes) — clean on the first
+  attempt this time (the prior session's own 22-byte mismatch, caught
+  and corrected then, was a lesson this session's transplant didn't
+  need to re-learn).
+- Confirmed by direct diff review: no change to `ScannerPort`,
+  `NmapAdapter`, `NucleiAdapter`, `RunScanWorkflowUseCase`,
+  `execute_scan_workflow`, the pipeline, or any of the five composition-
+  root/wiring files the prior session touched.
 
 ## Pending work
-Unchanged from the prior session's own list, plus the Nmap-adapter
-follow-ups this session's own scope excluded: wiring `NmapAdapter` into
-`scans.py`'s `scanner_name` literal / `RunScanWorkflowUseCase` (not
-requested — Phase 4 adapters are being built ahead of pipeline wiring,
-by design, matching how `NucleiAdapter` itself was built in Milestone 3
-before Milestone 4 wired it in); a real-`nmap`-binary integration test
-(TD #15, mirrors TD #7); the remaining 5 Phase 4 stub adapters (burp,
-zap, reconx, bughunter, sqlmap — explicitly not started, stop-after-Nmap
-was an explicit instruction, not a partial session). All Phase 3
-frontend items are untouched by this session and remain exactly where
-the prior session left them: Step 5 (tests) awaiting a scope decision,
-TD #13 (Next.js 16 evaluation), TD #14 (`frontend/package-lock.json`
-still not committed), TD #5/#8/#11/#12, the `E501` finding in
-`api/dependencies.py`, Findings/Assets/Reporting HTTP surface, the eight
-`docs/*.md` files, `CORS_ALLOWED_ORIGINS` not yet in
-`docker-compose.yml`, RBAC/OAuth/MFA/password reset/email
+Remaining Phase 4 scanner adapters (burp/zap/reconx/bughunter/sqlmap)
+untouched — not requested this session. All Phase 3 frontend items
+remain exactly where prior sessions left them: Step 5 (tests) awaiting
+a scope decision, TD #13 (Next.js 16 evaluation), TD #14
+(`frontend/package-lock.json` still not committed), TD #5/#8/#11/#12,
+the `E501` finding in `api/dependencies.py`, Findings/Assets/Reporting
+HTTP surface, the eight `docs/*.md` files, `CORS_ALLOWED_ORIGINS` not
+yet in `docker-compose.yml`, RBAC/OAuth/MFA/password reset/email
 verification/CSRF double-submit/full organization management.
 
+Nmap is now a genuinely complete, working scanner path end-to-end
+(select → execute → normalize → deduplicate → correlate → enrich →
+ai_analyze → persist), the same as nuclei. Nothing about this path is
+half-built anymore.
+
 ## Next immediate task
-No next task self-selected — this session was explicitly scoped to stop
-after the Nmap adapter, and did. Two independent open decisions now sit
-side by side, neither implied by the other: (1) Step 5's scope for the
-Phase 3 frontend test suite (PROJECT_STATE.md §16, unaffected by this
-session), and (2) whether/when to wire `NmapAdapter` into the pipeline
-and API layer, or instead continue building further Phase 4 stub
-adapters (burp/zap/reconx/bughunter/sqlmap) to the same
-implement-first-wire-later pattern this session and Milestone 3 both
-followed. Await explicit instruction on either before starting new work.
+No next task self-selected — this session was explicitly scoped to TD
+#16 and stopped there. Two independent things are now open, neither
+implied by the other: (1) Step 5's scope for the Phase 3 frontend test
+suite (PROJECT_STATE.md §16, unaffected by this session); (2) whether
+to continue building further Phase 4 scanner adapters
+(burp/zap/reconx/bughunter/sqlmap) — nmap's own three-session arc
+(adapter → wiring → normalizer) is now a complete, reusable template
+for whichever adapter comes next. Await explicit instruction on either
+before starting new work.

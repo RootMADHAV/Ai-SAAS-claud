@@ -117,15 +117,30 @@ diverging (§14). Full rationale: `docs/implementation_progress.md`.
 - Scanner-native severity is never written to `Finding.ai_severity_level`
   (that field means an AI provider's own estimate) — raw scanner
   severity travels in `FindingOccurrence.raw_evidence` instead.
-- No `BaseAgent`/`NormalizerPort`/scanner registry yet — YAGNI, exactly
-  one concrete implementation exists for each; build the abstraction
-  only when a second real shape exists.
+- No `BaseAgent`/`NormalizerPort`/scanner registry yet — YAGNI. Two
+  concrete `ActiveScanner` implementations exist as of Phase 4 (nuclei,
+  nmap), selected via an explicit if/elif in `app/workers/tasks.py`'s
+  `_select_active_scanner` and carried as a plain tuple in
+  `AppState.active_scanners` (`app/api/dependencies.py`) — not a
+  registry: no registration API, no dynamic/pluggable dispatch, just
+  the two known concrete classes hand-wired in source. Normalization
+  (`normalize_scan_output`, `app/application/scanning/normalization.py`)
+  follows the identical pattern for its own two known output formats
+  (`"nuclei-jsonl"`, `"nmap-xml"` — TD #16, resolved) — a plain
+  if/elif, not an injectable `NormalizerPort`, for the same reason.
+  `BaseAgent` still has exactly one concrete shape; build it only when a
+  second real AI-agent shape exists.
 - `POST .../scans/{scan_id}/run` dispatches Celery async, returns `202
   Accepted` (resolved TD #10): checks scan exists (404) and
-  `scanner_name` matches the wired adapter (409) before dispatch; does
-  not re-dispatch an already-`RUNNING` scan. `RunScanWorkflowUseCase`
-  itself runs unmodified inside one `ingestion_worker` Celery task (no
-  scanner_worker split — TD #12).
+  `scanner_name` matches one of the wired adapters (409 — widened from
+  a single adapter to a small set, Phase 4; see `AppState.active_scanners`
+  above) before dispatch; does not re-dispatch an already-`RUNNING`
+  scan. `RunScanWorkflowUseCase` itself runs unmodified inside one
+  `ingestion_worker` Celery task (no scanner_worker split — TD #12),
+  constructed with whichever single concrete adapter
+  `_select_active_scanner` (`app/workers/tasks.py`) picks for that
+  scan's own `scanner_name` — the use case's own "exactly one adapter
+  per construction" shape (its module docstring) is unchanged.
 - Network segmentation (`docker-compose.yml`): `backend` (API) is on
   `internal` only, no internet route, no MinIO/Anthropic credentials.
   `worker` is on `internal` + `queue` + `worker-egress` — has both DB
@@ -191,7 +206,7 @@ bounded contexts in §2 under each layer:
 - `ai_agents/analysis_service.py` (no `BaseAgent` yet);
   `workers/{celery_app,tasks}.py`.
 
-`backend/tests/`: `conftest.py`; `unit/` (30 files); `integration/`
+`backend/tests/`: `conftest.py`; `unit/` (31 files); `integration/`
 (`support.py` + 13 files, against real Postgres).
 
 ## 6. Domain model summary
@@ -231,6 +246,8 @@ transition *enforcement* still requires future use cases.
 | — | Phase 3 frontend — Step 3: auth/session flow (not a milestone) | `frontend/src/lib/auth/`: `AuthProvider`/`useAuth` (client-side session-state mirror — never reads/stores a token, only reflects what the backend's responses said), restoring a session on mount via the existing `refreshSession()` call (no dedicated `/auth/me` endpoint — a documented design choice, not a gap). `RequireAuth` — client-side-only route guard; deliberately no `middleware.ts` (would need either sharing `JWT_SECRET` with the edge runtime or a cookie-presence-only check that buys little over the already-known session state) — never the security boundary, which stays entirely server-side. `frontend/src/app/{login,register,dashboard}/page.tsx` (dashboard is a minimal protected placeholder, not Step 4's real UI); `frontend/src/components/nav-bar.tsx` (basic authenticated/unauthenticated nav state). Added `logout()` to `lib/api/auth.ts` (the one gap Step 2 correctly left out of scope). A real bug was caught by the new component test, not just avoided: `logout()`'s original `try/finally` (no `catch`) still rethrows after cleanup, leaving an unhandled promise rejection at every call site on a network failure — fixed to catch-and-log instead. `npm run typecheck`/`lint`/`test` (30/30)/`build` all clean in sandbox before transplant. No organization/scan UI — Steps 4-5 remain. |
 | — | Phase 3 frontend — Step 4: organization + scan lifecycle UI (not a milestone) | `frontend/src/lib/organization/use-selected-organization.ts`: the one piece of org state this MVP needs client-side (which organization is selected), persisted to `localStorage` — explicitly not a credential (an org id alone grants no access; the backend's `require_organization_member` is what actually decides), and explicitly not multi-org management (a single id, not a list — the backend still has no "list my organizations" endpoint, §13). `frontend/src/lib/scans/use-scan-polling.ts`: bounded polling (fixed 3s interval, recursive `setTimeout` so requests never overlap, stops on terminal status/unmount/a 200-poll ―~10 min― safety cap). `frontend/src/components/{create-organization-form,new-scan-form,scan-detail}.tsx`; `frontend/src/app/scans/[scanId]/page.tsx` (new route); `frontend/src/app/dashboard/page.tsx` rewritten to bootstrap an organization then show scan creation. Added `frontend/src/lib/api/error-message.ts` (`describeApiError()`) to consolidate the instanceof-chain error handling Step 3's pages had each duplicated inline. `npm run typecheck`/`lint`/`test` (47/47)/`build` all clean in sandbox before transplant. No findings/assets/reporting UI, no RBAC/multi-org management — out of scope by design, not deferred. |
 | — | Phase 4 — Nmap scanner adapter (not a milestone; out-of-sequence explicit-instruction session, ahead of Phase 3 frontend Step 5) | `scanner_engine/adapters/nmap/adapter.py`: `NmapAdapter(ActiveScanner)`, following `NucleiAdapter`'s exact shape — routes through the existing `validate_target`/`run_scanner_subprocess`, returns the existing `ScanOutput` shape, no new abstractions/registry/pipeline changes. Scan type pinned to `-sT -Pn` (TCP connect + skip host discovery, both unprivileged) — the code-level "no privileged/raw-packet scanning" requirement, on top of (not instead of) `run_scanner_subprocess`'s own non-root guard. Target is always the single already-validated hostname appended last, never a range — no target-expansion surface. Output format tagged `nmap-xml` (nmap's own `-oX -`), unparsed beyond a shallow `<nmaprun` sanity check (real parsing stays normalization's job, per §1's Scanning/Findings boundary). Explicitly handles: missing binary (`FileNotFoundError` → `ScannerExecutionError`), timeout (propagates `ScannerTimeoutError` from `run_scanner_subprocess` uncaught), non-zero exit (always a hard failure for nmap — deliberately stricter than nuclei's tolerant classification; see the adapter's own comment on why), empty output, and malformed/non-XML output. `tests/unit/test_nmap_adapter.py` — 9 new tests, fakes/spies only, no real `nmap` binary required. No ZAP/Burp/SQLMap/ReconX/BugHunter, no `ScannerPort` changes, no wiring into the API layer's scanner-name literal or the pipeline — explicitly out of scope, stopped after Nmap per instruction. |
+| — | Phase 4 — Nmap adapter wiring into scan pipeline/API (not a milestone; second out-of-sequence explicit-instruction session, directly following the adapter-only one above) | Made `nmap` actually selectable/executable through the existing scan flow, without a registry/factory/`ScannerPort` redesign. `app/api/v1/schemas.py`: `scanner_name: Literal["nuclei", "nmap"]`. `app/api/dependencies.py`: `AppState.active_scanner` (singular) → `active_scanners: tuple[ActiveScanner, ...]`; `get_active_scanner` → `get_active_scanners`; `ScanDispatcher` widened to carry `scanner_name` alongside the ids. `app/main.py`: `_lifespan` constructs both `NucleiAdapter()` and `NmapAdapter()`. `app/api/v1/scans.py`: `run_scan` checks `scan.scanner_name` against the whole wired-names set (409 if unmatched) and passes `scan.scanner_name` through to the dispatcher. `app/workers/tasks.py`: new `_select_active_scanner(scanner_name)` helper — an explicit if/elif over exactly the two known adapters (not a registry — see §4), reusing `ScannerMismatchError` for an unrecognized name; `scanner_name` threaded through `_run_scan_workflow_from_settings`/`run_scan_workflow_task`. `RunScanWorkflowUseCase`/`execute_scan_workflow`/the 8-step pipeline/target validation/subprocess boundary/every other adapter — all untouched, confirmed by direct diff review. New `tests/unit/test_workers_tasks.py` (3 pure-function tests for `_select_active_scanner`); updated `test_api_dependencies.py`, `test_api_schemas.py`, `test_api_scans.py` (+3 new nmap-path tests), `test_main_lifespan.py`, `test_scan_worker_task.py` (+1 new integration test proving the worker selects `NmapAdapter`, not `NucleiAdapter`, for an nmap-scoped scan). |
+| — | Phase 4 — Nmap XML normalizer (not a milestone; third out-of-sequence explicit-instruction session, resolving TD #16) | `app/application/scanning/normalization.py`: `normalize_scan_output` gained a second dispatch branch for `"nmap-xml"` (plain if/elif alongside the existing `"nuclei-jsonl"` branch — explicitly not a `NormalizerPort`, per instruction not to introduce new pipeline/scanner abstractions; mirrors the `_select_active_scanner` precedent). New `_parse_nmap_xml`/`_nmap_host_value`/`_nmap_port_to_normalized`/`_nmap_service_description` (stdlib `xml.etree.ElementTree`, no new dependency) turn nmap's `-oX` XML into one `NormalizedFinding` per **open** port across every **up** host — closed/filtered ports and down hosts contribute nothing. Every nmap-derived finding is `raw_severity="info"` with no CVE/CVSS candidate (an honest reflection of what a plain `-sT -Pn` TCP-connect scan with no NSE vulnerability scripts actually detects — see `NmapAdapter`'s own scope). `template_id="open-port-{protocol}-{portid}"` gives the same per-scan-recurring-finding fingerprint stability nuclei's `template-id` already provides. `host` prefers a resolved hostname over the raw IP, mirroring nuclei's own host/ip fallback. Ten new `test_normalization.py` cases (single/multiple open ports, closed/filtered-port exclusion, down-host exclusion, hostname-vs-address preference, missing-service handling, empty input, malformed XML, multi-host); the pre-existing `test_unsupported_output_format_raises` (previously asserting `"nmap-xml"` itself was unsupported) was updated to use `"burp-xml"` instead, since that claim is no longer true. `tests/integration/test_scan_worker_task.py`'s nmap-selection test (added by the wiring session immediately above) was upgraded in step: its fake scanner now emits real nmap-XML-shaped output for the `"nmap-xml"` persona (previously always emitted nuclei-JSON-shaped output regardless of persona, which this new normalizer would have flagged as malformed XML), and the test now asserts genuine full `Scan.status is COMPLETED` — matching its nuclei sibling test — rather than only the `EXECUTE_SCANNER` step's status, since normalization can now actually carry an nmap-scoped scan all the way through. |
 
 Full per-milestone delivery detail, file lists, verification narrative:
 `docs/implementation_progress.md`.
@@ -240,11 +257,12 @@ Full per-milestone delivery detail, file lists, verification narrative:
 **Scanning** (`/organizations/{organization_id}/scans`, all routes
 require `require_organization_member`):
 - `POST /` — create scan (`TriggerScanUseCase`); `scanner_name:
-  Literal["nuclei"]`; also depends on `get_current_user`, passes
-  `current_user.id` as `triggered_by_user_id`.
+  Literal["nuclei", "nmap"]` (widened Phase 4); also depends on
+  `get_current_user`, passes `current_user.id` as `triggered_by_user_id`.
 - `POST /{scan_id}/run` — dispatches Celery task, returns `202
-  Accepted` with pre-execution state; 404 if missing, 409 on
-  `scanner_name` mismatch; no-op (still 202) if already `RUNNING`.
+  Accepted` with pre-execution state; 404 if missing, 409 if
+  `scanner_name` doesn't match any wired adapter (a small set as of
+  Phase 4, not a single adapter); no-op (still 202) if already `RUNNING`.
 - `GET /{scan_id}` — direct repository read (`ScanDetailResponse`).
 
 **Auth** (`/auth`, no membership required):
@@ -480,6 +498,82 @@ which this session did not touch). No API-layer, pipeline, or
 other-adapter files were changed — confirmed by reviewing the diff of
 every file actually written.
 
+**Phase 4 — Nmap adapter wiring into scan pipeline/API.** A much wider
+reconstruction than the adapter-only session above, since this one
+touches the composition root (`app/main.py`, `app/api/dependencies.py`,
+`app/workers/tasks.py`) — files with a wide, transitive import graph.
+The **entire** `backend/app/` package (all six bounded contexts,
+infrastructure, workers, scanner_engine, ai_agents), the real Alembic
+migration, and a genuine non-superuser `app_user` role (`rolsuper=false`,
+`rolbypassrls=false`, explicitly checked, matching every prior
+full-package session's own standard) were reconstructed fresh in
+Claude's sandbox — not a partial slice. A real PostgreSQL 16 instance
+was installed and the migration applied for real (19 tables + RLS
+policies). Every existing test file the changed files' own imports
+touch was reconstructed and run as a genuine regression baseline
+**before** any edit was made (63 passed), then again after every edit
+(**70 passed, 0 failed** — 61 pre-existing/regression cases across
+`test_nuclei_adapter.py`/`test_nmap_adapter.py`/`test_base_scanner.py`/
+`test_api_dependencies.py`/`test_api_schemas.py`/`test_api_scans.py`/
+`test_main_lifespan.py`/`test_scan_worker_task.py`, plus 9 genuinely new
+cases across the same files and the new `test_workers_tasks.py`). Ruff
+(lint + format) and MyPy `--strict` both clean on all 11 changed/new
+files — the only two remaining Ruff findings in the touched files are
+both on lines this session did not edit (`app/api/dependencies.py`'s
+already-documented pre-existing `E501` above, and one pre-existing
+formatting choice in `app/main.py` outside this session's edit blocks,
+confirmed by direct diff review). Byte-count integrity check
+(`get_file_info` vs. sandbox `wc -c`) confirmed an exact-match transplant
+for every one of the 11 files — including a real, caught-and-fixed
+mismatch: an early transplant of one new test's `asyncio.to_thread(...)`
+call used a different line-wrap than the sandbox's own `ruff format`
+output; the byte-count check caught the 22-byte discrepancy immediately
+and it was corrected before being reported done. New integration test
+(`test_run_scan_workflow_task_selects_nmap_for_an_nmap_scoped_scan`)
+asserts via `call_count` spies on both adapter fakes that `NmapAdapter`,
+not `NucleiAdapter`, actually runs for an nmap-scoped scan — and via the
+`EXECUTE_SCANNER` workflow step's own status, not the whole `Scan`'s,
+since no nmap-xml normalizer exists yet and the scan's later `NORMALIZE`
+step genuinely (and correctly) fails for that reason — see TD #16.
+`RunScanWorkflowUseCase`, `execute_scan_workflow`, the 8-step pipeline,
+`validate_target`, `run_scanner_subprocess`, `ScannerPort`, and every
+other adapter were confirmed untouched by direct diff review, not just
+by claim.
+
+**Phase 4 — Nmap XML normalizer (TD #16).** Same reconstruct-in-sandbox
+approach, reusing the still-intact full-package sandbox from the wiring
+session immediately above (fresh-diffed against the real repo's current
+`normalization.py`/`test_normalization.py` before editing, to rule out
+drift). **`pytest tests/ -q` → 89 passed, 0 failed** (19
+`test_normalization.py` cases — 9 pre-existing nuclei-path regression
+cases plus 10 new nmap-xml cases; 70 pre-existing cases across every
+other test file, confirming zero regression elsewhere — the composition
+root/wiring files from the prior session were not touched this session).
+Ruff (lint + format, including `--fix` for three auto-fixable
+UP012/line-length findings in the new test fixture's XML-building code)
+and MyPy `--strict` (one real finding: a list-comprehension type-narrowing
+case mypy couldn't follow across two separate `.get()` calls, fixed with
+a walrus-operator rewrite) both clean on all three changed files
+(`normalization.py`, `test_normalization.py`, `test_scan_worker_task.py`)
+and on the full package (102 source files, whole-package sweep). Byte-count
+integrity check (`get_file_info` vs. sandbox `wc -c`) confirmed an
+exact-match transplant for all three files
+(`normalization.py`: 11424 bytes; `test_normalization.py`: 10419 bytes;
+`test_scan_worker_task.py`: 18813 bytes) — clean on the first attempt
+this time, no byte-count mismatch to correct. **A direct, in-scope
+consequence this session's own verification caught, not initially
+anticipated:** the wiring session's nmap-selection integration test had
+a fake scanner that emitted nuclei-JSON-shaped output regardless of
+which adapter persona it stood in for; with a real nmap-xml normalizer
+now in place, that fake's XML claim would have been exposed as false
+(a malformed-XML `NormalizationError`, not the old "unsupported format"
+failure) the moment the test ran. Fixed by making the fake emit output
+shaped like whichever `output_format` it is actually configured to
+report, and upgrading the test's own assertion from "`EXECUTE_SCANNER`
+step completed" to genuine `Scan.status is COMPLETED`, matching its
+nuclei sibling test — the test now actually exercises the new
+normalizer end-to-end rather than working around its prior absence.
+
 ## 12. Active technical debt
 
 1. `domain/shared/enums.py` — staging area for enums belonging to
@@ -545,6 +639,17 @@ every file actually written.
     `run_scanner_subprocess`** — no real `nmap` binary reachable in the
     verification environment. Same shape as TD #7 (`NucleiAdapter`);
     resolved the same way when a real-binary CI/sandbox image exists.
+16. ~~**No `nmap-xml` normalizer.**~~ — **resolved.**
+    `normalize_scan_output` (`app/application/scanning/normalization.py`)
+    now parses nmap's `-oX` XML (one `NormalizedFinding` per open port,
+    across every up host — `raw_severity="info"`, no CVE/CVSS candidate,
+    honestly reflecting what a plain `-sT -Pn` scan with no NSE scripts
+    actually detects). An nmap-scoped scan now genuinely reaches
+    `Scan.status is COMPLETED` end-to-end, confirmed by this session's
+    own integration test (upgraded from the wiring session's narrower
+    `EXECUTE_SCANNER`-only assertion — see §7/§11). Still a plain
+    if/elif dispatch in `normalize_scan_output`, not a `NormalizerPort`
+    — see §4.
 
 ## 13. Deferred / excluded work
 
@@ -552,7 +657,9 @@ every file actually written.
 - `EventBusPort` and its implementation; `FindingCreated` publication
   (planned, no port yet).
 - Remaining 13 scanner adapters (Phase 4 — burp, zap, reconx,
-  bughunter, sqlmap, etc.; nmap now done — see §7/§11/TD #15).
+  bughunter, sqlmap, etc.; nmap now done and fully wired — selection,
+  execution, and normalization — into the pipeline/API, see §7/§11/
+  TD #15/TD #16).
 - OpenAI/Ollama/OpenRouter `AIProviderPort` implementations (deferred
   until a second real provider shape is known).
 - Network-isolated `scanner_worker` split (TD #12).
@@ -636,6 +743,36 @@ ahead of the Step 5 decision below, with an explicit stop-after-Nmap
 scope: `NmapAdapter` only, no `ScannerPort`/pipeline/registry changes,
 no other adapters. Nothing here changes Step 5's own status — it is
 still awaiting a scope decision, unaffected by this session.
+
+**Second out-of-sequence session (explicit instruction, directly
+following the one above): Phase 4 — Nmap adapter wiring into the scan
+pipeline/API — complete, see §7/§11/TD #16.** `nmap` is now genuinely
+selectable (`scanner_name: Literal["nuclei", "nmap"]`) and executable
+(the worker actually constructs and runs `NmapAdapter` for an
+nmap-scoped scan) through the real, public scan flow — not just an
+adapter class sitting unreferenced in `scanner_engine/adapters/nmap/`.
+Still no registry/factory/`ScannerPort` redesign — selection is a plain
+tuple (`AppState.active_scanners`) plus an explicit if/elif
+(`_select_active_scanner`). This session's own verification surfaced a
+real, then-currently-reachable gap (an nmap-scoped scan would genuinely
+fail at `NORMALIZE`, no `nmap-xml` normalizer existing yet) — resolved
+by the third session immediately below, not left open. Nothing here
+changes Step 5's own status — still awaiting a scope decision,
+unaffected by this session.
+
+**Third out-of-sequence session (explicit instruction, directly
+following the two above): Phase 4 — Nmap XML normalizer — complete,
+resolving TD #16, see §7/§11/§12.** `normalize_scan_output` now parses
+nmap's own `-oX` XML output into `NormalizedFinding`s (one per open
+port, across every up host), via a second plain if/elif branch —
+explicitly not a `NormalizerPort`, matching the instruction not to
+introduce new pipeline/scanner abstractions and mirroring the
+`_select_active_scanner` precedent from the session above. **An
+nmap-scoped scan now genuinely completes end-to-end through the real,
+public scan flow** — confirmed by an upgraded integration test
+asserting true `Scan.status is COMPLETED`, not just adapter selection.
+Nothing here changes Step 5's own status either — still awaiting a
+scope decision, unaffected by this session.
 
 **Phase 3 (frontend) implementation is approved and in progress**,
 following the 5-step plan (scaffold → API client infra → auth/session

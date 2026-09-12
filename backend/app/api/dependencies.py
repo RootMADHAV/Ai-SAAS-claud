@@ -42,7 +42,12 @@ from app.infrastructure.security.token_service import (
 )
 from app.workers.tasks import run_scan_workflow_task
 
-ScanDispatcher = Callable[[UUID, UUID], None]
+#: Carries scanner_name alongside the ids being dispatched -- Phase 4
+#: (Nmap): the worker composition root now needs to know which adapter
+#: a given scan actually wants before it constructs one (see
+#: app/workers/tasks.py's _select_active_scanner), not just which scan
+#: to run.
+ScanDispatcher = Callable[[UUID, UUID, str], None]
 
 
 @dataclass(slots=True, frozen=True)
@@ -55,7 +60,13 @@ class AuthConfig:
 @dataclass(slots=True)
 class AppState:
     session_factory: async_sessionmaker[AsyncSession]
-    active_scanner: ActiveScanner
+    #: Every ``ActiveScanner`` this process actually constructs -- a
+    #: plain tuple of concrete instances (today: nuclei, nmap), not a
+    #: registry: there is no registration API and nothing pluggable,
+    #: just the small, fixed set this deployment is wired to. Plural
+    #: since Phase 4 (Nmap) -- was a single ``ActiveScanner`` field
+    #: through Milestone 7, when exactly one adapter existed.
+    active_scanners: tuple[ActiveScanner, ...]
     auth_config: AuthConfig
 
 
@@ -67,8 +78,8 @@ def get_session_factory(request: Request) -> async_sessionmaker[AsyncSession]:
     return _state(request).session_factory
 
 
-def get_active_scanner(request: Request) -> ActiveScanner:
-    return _state(request).active_scanner
+def get_active_scanners(request: Request) -> tuple[ActiveScanner, ...]:
+    return _state(request).active_scanners
 
 
 def get_auth_config(request: Request) -> AuthConfig:
@@ -76,8 +87,8 @@ def get_auth_config(request: Request) -> AuthConfig:
 
 
 def get_scan_dispatcher() -> ScanDispatcher:
-    def _dispatch(organization_id: UUID, scan_id: UUID) -> None:
-        run_scan_workflow_task.delay(str(organization_id), str(scan_id))
+    def _dispatch(organization_id: UUID, scan_id: UUID, scanner_name: str) -> None:
+        run_scan_workflow_task.delay(str(organization_id), str(scan_id), scanner_name)
 
     return _dispatch
 

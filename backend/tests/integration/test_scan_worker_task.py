@@ -99,25 +99,57 @@ class _FakeStorage(StoragePort):
 @dataclass
 class _FakeActiveScanner(ActiveScanner):
     call_count: int = 0
+    # Phase 4: overridable so this one fake class can stand in for
+    # either wired adapter in a test (see
+    # test_run_scan_workflow_task_selects_nmap_for_an_nmap_scoped_scan
+    # below) -- defaults preserve every existing call site's behavior
+    # unchanged (a nuclei-shaped fake, same as before this field
+    # existed).
+    name_override: str = "nuclei"
+    output_format_override: str = "nuclei-jsonl"
 
     @property
     def name(self) -> str:
-        return "nuclei"
+        return self.name_override
 
     @property
     def output_format(self) -> str:
-        return "nuclei-jsonl"
+        return self.output_format_override
 
     async def execute(self, target: str, *, timeout_seconds: float) -> ScanOutput:
         self.call_count += 1
-        line = {
-            "template-id": "worker-task-test",
-            "info": {"name": "Worker Task Test Finding", "severity": "medium"},
-            "host": target,
-            "matched-at": target,
-        }
-        raw = json.dumps(line).encode("utf-8")
         now = utcnow()
+        # TD #16: produce output shaped like whatever output_format this
+        # fake is configured to report, so a scan using the "nmap"
+        # persona can now genuinely complete end-to-end through the real
+        # nmap-xml normalizer, the same as the "nuclei" persona already
+        # could through the real nuclei-jsonl one -- not just get far
+        # enough to prove adapter selection and then fail at NORMALIZE.
+        if self.output_format_override == "nmap-xml":
+            raw = (
+                '<?xml version="1.0"?>'
+                "<nmaprun>"
+                "<host>"
+                '<status state="up"/>'
+                '<address addr="93.184.216.34" addrtype="ipv4"/>'
+                f'<hostnames><hostname name="{target}" type="user"/></hostnames>'
+                "<ports>"
+                '<port protocol="tcp" portid="80">'
+                '<state state="open"/>'
+                '<service name="http"/>'
+                "</port>"
+                "</ports>"
+                "</host>"
+                "</nmaprun>"
+            ).encode()
+        else:
+            line = {
+                "template-id": "worker-task-test",
+                "info": {"name": "Worker Task Test Finding", "severity": "medium"},
+                "host": target,
+                "matched-at": target,
+            }
+            raw = json.dumps(line).encode("utf-8")
         return ScanOutput(
             scanner_name=self.name,
             output_format=self.output_format,
@@ -153,12 +185,14 @@ async def _create_organization(engine: AsyncEngine) -> UUID:
     return organization.id
 
 
-async def _create_scan(engine: AsyncEngine, organization_id: UUID) -> UUID:
+async def _create_scan(
+    engine: AsyncEngine, organization_id: UUID, *, scanner_name: str = "nuclei"
+) -> UUID:
     session_factory = async_sessionmaker(bind=engine, expire_on_commit=False)
     async with session_factory() as session:
         await set_org_context(session, organization_id)
         scan = await TriggerScanUseCase(SqlAlchemyScanRepository(session)).execute(
-            organization_id=organization_id, target="example.com", scanner_name="nuclei"
+            organization_id=organization_id, target="example.com", scanner_name=scanner_name
         )
         await session.commit()
     return scan.id
@@ -273,13 +307,92 @@ async def test_run_scan_workflow_task_completes_a_real_scan_end_to_end(
         # already running, so asyncio.to_thread here faithfully
         # reproduces that -- a fresh thread has no running loop of its
         # own for asyncio.run() to collide with.
-        await asyncio.to_thread(run_scan_workflow_task, str(organization_id), str(scan_id))
+        await asyncio.to_thread(
+            run_scan_workflow_task, str(organization_id), str(scan_id), "nuclei"
+        )
     finally:
         get_settings.cache_clear()
 
     assert scanner.call_count == 1
     assert ai_provider.call_count == 1
 
+    session_factory = async_sessionmaker(bind=engine, expire_on_commit=False)
+    async with session_factory() as session:
+        await set_org_context(session, organization_id)
+        scan = await SqlAlchemyScanRepository(session).get_by_id(scan_id)
+        assert scan is not None
+        assert scan.status is ScanStatus.COMPLETED
+
+
+async def test_run_scan_workflow_task_selects_nmap_for_an_nmap_scoped_scan(
+    postgres_available: bool,
+    engine: AsyncEngine,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Phase 4: the worker-side counterpart to
+    test_run_scan_workflow_task_completes_a_real_scan_end_to_end above,
+    but for scanner_name="nmap" -- proves
+    _run_scan_workflow_from_settings's _select_active_scanner actually
+    picks NmapAdapter, not NucleiAdapter, when a scan asks for it.
+    Monkeypatches both real-adapter classes with distinguishable fakes
+    (call_count each) so a wrong selection is caught directly (the
+    "wrong" fake's call_count would stay 0, the "right" one's would
+    never increment) rather than only inferred from the scan completing
+    -- either adapter's fake would let the scan complete on its own, so
+    completion alone would not prove which one actually ran."""
+    if not postgres_available:
+        pytest.skip("No PostgreSQL instance reachable for this task test")
+
+    monkeypatch.setenv("WORKER_ROLE", "ingestion_worker")
+    monkeypatch.setenv(
+        "DATABASE_URL",
+        "postgresql+asyncpg://app_user:app_password@localhost/security_platform_test",
+    )
+    monkeypatch.setenv("REDIS_URL", "redis://localhost:6379/0")
+    monkeypatch.setenv("MINIO_ENDPOINT", "localhost:9000")
+    monkeypatch.setenv("MINIO_ROOT_USER", "test-user")
+    monkeypatch.setenv("MINIO_ROOT_PASSWORD", "a-real-minio-password")
+    monkeypatch.setenv("MINIO_BUCKET", "scan-raw-output")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "a-real-anthropic-key")
+    get_settings.cache_clear()
+
+    nuclei_scanner = _FakeActiveScanner()
+    nmap_scanner = _FakeActiveScanner(name_override="nmap", output_format_override="nmap-xml")
+    ai_provider = _FakeAIProviderPort()
+    storage = _FakeStorage()
+
+    import app.workers.tasks as tasks_module
+
+    monkeypatch.setattr(tasks_module, "NucleiAdapter", lambda: nuclei_scanner)
+    monkeypatch.setattr(tasks_module, "NmapAdapter", lambda: nmap_scanner)
+    monkeypatch.setattr(tasks_module, "MinioStoragePort", lambda **kwargs: storage)
+    monkeypatch.setattr(tasks_module, "AnthropicProvider", lambda **kwargs: ai_provider)
+    monkeypatch.setattr(
+        tasks_module,
+        "AnalysisService",
+        lambda provider: AnalysisService(provider=provider),
+    )
+
+    organization_id = await _create_organization(engine)
+    scan_id = await _create_scan(engine, organization_id, scanner_name="nmap")
+
+    try:
+        await asyncio.to_thread(run_scan_workflow_task, str(organization_id), str(scan_id), "nmap")
+    finally:
+        get_settings.cache_clear()
+
+    assert nmap_scanner.call_count == 1
+    assert nuclei_scanner.call_count == 0
+
+    # TD #16 (resolved): a real nmap-xml normalizer now exists
+    # (app/application/scanning/normalization.py), so this fake's XML
+    # output (see _FakeActiveScanner.execute()) carries the pipeline all
+    # the way to a genuinely COMPLETED scan -- the same outcome
+    # test_run_scan_workflow_task_completes_a_real_scan_end_to_end above
+    # already asserts for the nuclei path. Asserting full completion
+    # here (not just the EXECUTE_SCANNER step) is what actually exercises
+    # the new normalizer in its real pipeline context, not just the
+    # adapter-selection logic this test also covers via call_count.
     session_factory = async_sessionmaker(bind=engine, expire_on_commit=False)
     async with session_factory() as session:
         await set_org_context(session, organization_id)
@@ -316,6 +429,6 @@ async def test_composition_root_rejects_an_unimplemented_ai_provider(
 
     try:
         with pytest.raises(ValueError, match="has no adapter wired"):
-            await _run_scan_workflow_from_settings(UUID(int=0), UUID(int=0))
+            await _run_scan_workflow_from_settings(UUID(int=0), UUID(int=0), "nuclei")
     finally:
         get_settings.cache_clear()

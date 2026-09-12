@@ -6,15 +6,16 @@ JSON -- no validation here duplicates a business rule that already lives
 in a domain entity or use case (PROJECT_STATE.md section 10: "no
 business logic inside FastAPI route handlers"). ``scanner_name`` is
 constrained to the literal set of adapters this process actually wires
-(today: just ``"nuclei"``, per Milestone 3) so a request naming an
-adapter that doesn't exist fails fast at the request-validation boundary
-(422) rather than creating a ``Scan`` row that
-``RunScanWorkflowUseCase`` could never execute (it would raise
+(``"nuclei"`` since Milestone 3; ``"nmap"`` added Phase 4) so a request
+naming an adapter that doesn't exist fails fast at the
+request-validation boundary (422) rather than creating a ``Scan`` row
+that ``RunScanWorkflowUseCase`` could never execute (it would raise
 ``ScannerMismatchError`` -- see run_scan_workflow.py). This is *not* a
-scanner registry (still exactly one adapter, per Milestone 4's decision
-log): it is Pydantic reflecting the one adapter this deployment happens
-to have wired, in one place, rather than letting an unrunnable ``Scan``
-row get created first and fail later.
+scanner registry: it is Pydantic hand-enumerating the small, fixed set
+of adapters this deployment happens to have wired, in one place -- no
+registration API, no dynamic discovery, just two literal strings someone
+adds by hand the day a third adapter is wired -- rather than letting an
+unrunnable ``Scan`` row get created first and fail later.
 """
 
 from __future__ import annotations
@@ -43,7 +44,7 @@ class ScanCreateRequest(BaseModel):
         # passes this schema and is the actual authority on whether a
         # target is safe to scan.
     )
-    scanner_name: Literal["nuclei"] = "nuclei"
+    scanner_name: Literal["nuclei", "nmap"] = "nuclei"
 
 
 class WorkflowStepResponse(BaseModel):

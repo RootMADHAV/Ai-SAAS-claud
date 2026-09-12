@@ -53,6 +53,20 @@ neither a new milestone --
     parameter's own docstring for why it defaults to
     ``get_cors_allowed_origins()`` (app/config.py) rather than
     ``Settings``.
+
+Update (Phase 4, Nmap adapter wiring): ``_lifespan`` now constructs
+``NmapAdapter`` alongside ``NucleiAdapter`` -- both credential-free, same
+as before -- and ``AppState.active_scanner`` (singular) became
+``active_scanners`` (plural, a tuple of both). ``run_scan``
+(app/api/v1/scans.py) now checks a scan's ``scanner_name`` against the
+whole tuple rather than a single adapter's ``.name``; the actual
+per-scan adapter *selection* for execution happens one layer down, in
+``app/workers/tasks.py``'s composition root, which is the only place
+that ever needs a single concrete ``ActiveScanner`` instance to hand to
+``RunScanWorkflowUseCase`` (unchanged -- still exactly one adapter per
+use-case construction, per that module's own docstring). See
+``AppState.active_scanners``'s own docstring (app/api/dependencies.py)
+for why this is a plain tuple, not a scanner registry.
 """
 
 from __future__ import annotations
@@ -78,6 +92,7 @@ from app.application.identity.errors import (
 from app.application.scanning.run_scan_workflow import ScannerMismatchError
 from app.config import Settings, get_cors_allowed_origins, get_settings
 from app.infrastructure.db.session import create_engine, create_session_factory
+from app.scanner_engine.adapters.nmap.adapter import NmapAdapter
 from app.scanner_engine.adapters.nuclei.adapter import NucleiAdapter
 
 
@@ -117,7 +132,13 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     engine = create_engine(settings)
     app.state.wired = AppState(
         session_factory=create_session_factory(engine),
-        active_scanner=NucleiAdapter(),
+        # Phase 4 (Nmap): both concrete adapters this process actually
+        # supports are constructed here, once, at startup -- same
+        # credential-free construction NucleiAdapter already had, no new
+        # abstraction added for the second one. See AppState.active_scanners'
+        # own docstring (app/api/dependencies.py) for why this is a plain
+        # tuple, not a registry.
+        active_scanners=(NucleiAdapter(), NmapAdapter()),
         auth_config=_build_auth_config(settings),
     )
     try:
@@ -164,17 +185,19 @@ async def _lookup_error_handler(request: Request, exc: Exception) -> JSONRespons
 
 
 async def _scanner_mismatch_error_handler(request: Request, exc: Exception) -> JSONResponse:
-    """A ``Scan`` whose recorded ``scanner_name`` does not match the one
-    ``ActiveScanner`` this process is wired to (see
-    ``RunScanWorkflowUseCase``'s module docstring on why no multi-adapter
-    registry exists yet) is a state conflict, not a missing resource or
-    a malformed request -- 409, not 404 or 422. As of Milestone 7, this
-    check runs directly in ``app/api/v1/scans.py``'s ``run_scan`` route
-    (before a Celery task is ever dispatched, not inside the pipeline
-    itself), but it still raises the same ``ScannerMismatchError`` type
-    ``RunScanWorkflowUseCase`` always has, so this one global handler
-    covers both call sites without either needing to know about the
-    other.
+    """A ``Scan`` whose recorded ``scanner_name`` does not match any of
+    the ``ActiveScanner`` adapters this process is wired to (a small,
+    fixed tuple of concrete adapters as of Phase 4 -- see
+    ``AppState.active_scanners``'s own docstring, app/api/dependencies.py,
+    for why that still isn't a scanner registry) is a state conflict, not
+    a missing resource or a malformed request -- 409, not 404 or 422. As
+    of Milestone 7, this check runs directly in ``app/api/v1/scans.py``'s
+    ``run_scan`` route (before a Celery task is ever dispatched, not
+    inside the pipeline itself), but it still raises the same
+    ``ScannerMismatchError`` type ``RunScanWorkflowUseCase`` always has
+    (still constructed with exactly one ``ActiveScanner`` -- see that
+    class's own module docstring), so this one global handler covers
+    both call sites without either needing to know about the other.
 
     Typed as ``Exception`` for the same mypy-contravariance reason given
     in ``_lookup_error_handler`` above -- Starlette only ever calls this

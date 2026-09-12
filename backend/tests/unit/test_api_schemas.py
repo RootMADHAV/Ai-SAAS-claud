@@ -22,9 +22,17 @@ from app.domain.shared.enums import ScanStatus, WorkflowStepName, WorkflowStepSt
 from app.domain.shared.ids import new_id
 
 
-def test_scan_create_request_accepts_the_only_wired_scanner() -> None:
+def test_scan_create_request_accepts_nuclei() -> None:
     request = ScanCreateRequest(target="example.com", scanner_name="nuclei")
     assert request.scanner_name == "nuclei"
+
+
+def test_scan_create_request_accepts_nmap() -> None:
+    """Phase 4: nmap joins nuclei as a wired adapter -- see the module
+    docstring on why widening this Literal by hand is still not a
+    scanner registry."""
+    request = ScanCreateRequest(target="example.com", scanner_name="nmap")
+    assert request.scanner_name == "nmap"
 
 
 def test_scan_create_request_defaults_scanner_name_to_nuclei() -> None:
@@ -36,9 +44,12 @@ def test_scan_create_request_rejects_unknown_scanner_name() -> None:
     """The whole point of the Literal constraint (see the module
     docstring): a scanner this process has no adapter for should fail
     request validation (422), not create a Scan row that
-    RunScanWorkflowUseCase could never execute."""
+    RunScanWorkflowUseCase could never execute. "zap" specifically:
+    a real future scanner_engine/adapters/zap/ stub already exists
+    (Phase 4 roadmap) but has no adapter implementation yet, making it
+    a realistic not-yet-wired example rather than a nonsense string."""
     with pytest.raises(ValidationError):
-        ScanCreateRequest(target="example.com", scanner_name="nmap")  # type: ignore[arg-type]
+        ScanCreateRequest(target="example.com", scanner_name="zap")  # type: ignore[arg-type]
 
 
 def test_scan_create_request_rejects_empty_target() -> None:

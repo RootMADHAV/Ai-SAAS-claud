@@ -84,7 +84,7 @@ from uuid import UUID
 from app.ai_agents.analysis_service import AnalysisService
 from app.application.interfaces.scanner_port import ActiveScanner
 from app.application.interfaces.storage_port import StoragePort
-from app.application.scanning.run_scan_workflow import RunScanWorkflowUseCase
+from app.application.scanning.run_scan_workflow import RunScanWorkflowUseCase, ScannerMismatchError
 from app.config import get_settings
 from app.infrastructure.ai_providers.anthropic_provider import AnthropicProvider
 from app.infrastructure.db.repositories.assets_repository import SqlAlchemyAssetRepository
@@ -96,6 +96,7 @@ from app.infrastructure.db.session import (
     session_scoped_to_org,
 )
 from app.infrastructure.storage.minio_storage import MinioStoragePort
+from app.scanner_engine.adapters.nmap.adapter import NmapAdapter
 from app.scanner_engine.adapters.nuclei.adapter import NucleiAdapter
 from app.workers.celery_app import celery_app
 
@@ -132,13 +133,56 @@ async def execute_scan_workflow(
         await use_case.execute(scan_id)
 
 
-async def _run_scan_workflow_from_settings(organization_id: UUID, scan_id: UUID) -> None:
+def _select_active_scanner(scanner_name: str) -> ActiveScanner:
+    """Picks the one concrete ``ActiveScanner`` this worker constructs
+    for ``scanner_name`` -- an explicit if/elif over the exactly two
+    adapters this process wires (nuclei, nmap; Phase 4 added the
+    second), not a scanner registry: there is no registration API, no
+    pluggable/dynamic dispatch, and no abstraction beyond "which one of
+    these two known, concrete classes do we build." Mirrors this
+    module's own existing fail-fast style a few lines below (the
+    ``ai_default_provider`` check) -- an unrecognized value is a
+    genuine configuration/data problem (a ``Scan`` row naming a
+    scanner_name this deployment has no adapter for -- normally already
+    rejected at the API layer, see ``app/api/v1/schemas.py``'s
+    ``Literal`` and ``app/api/v1/scans.py``'s own pre-dispatch check,
+    but this worker does not re-trust that the caller was this
+    codebase's own API process), not something to guess at.
+
+    Reuses ``ScannerMismatchError`` for that unrecognized-name case
+    (rather than a new exception type) since it is the same category of
+    problem ``RunScanWorkflowUseCase`` already names that error for:
+    "this deployment has no adapter for the scanner_name a Scan names."
+    """
+    if scanner_name == "nuclei":
+        return NucleiAdapter()
+    if scanner_name == "nmap":
+        return NmapAdapter()
+    raise ScannerMismatchError(
+        f"no adapter wired for scanner_name={scanner_name!r} -- this worker is wired to "
+        "'nuclei' and 'nmap' only"
+    )
+
+
+async def _run_scan_workflow_from_settings(
+    organization_id: UUID, scan_id: UUID, scanner_name: str
+) -> None:
     """The worker-specific composition root -- mirrors ``app/main.py``'s
     ``_lifespan`` exactly, but for ``worker_role=ingestion_worker``
     (this process's own role, not the API's) and built fresh per task
     invocation rather than once at process startup, per this module's
     docstring on why an engine/session factory cannot be cached across
     ``asyncio.run()`` calls.
+
+    ``scanner_name`` (Phase 4 addition): selects which concrete
+    ``ActiveScanner`` to construct via ``_select_active_scanner`` above
+    -- passed in by the caller (ultimately ``app/api/v1/scans.py``'s
+    ``run_scan`` route, which already has the ``Scan``'s own
+    ``scanner_name`` in hand at dispatch time) rather than re-fetched
+    from the database here, so this function's own shape -- and
+    ``execute_scan_workflow``'s, which it calls -- stays exactly as
+    fully-injectable/fakeable as before this change; only the *value*
+    threaded through is new.
     """
     settings = get_settings()
     # Settings.check_role_boundaries (app/config.py) already guarantees
@@ -170,7 +214,7 @@ async def _run_scan_workflow_from_settings(organization_id: UUID, scan_id: UUID)
     try:
         await execute_scan_workflow(
             session_factory=create_session_factory(engine),
-            active_scanner=NucleiAdapter(),
+            active_scanner=_select_active_scanner(scanner_name),
             storage=MinioStoragePort(
                 endpoint=settings.minio_endpoint,
                 access_key=settings.minio_root_user,
@@ -190,16 +234,20 @@ async def _run_scan_workflow_from_settings(organization_id: UUID, scan_id: UUID)
 
 
 @celery_app.task(name="scanning.run_scan_workflow")
-def run_scan_workflow_task(organization_id: str, scan_id: str) -> None:
+def run_scan_workflow_task(organization_id: str, scan_id: str, scanner_name: str) -> None:
     """The actual Celery entrypoint, dispatched by
     ``app/api/v1/scans.py``'s ``run_scan`` route via
     ``app/api/dependencies.py``'s ``get_scan_dispatcher`` seam.
 
-    Arguments are plain strings, not ``UUID``, because Celery task
-    arguments must be JSON-serializable for the default broker transport
-    -- parsed back into ``UUID`` immediately, so nothing past this one
-    line ever handles a raw string where a ``UUID`` belongs, matching
-    this codebase's existing convention everywhere else.
+    ``organization_id``/``scan_id`` are plain strings, not ``UUID``,
+    because Celery task arguments must be JSON-serializable for the
+    default broker transport -- parsed back into ``UUID`` immediately,
+    so nothing past this one line ever handles a raw string where a
+    ``UUID`` belongs, matching this codebase's existing convention
+    everywhere else. ``scanner_name`` (Phase 4 addition) is already a
+    plain string and needs no such conversion; see
+    ``_run_scan_workflow_from_settings``/``_select_active_scanner``
+    above for what it selects.
 
     Any exception raised here (``LookupError``/``ScannerMismatchError``
     from a scan or organization that no longer exists by the time this
@@ -215,4 +263,6 @@ def run_scan_workflow_task(organization_id: str, scan_id: str) -> None:
     only genuine misuse does (see ``run_scan_workflow.py``'s own
     docstring on this distinction).
     """
-    asyncio.run(_run_scan_workflow_from_settings(UUID(organization_id), UUID(scan_id)))
+    asyncio.run(
+        _run_scan_workflow_from_settings(UUID(organization_id), UUID(scan_id), scanner_name)
+    )

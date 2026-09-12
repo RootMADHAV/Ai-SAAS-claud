@@ -9,7 +9,7 @@ test's own (see tests/conftest.py's ``engine`` fixture docstring for why
 that specific failure mode matters enough to design around here too).
 
 Only the low-level providers with a real external dependency
-(``get_session_factory``, ``get_active_scanner``, and
+(``get_session_factory``, ``get_active_scanners``, and
 ``get_auth_config``) are overridden -- see app/api/dependencies.py's
 module docstring. Everything built on top of them (``get_org_session``'s
 organization-existence check, ``require_organization_member``'s
@@ -58,7 +58,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from app.api.dependencies import (
     AuthConfig,
-    get_active_scanner,
+    get_active_scanners,
     get_auth_config,
     get_scan_dispatcher,
     get_session_factory,
@@ -109,6 +109,30 @@ class _FakeActiveScanner(ActiveScanner):
         )
 
 
+class _FakeNmapActiveScanner(ActiveScanner):
+    """Phase 4: the second entry in this test's fake ``active_scanners``
+    tuple, mirroring ``_FakeActiveScanner`` above exactly (same
+    ``.execute()`` guard, same reasoning) -- proves ``run_scan`` accepts
+    a scan whose ``scanner_name`` is the *second* wired adapter, not
+    just the first, which a test that only ever wired one fake could not
+    distinguish."""
+
+    @property
+    def name(self) -> str:
+        return "nmap"
+
+    @property
+    def output_format(self) -> str:
+        return "nmap-xml"
+
+    async def execute(self, target: str, *, timeout_seconds: float) -> ScanOutput:
+        raise AssertionError(
+            "ActiveScanner.execute() should never be called from the API process -- "
+            "the pipeline runs inside the ingestion_worker Celery task, not here. "
+            "If this fired, run_scan regressed to calling the pipeline directly again."
+        )
+
+
 class _RecordingDispatcher:
     """Records every dispatch call instead of actually enqueueing a
     Celery task or touching a real Redis broker -- this test module's
@@ -120,10 +144,10 @@ class _RecordingDispatcher:
     module for the use case underneath)."""
 
     def __init__(self) -> None:
-        self.calls: list[tuple[UUID, UUID]] = []
+        self.calls: list[tuple[UUID, UUID, str]] = []
 
-    def __call__(self, organization_id: UUID, scan_id: UUID) -> None:
-        self.calls.append((organization_id, scan_id))
+    def __call__(self, organization_id: UUID, scan_id: UUID, scanner_name: str) -> None:
+        self.calls.append((organization_id, scan_id, scanner_name))
 
 
 @pytest.fixture
@@ -142,7 +166,10 @@ def wired_app(engine: AsyncEngine, dispatcher: _RecordingDispatcher) -> FastAPI:
     app.dependency_overrides[get_session_factory] = lambda: async_sessionmaker(
         bind=engine, expire_on_commit=False
     )
-    app.dependency_overrides[get_active_scanner] = lambda: _FakeActiveScanner()
+    app.dependency_overrides[get_active_scanners] = lambda: (
+        _FakeActiveScanner(),
+        _FakeNmapActiveScanner(),
+    )
     app.dependency_overrides[get_scan_dispatcher] = lambda: dispatcher
     app.dependency_overrides[get_auth_config] = lambda: AuthConfig(
         jwt_secret=_TEST_JWT_SECRET,
@@ -244,6 +271,27 @@ async def test_create_scan_defaults_scanner_name_to_nuclei(
     assert response.json()["scanner_name"] == "nuclei"
 
 
+async def test_create_scan_accepts_nmap_as_scanner_name(
+    wired_app: FastAPI, db_session: AsyncSession
+) -> None:
+    """Phase 4: nmap is now a second wired adapter, accepted by the
+    request schema and creatable the same way nuclei always was --
+    mirrors ``test_create_scan_returns_201_with_all_eight_steps_pending``
+    above for the other adapter."""
+    org_id = await _create_organization(db_session)
+    cookies = await _create_authenticated_member(db_session, org_id)
+
+    async with await _make_client(wired_app) as client:
+        response = await client.post(
+            f"/api/v1/organizations/{org_id}/scans",
+            json={"target": "example.com", "scanner_name": "nmap"},
+            cookies=cookies,
+        )
+
+    assert response.status_code == 201
+    assert response.json()["scanner_name"] == "nmap"
+
+
 async def test_create_scan_rejects_an_unknown_scanner_name_with_422(
     wired_app: FastAPI, db_session: AsyncSession
 ) -> None:
@@ -253,7 +301,7 @@ async def test_create_scan_rejects_an_unknown_scanner_name_with_422(
     async with await _make_client(wired_app) as client:
         response = await client.post(
             f"/api/v1/organizations/{org_id}/scans",
-            json={"target": "example.com", "scanner_name": "nmap"},
+            json={"target": "example.com", "scanner_name": "zap"},
             cookies=cookies,
         )
 
@@ -310,7 +358,34 @@ async def test_run_scan_returns_202_and_dispatches_the_task(
     # tests/integration/test_scan_pipeline_orchestrator.py's job to
     # verify, not this module's.
     assert body["status"] == ScanStatus.QUEUED.value
-    assert dispatcher.calls == [(org_id, UUID(scan_id))]
+    assert dispatcher.calls == [(org_id, UUID(scan_id), "nuclei")]
+
+
+async def test_run_scan_dispatches_an_nmap_scoped_scan_with_its_own_scanner_name(
+    wired_app: FastAPI, db_session: AsyncSession, dispatcher: _RecordingDispatcher
+) -> None:
+    """Phase 4: a scan created with scanner_name="nmap" passes the
+    now-widened wired-adapters check and dispatches with "nmap" (not
+    "nuclei") -- proves the scanner_name that reaches the dispatcher is
+    the scan's own, not hardcoded to whichever adapter happens to be
+    first in the wired tuple."""
+    org_id = await _create_organization(db_session)
+    cookies = await _create_authenticated_member(db_session, org_id)
+
+    async with await _make_client(wired_app) as client:
+        create_response = await client.post(
+            f"/api/v1/organizations/{org_id}/scans",
+            json={"target": "example.com", "scanner_name": "nmap"},
+            cookies=cookies,
+        )
+        scan_id = create_response.json()["id"]
+
+        run_response = await client.post(
+            f"/api/v1/organizations/{org_id}/scans/{scan_id}/run", cookies=cookies
+        )
+
+    assert run_response.status_code == 202
+    assert dispatcher.calls == [(org_id, UUID(scan_id), "nmap")]
 
 
 async def test_run_scan_for_a_nonexistent_scan_returns_404(
@@ -469,7 +544,7 @@ async def test_scan_lifecycle_across_three_requests_reflects_async_dispatch(
             f"/api/v1/organizations/{org_id}/scans/{scan_id}/run", cookies=cookies
         )
         assert ran.status_code == 202
-        assert dispatcher.calls == [(org_id, UUID(scan_id))]
+        assert dispatcher.calls == [(org_id, UUID(scan_id), "nuclei")]
 
         fetched = await client.get(
             f"/api/v1/organizations/{org_id}/scans/{scan_id}", cookies=cookies

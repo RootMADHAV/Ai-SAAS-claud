@@ -10,7 +10,7 @@ objects" -- genuinely untested unless something does so directly. This
 module is that something.
 
 Milestone 7 update: ``_lifespan`` now only constructs a session factory
-and a ``NucleiAdapter`` (see ``app/main.py``'s module docstring for why
+and scanner adapters (see ``app/main.py``'s module docstring for why
 ``MinioStoragePort``/``AnthropicProvider``/``AnalysisService`` moved to
 ``app/workers/tasks.py``'s own composition root instead) -- so this test
 only needs ``DATABASE_URL``/``REDIS_URL`` to exercise the real lifespan;
@@ -21,6 +21,12 @@ root, ``_run_scan_workflow_from_settings`` (which does still need those,
 plus a real Anthropic-shaped key, for exactly the reasons this module's
 old version did), now lives in
 ``tests/integration/test_scan_worker_task.py``.
+
+Phase 4 update: ``_lifespan`` now constructs ``NmapAdapter`` alongside
+``NucleiAdapter`` -- both credential-free, same as before -- and
+``AppState.active_scanner`` (singular) became ``active_scanners``
+(plural, a tuple of both). Asserted below the same way the single
+adapter already was.
 
 Update: ``_lifespan`` now also builds an ``AuthConfig``
 (``app/api/dependencies.py``) from ``Settings`` and adds it to
@@ -38,6 +44,7 @@ from app.api.dependencies import AppState
 from app.application.interfaces.scanner_port import ActiveScanner
 from app.config import get_settings
 from app.main import create_app
+from app.scanner_engine.adapters.nmap.adapter import NmapAdapter
 from app.scanner_engine.adapters.nuclei.adapter import NucleiAdapter
 
 pytestmark = pytest.mark.integration
@@ -73,8 +80,14 @@ async def test_lifespan_wires_app_state_with_working_objects(
         async with app.router.lifespan_context(app):
             wired = app.state.wired
             assert isinstance(wired, AppState)
-            assert isinstance(wired.active_scanner, ActiveScanner)
-            assert isinstance(wired.active_scanner, NucleiAdapter)
+            assert isinstance(wired.active_scanners, tuple)
+            assert all(isinstance(s, ActiveScanner) for s in wired.active_scanners)
+            # Phase 4: both wired adapters, not just nuclei -- proves
+            # _lifespan actually constructs NmapAdapter now too, not
+            # just that the tuple type-checks.
+            assert {s.name for s in wired.active_scanners} == {"nuclei", "nmap"}
+            assert any(isinstance(s, NucleiAdapter) for s in wired.active_scanners)
+            assert any(isinstance(s, NmapAdapter) for s in wired.active_scanners)
             assert wired.auth_config.jwt_secret == "a-real-secret"
             assert wired.auth_config.access_token_expire_minutes == 20
             assert wired.auth_config.refresh_token_expire_days == 45

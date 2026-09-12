@@ -32,11 +32,14 @@ dispatches:
   1. Confirm the scan exists (404 if not) -- a cheap, single-row read,
      the same ``ScanRepositoryPort.get_by_id`` this route already used
      for ``get_scan`` below.
-  2. Confirm the scan's recorded ``scanner_name`` matches the adapter
-     this deployment is wired to (409, via the same
+  2. Confirm the scan's recorded ``scanner_name`` matches one of the
+     adapters this deployment is wired to (409, via the same
      ``ScannerMismatchError`` -> 409 global handler in ``app/main.py``
      that already existed for this exact error, previously raised from
-     inside the use case instead of here).
+     inside the use case instead of here; Phase 4 (Nmap) widened this
+     from a single adapter to a small set -- see
+     ``AppState.active_scanners``'s own docstring,
+     app/api/dependencies.py, for why that still isn't a registry).
   3. If the scan is not already ``RUNNING``, dispatch
      ``run_scan_workflow_task`` (via the injected ``ScanDispatcher`` --
      see ``app/api/dependencies.py``'s ``get_scan_dispatcher``) and
@@ -87,7 +90,7 @@ from fastapi import APIRouter, Depends, HTTPException, Response, status
 
 from app.api.dependencies import (
     ScanDispatcher,
-    get_active_scanner,
+    get_active_scanners,
     get_current_user,
     get_scan_dispatcher,
     get_scan_repository,
@@ -143,7 +146,7 @@ async def create_scan(
 async def run_scan(
     scan_id: UUID,
     organization_id: UUID,
-    active_scanner: ActiveScanner = Depends(get_active_scanner),
+    active_scanners: tuple[ActiveScanner, ...] = Depends(get_active_scanners),
     scan_repository: ScanRepositoryPort = Depends(get_scan_repository),
     dispatch_scan: ScanDispatcher = Depends(get_scan_dispatcher),
     _member: OrganizationMember = Depends(require_organization_member),
@@ -170,14 +173,15 @@ async def run_scan(
     scan = await scan_repository.get_by_id(scan_id)
     if scan is None:
         raise HTTPException(status_code=404, detail=f"scan {scan_id} not found")
-    if scan.scanner_name != active_scanner.name:
+    wired_names = {scanner.name for scanner in active_scanners}
+    if scan.scanner_name not in wired_names:
         raise ScannerMismatchError(
             f"scan {scan_id} is registered for scanner_name={scan.scanner_name!r}, "
-            f"but this deployment is wired to the {active_scanner.name!r} adapter"
+            f"but this deployment has no adapter wired for it (wired: {sorted(wired_names)!r})"
         )
 
     if scan.status is not ScanStatus.RUNNING:
-        dispatch_scan(organization_id, scan.id)
+        dispatch_scan(organization_id, scan.id, scan.scanner_name)
 
     steps = await scan_repository.list_workflow_steps(scan.id)
     return ScanDetailResponse.from_domain(scan, steps)

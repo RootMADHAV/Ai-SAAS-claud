@@ -1,7 +1,7 @@
 """Unit tests for the small provider functions in
 ``app/api/dependencies.py`` whose own bodies are never exercised by the
 integration suite: ``tests/integration/test_api_scans.py`` overrides
-``get_session_factory``/``get_active_scanner``/``get_scan_dispatcher``
+``get_session_factory``/``get_active_scanners``/``get_scan_dispatcher``
 wholesale via ``app.dependency_overrides`` (by design -- see that
 module's docstring), which means their *real* implementations are
 otherwise never called by any test, only their *replacements*.
@@ -45,7 +45,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from app.api.dependencies import (
     AppState,
     AuthConfig,
-    get_active_scanner,
+    get_active_scanners,
     get_auth_config,
     get_current_user,
     get_scan_dispatcher,
@@ -56,6 +56,7 @@ from app.domain.identity.entities import User
 from app.domain.shared.clock import utcnow
 from app.domain.shared.ids import new_id
 from app.infrastructure.security.token_service import create_access_token
+from app.scanner_engine.adapters.nmap.adapter import NmapAdapter
 from app.scanner_engine.adapters.nuclei.adapter import NucleiAdapter
 
 _SECRET = "unit-test-secret-value"
@@ -76,7 +77,9 @@ def _fake_request(wired: AppState) -> Mock:
 def test_get_session_factory_reads_it_off_app_state() -> None:
     session_factory: async_sessionmaker[AsyncSession] = async_sessionmaker()
     wired = AppState(
-        session_factory=session_factory, active_scanner=NucleiAdapter(), auth_config=_auth_config()
+        session_factory=session_factory,
+        active_scanners=(NucleiAdapter(),),
+        auth_config=_auth_config(),
     )
 
     result = get_session_factory(_fake_request(wired))
@@ -84,22 +87,23 @@ def test_get_session_factory_reads_it_off_app_state() -> None:
     assert result is session_factory
 
 
-def test_get_active_scanner_reads_it_off_app_state() -> None:
-    scanner = NucleiAdapter()
+def test_get_active_scanners_reads_it_off_app_state() -> None:
+    scanners = (NucleiAdapter(), NmapAdapter())
     wired = AppState(
-        session_factory=async_sessionmaker(), active_scanner=scanner, auth_config=_auth_config()
+        session_factory=async_sessionmaker(), active_scanners=scanners, auth_config=_auth_config()
     )
 
-    result = get_active_scanner(_fake_request(wired))
+    result = get_active_scanners(_fake_request(wired))
 
-    assert result is scanner
+    assert result is scanners
+    assert {scanner.name for scanner in result} == {"nuclei", "nmap"}
 
 
 def test_get_auth_config_reads_it_off_app_state() -> None:
     auth_config = _auth_config()
     wired = AppState(
         session_factory=async_sessionmaker(),
-        active_scanner=NucleiAdapter(),
+        active_scanners=(NucleiAdapter(),),
         auth_config=auth_config,
     )
 
@@ -111,17 +115,19 @@ def test_get_auth_config_reads_it_off_app_state() -> None:
 def test_get_scan_dispatcher_returns_a_callable_that_enqueues_the_task(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    calls: list[tuple[str, str]] = []
+    calls: list[tuple[str, str, str]] = []
     monkeypatch.setattr(
         "app.api.dependencies.run_scan_workflow_task.delay",
-        lambda organization_id, scan_id: calls.append((organization_id, scan_id)),
+        lambda organization_id, scan_id, scanner_name: calls.append(
+            (organization_id, scan_id, scanner_name)
+        ),
     )
     organization_id, scan_id = uuid4(), uuid4()
 
     dispatch = get_scan_dispatcher()
-    dispatch(organization_id, scan_id)
+    dispatch(organization_id, scan_id, "nmap")
 
-    assert calls == [(str(organization_id), str(scan_id))]
+    assert calls == [(str(organization_id), str(scan_id), "nmap")]
 
 
 class _FakeUserRepository(UserRepositoryPort):
