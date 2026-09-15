@@ -128,6 +128,20 @@ def test_unsupported_output_format_raises() -> None:
         normalize_scan_output(output_format="burp-xml", scanner_name="burp", raw_bytes=b"<xml/>")
 
 
+def test_sqlmap_stdout_is_not_yet_supported() -> None:
+    """SqlmapAdapter exists (its own ActiveScanner implementation is
+    complete) but deliberately has no normalizer -- sqlmap's stdout is
+    not a documented, machine-readable contract the way nuclei's jsonl
+    or nmap's XML are, so this adapter's own module docstring explicitly
+    promises this exact behavior rather than fabricating parsed
+    vulnerability data from an undocumented format. This test verifies
+    that promise holds, not just documents it."""
+    with pytest.raises(UnsupportedScanOutputFormatError):
+        normalize_scan_output(
+            output_format="sqlmap-stdout", scanner_name="sqlmap", raw_bytes=b"some output\n"
+        )
+
+
 def test_non_numeric_cvss_score_is_dropped_not_raised() -> None:
     line = _nuclei_line()
     line["info"]["classification"]["cvss-score"] = "not-a-number"  # type: ignore[index]

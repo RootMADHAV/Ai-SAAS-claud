@@ -117,19 +117,26 @@ diverging (§14). Full rationale: `docs/implementation_progress.md`.
 - Scanner-native severity is never written to `Finding.ai_severity_level`
   (that field means an AI provider's own estimate) — raw scanner
   severity travels in `FindingOccurrence.raw_evidence` instead.
-- No `BaseAgent`/`NormalizerPort`/scanner registry yet — YAGNI. Two
+- No `BaseAgent`/`NormalizerPort`/scanner registry yet — YAGNI. Three
   concrete `ActiveScanner` implementations exist as of Phase 4 (nuclei,
-  nmap), selected via an explicit if/elif in `app/workers/tasks.py`'s
-  `_select_active_scanner` and carried as a plain tuple in
-  `AppState.active_scanners` (`app/api/dependencies.py`) — not a
-  registry: no registration API, no dynamic/pluggable dispatch, just
-  the two known concrete classes hand-wired in source. Normalization
-  (`normalize_scan_output`, `app/application/scanning/normalization.py`)
-  follows the identical pattern for its own two known output formats
-  (`"nuclei-jsonl"`, `"nmap-xml"` — TD #16, resolved) — a plain
-  if/elif, not an injectable `NormalizerPort`, for the same reason.
-  `BaseAgent` still has exactly one concrete shape; build it only when a
-  second real AI-agent shape exists.
+  nmap, sqlmap), selected via an explicit if/elif in
+  `app/workers/tasks.py`'s `_select_active_scanner` and carried as a
+  plain tuple in `AppState.active_scanners` (`app/api/dependencies.py`)
+  — not a registry: no registration API, no dynamic/pluggable dispatch,
+  just the known concrete classes hand-wired in source. `SqlmapAdapter`
+  is not yet added to either (adapter-only session, mirroring nmap's own
+  first session — see §7). Normalization (`normalize_scan_output`,
+  `app/application/scanning/normalization.py`) follows the identical
+  pattern for its own known output formats (`"nuclei-jsonl"`,
+  `"nmap-xml"` — TD #16, resolved) — a plain if/elif, not an
+  injectable `NormalizerPort`, for the same reason. `SqlmapAdapter`'s
+  own `"sqlmap-stdout"` output format deliberately has no normalizer
+  branch yet — sqlmap has no documented machine-readable contract for
+  injection-point findings the way nuclei/nmap do, so
+  `normalize_scan_output` currently raises
+  `UnsupportedScanOutputFormatError` for it, honestly, rather than a
+  fabricated parser (TD #18). `BaseAgent` still has exactly one concrete
+  shape; build it only when a second real AI-agent shape exists.
 - `POST .../scans/{scan_id}/run` dispatches Celery async, returns `202
   Accepted` (resolved TD #10): checks scan exists (404) and
   `scanner_name` matches one of the wired adapters (409 — widened from
@@ -201,12 +208,13 @@ bounded contexts in §2 under each layer:
   `password_hashing`, `token_service`), `infrastructure/ai_providers/`
   (`anthropic_provider`; OpenAI/Ollama/OpenRouter pending),
   `infrastructure/{vector_store,event_bus,observability}/` (empty).
-- `scanner_engine/adapters/{nuclei,nmap}/` (done); `burp`/`zap`/
-  `reconx`/`bughunter`/`sqlmap` (empty Phase-4 stubs).
+- `scanner_engine/adapters/{nuclei,nmap,sqlmap}/` (done, `sqlmap`
+  adapter-only — no pipeline/API wiring, no normalizer yet, see §7);
+  `burp`/`zap`/`reconx`/`bughunter` (empty Phase-4 stubs).
 - `ai_agents/analysis_service.py` (no `BaseAgent` yet);
   `workers/{celery_app,tasks}.py`.
 
-`backend/tests/`: `conftest.py`; `unit/` (31 files); `integration/`
+`backend/tests/`: `conftest.py`; `unit/` (32 files); `integration/`
 (`support.py` + 13 files, against real Postgres).
 
 ## 6. Domain model summary
@@ -248,6 +256,8 @@ transition *enforcement* still requires future use cases.
 | — | Phase 4 — Nmap scanner adapter (not a milestone; out-of-sequence explicit-instruction session, ahead of Phase 3 frontend Step 5) | `scanner_engine/adapters/nmap/adapter.py`: `NmapAdapter(ActiveScanner)`, following `NucleiAdapter`'s exact shape — routes through the existing `validate_target`/`run_scanner_subprocess`, returns the existing `ScanOutput` shape, no new abstractions/registry/pipeline changes. Scan type pinned to `-sT -Pn` (TCP connect + skip host discovery, both unprivileged) — the code-level "no privileged/raw-packet scanning" requirement, on top of (not instead of) `run_scanner_subprocess`'s own non-root guard. Target is always the single already-validated hostname appended last, never a range — no target-expansion surface. Output format tagged `nmap-xml` (nmap's own `-oX -`), unparsed beyond a shallow `<nmaprun` sanity check (real parsing stays normalization's job, per §1's Scanning/Findings boundary). Explicitly handles: missing binary (`FileNotFoundError` → `ScannerExecutionError`), timeout (propagates `ScannerTimeoutError` from `run_scanner_subprocess` uncaught), non-zero exit (always a hard failure for nmap — deliberately stricter than nuclei's tolerant classification; see the adapter's own comment on why), empty output, and malformed/non-XML output. `tests/unit/test_nmap_adapter.py` — 9 new tests, fakes/spies only, no real `nmap` binary required. No ZAP/Burp/SQLMap/ReconX/BugHunter, no `ScannerPort` changes, no wiring into the API layer's scanner-name literal or the pipeline — explicitly out of scope, stopped after Nmap per instruction. |
 | — | Phase 4 — Nmap adapter wiring into scan pipeline/API (not a milestone; second out-of-sequence explicit-instruction session, directly following the adapter-only one above) | Made `nmap` actually selectable/executable through the existing scan flow, without a registry/factory/`ScannerPort` redesign. `app/api/v1/schemas.py`: `scanner_name: Literal["nuclei", "nmap"]`. `app/api/dependencies.py`: `AppState.active_scanner` (singular) → `active_scanners: tuple[ActiveScanner, ...]`; `get_active_scanner` → `get_active_scanners`; `ScanDispatcher` widened to carry `scanner_name` alongside the ids. `app/main.py`: `_lifespan` constructs both `NucleiAdapter()` and `NmapAdapter()`. `app/api/v1/scans.py`: `run_scan` checks `scan.scanner_name` against the whole wired-names set (409 if unmatched) and passes `scan.scanner_name` through to the dispatcher. `app/workers/tasks.py`: new `_select_active_scanner(scanner_name)` helper — an explicit if/elif over exactly the two known adapters (not a registry — see §4), reusing `ScannerMismatchError` for an unrecognized name; `scanner_name` threaded through `_run_scan_workflow_from_settings`/`run_scan_workflow_task`. `RunScanWorkflowUseCase`/`execute_scan_workflow`/the 8-step pipeline/target validation/subprocess boundary/every other adapter — all untouched, confirmed by direct diff review. New `tests/unit/test_workers_tasks.py` (3 pure-function tests for `_select_active_scanner`); updated `test_api_dependencies.py`, `test_api_schemas.py`, `test_api_scans.py` (+3 new nmap-path tests), `test_main_lifespan.py`, `test_scan_worker_task.py` (+1 new integration test proving the worker selects `NmapAdapter`, not `NucleiAdapter`, for an nmap-scoped scan). |
 | — | Phase 4 — Nmap XML normalizer (not a milestone; third out-of-sequence explicit-instruction session, resolving TD #16) | `app/application/scanning/normalization.py`: `normalize_scan_output` gained a second dispatch branch for `"nmap-xml"` (plain if/elif alongside the existing `"nuclei-jsonl"` branch — explicitly not a `NormalizerPort`, per instruction not to introduce new pipeline/scanner abstractions; mirrors the `_select_active_scanner` precedent). New `_parse_nmap_xml`/`_nmap_host_value`/`_nmap_port_to_normalized`/`_nmap_service_description` (stdlib `xml.etree.ElementTree`, no new dependency) turn nmap's `-oX` XML into one `NormalizedFinding` per **open** port across every **up** host — closed/filtered ports and down hosts contribute nothing. Every nmap-derived finding is `raw_severity="info"` with no CVE/CVSS candidate (an honest reflection of what a plain `-sT -Pn` TCP-connect scan with no NSE vulnerability scripts actually detects — see `NmapAdapter`'s own scope). `template_id="open-port-{protocol}-{portid}"` gives the same per-scan-recurring-finding fingerprint stability nuclei's `template-id` already provides. `host` prefers a resolved hostname over the raw IP, mirroring nuclei's own host/ip fallback. Ten new `test_normalization.py` cases (single/multiple open ports, closed/filtered-port exclusion, down-host exclusion, hostname-vs-address preference, missing-service handling, empty input, malformed XML, multi-host); the pre-existing `test_unsupported_output_format_raises` (previously asserting `"nmap-xml"` itself was unsupported) was updated to use `"burp-xml"` instead, since that claim is no longer true. `tests/integration/test_scan_worker_task.py`'s nmap-selection test (added by the wiring session immediately above) was upgraded in step: its fake scanner now emits real nmap-XML-shaped output for the `"nmap-xml"` persona (previously always emitted nuclei-JSON-shaped output regardless of persona, which this new normalizer would have flagged as malformed XML), and the test now asserts genuine full `Scan.status is COMPLETED` — matching its nuclei sibling test — rather than only the `EXECUTE_SCANNER` step's status, since normalization can now actually carry an nmap-scoped scan all the way through. |
+| — | Phase 4 — SQLMap scanner adapter (not a milestone; fourth out-of-sequence explicit-instruction session, adapter-only — mirrors Nmap's own first session's scope exactly) | `scanner_engine/adapters/sqlmap/adapter.py`: `SqlmapAdapter(ActiveScanner)`, following `NmapAdapter`'s exact shape — routes through the existing `validate_target`/`run_scanner_subprocess`, returns the existing `ScanOutput` shape, no new abstractions/registry/pipeline changes, no wiring into `AppState.active_scanners`/`_select_active_scanner`/the `scanner_name` API literal (deferred to a future wiring session, exactly mirroring Nmap's own three-session arc). Target passed to sqlmap's `-u` flag is `validated.original` (the caller's exact target string, e.g. a full URL with a query parameter to actually test), not `validated.hostname` — SQL injection testing needs an endpoint/parameter, not just a bare host; `validate_target`'s SSRF checks already cover whatever host is embedded in it regardless of shape. Flags pinned explicitly rather than left to sqlmap's own defaults: `--batch` (required — without it sqlmap prompts interactively and the subprocess provides no stdin), `--risk=1 --level=1` (least-aggressive payload settings), `--technique=BEUT` (boolean-blind/error-based/UNION/time-blind — excludes `S`, stacked queries, which can run arbitrary additional destructive SQL, mirroring Nmap's own no-privileged/no-exploitative-behavior stance). Output tagged honestly as `"sqlmap-stdout"` — captured stdout text, not a documented machine-readable contract (sqlmap has no `-oX`/`--format=json` equivalent for injection-point findings) — **deliberately has no normalizer** (TD #18): fabricating a parser for sqlmap's human-readable progress/summary text was explicitly rejected as inventing an undocumented contract; `normalize_scan_output("sqlmap-stdout", ...)` currently raises `UnsupportedScanOutputFormatError`, verified by a new test, not just documented. Non-zero-exit/empty-output classification deliberately differs from both existing adapters (documented in the adapter's own code): unlike nmap, a non-zero exit alone is not an automatic hard failure (sqlmap's exit-code convention isn't confidently known); unlike nuclei, truly empty output is *always* a failure regardless of exit code (sqlmap always prints banner/status text on any real run, unlike nuclei's deliberately silent mode). `tests/unit/test_sqlmap_adapter.py` — 9 new tests, fakes/spies only, no real `sqlmap` binary required; 1 new `test_normalization.py` case confirming the unsupported-format claim. No ScannerPort/pipeline/registry changes, no other adapter touched — confirmed by direct diff review. |
+| — | Phase 4 — `sqlmap-stdout` normalizer re-investigation (not a milestone; fifth out-of-sequence explicit-instruction session; TD #18 re-confirmed, not resolved — no code changed) | Explicitly instructed to attempt implementing the normalizer, with a directive to parse only what the repository/tests establish as reliable and to stop and document rather than fabricate if the available output is insufficient. Re-inspected `normalization.py`, both existing normalizers, `SqlmapAdapter`, and `test_sqlmap_adapter.py`, then searched the entire `tests/` tree for any real captured sqlmap output/fixture — found none; the only sqlmap output content anywhere in the repository is `test_sqlmap_adapter.py`'s own `_SAMPLE_OUTPUT`, which the repository itself documents as a fabricated stand-in, not a real reference. Per direct instruction, stopped rather than write a parser grounded in outside knowledge the repository doesn't establish as reliable. Zero files modified; TD #18 (§12) rewritten to record precisely what was re-checked this session, not just re-stated. Verification re-run anyway for a genuine current confirmation (not resting on the prior session's numbers) — see §11. |
 
 Full per-milestone delivery detail, file lists, verification narrative:
 `docs/implementation_progress.md`.
@@ -574,6 +584,51 @@ step completed" to genuine `Scan.status is COMPLETED`, matching its
 nuclei sibling test — the test now actually exercises the new
 normalizer end-to-end rather than working around its prior absence.
 
+**Phase 4 — SQLMap scanner adapter.** Same reconstruct-and-run-in-sandbox
+approach as the Nmap adapter-only session (no command-execution tool
+exists against the real repository — §15), reusing the still-intact
+sandbox. `SqlmapAdapter` plus its direct dependencies
+(`ScannerPort`/`ScanOutput`, `validate_target`, `run_scanner_subprocess`,
+`utcnow`) were exercised alongside the unmodified `NmapAdapter`/
+`NucleiAdapter`/`base_scanner` test files, to check for regressions on
+code this session did not touch. **`pytest tests/ -q` → 99 passed, 0
+failed** (9 new `test_sqlmap_adapter.py` cases — argv construction with/
+without `extra_args`, missing binary, timeout propagation, non-zero
+exit tolerated with output present, empty output always a failure
+regardless of exit code, target-validated-before-subprocess-call; 1 new
+`test_normalization.py` case confirming `"sqlmap-stdout"` currently
+raises `UnsupportedScanOutputFormatError`; 89 pre-existing cases across
+every other test file, confirming zero regression). Ruff (lint +
+format, `--fix` applied for two auto-fixable line-length findings) and
+MyPy `--strict` both clean on all three changed/new files
+(`adapter.py`, `test_sqlmap_adapter.py`, `test_normalization.py`) and on
+the full package (103 source files, whole-package sweep — up one file
+from the new adapter). Byte-count integrity check (`get_file_info` vs.
+sandbox `wc -c`) confirmed an exact-match transplant for all files
+touched (`adapter.py`: 6660 bytes; `test_sqlmap_adapter.py`: 8458 bytes;
+`test_normalization.py`: 11137 bytes), clean on the first attempt.
+**Not verified:** a real `sqlmap` binary (same documented gap as
+`NucleiAdapter`/`NmapAdapter` — TD #17); no pipeline/API wiring (not
+requested this session — mirrors Nmap's own adapter-only first session
+exactly, TD to be resolved in a future wiring session same as Nmap's
+was). No `ScannerPort`, pipeline, other-adapter, or normalization-dispatch
+file was changed beyond the one honest addition of a test confirming
+the already-existing `UnsupportedScanOutputFormatError` path —
+confirmed by direct diff review, not just by claim.
+
+**TD #18 re-investigation (no code changed).** A follow-up session
+explicitly instructed to attempt the `sqlmap-stdout` normalizer, with a
+directive to stop and document rather than fabricate if the repository
+doesn't establish a reliable format. It doesn't (re-confirmed by a fresh
+search, not just citing the prior session's note — see TD #18's own
+updated entry for exactly what was checked). Zero files were modified.
+Still re-ran verification for a genuine, current confirmation rather
+than resting on the prior session's numbers: **`pytest tests/ -q` → 99
+passed, 0 failed** (unchanged from the SQLMap adapter session, as
+expected — no code changed). Ruff (lint + format) and MyPy `--strict`
+both still clean on `normalization.py`, `sqlmap/adapter.py`,
+`test_sqlmap_adapter.py`, `test_normalization.py`.
+
 ## 12. Active technical debt
 
 1. `domain/shared/enums.py` — staging area for enums belonging to
@@ -650,16 +705,61 @@ normalizer end-to-end rather than working around its prior absence.
     `EXECUTE_SCANNER`-only assertion — see §7/§11). Still a plain
     if/elif dispatch in `normalize_scan_output`, not a `NormalizerPort`
     — see §4.
+17. **`SqlmapAdapter` verified only against a patched
+    `run_scanner_subprocess`** — no real `sqlmap` binary reachable in
+    the verification environment. Same shape as TD #7 (`NucleiAdapter`)/
+    TD #15 (`NmapAdapter`); resolved the same way when a real-binary
+    CI/sandbox image exists.
+18. **No `sqlmap-stdout` normalizer, and not a placeholder pending more
+    parsing effort — a deliberate, explained gap, re-investigated once
+    and re-confirmed, not just carried forward unexamined.** Unlike
+    nmap/nuclei, sqlmap has no official machine-readable output mode for
+    its injection-detection results (no `-oX`/`--format=json`
+    equivalent; its real structured artifacts — the per-target session
+    SQLite database, the per-target log file — live under
+    `--output-dir` on disk, not on the single subprocess's stdout this
+    codebase's adapters capture). Writing a normalizer would mean
+    parsing sqlmap's human-readable progress/summary text well enough to
+    assert confidence in specific injection techniques/payloads
+    detected — explicitly rejected as fabricating parsed vulnerability
+    data from an undocumented contract, per direct instruction, twice
+    now. **Re-investigation session:** explicitly instructed to attempt
+    implementation, with a directive to parse only what the repository/
+    tests establish as reliable and to stop and document if the
+    available output is insufficient, rather than fabricate. Searched
+    the entire `tests/` tree (`search_files`/`directory_tree`, not just
+    the files already known) for any real captured sqlmap output,
+    fixture, or sample file — found none. The *only* sqlmap output
+    content anywhere in this repository is `test_sqlmap_adapter.py`'s
+    own `_SAMPLE_OUTPUT` constant, which is itself explicitly commented
+    as "a plausible stand-in... not a byte-perfect reproduction of real
+    sqlmap output" — i.e. the repository itself documents that nothing
+    reliable exists to parse. Per that explicit instruction, no
+    normalizer was written; no code was changed this session at all
+    (confirmed via a fresh, genuine pytest/Ruff/MyPy-strict re-run on
+    the unmodified codebase, not just citing the prior session's
+    numbers — see §11). `SqlmapAdapter` itself remains complete and
+    fully tested; `normalize_scan_output("sqlmap-stdout", ...)` still
+    raises `UnsupportedScanOutputFormatError`, verified by the existing
+    test. Not yet reachable via the public API at all (no pipeline/API
+    wiring exists for `sqlmap` yet). Revisit only if a reliable,
+    sqlmap-documented structured output mode is identified, or if real
+    captured sqlmap output is added to this repository as a genuine
+    fixture a parser could be built and verified against, or if a
+    deliberately conservative, explicitly-fragility-flagged text parser
+    is later judged worth the risk by a human decision — not by
+    guessing at stdout formatting from memory a third time.
 
 ## 13. Deferred / excluded work
 
 - Findings/Assets/Reporting application-layer use cases and HTTP routes.
 - `EventBusPort` and its implementation; `FindingCreated` publication
   (planned, no port yet).
-- Remaining 13 scanner adapters (Phase 4 — burp, zap, reconx,
-  bughunter, sqlmap, etc.; nmap now done and fully wired — selection,
+- Remaining 12 scanner adapters (Phase 4 — burp, zap, reconx,
+  bughunter, etc.; nmap now done and fully wired — selection,
   execution, and normalization — into the pipeline/API, see §7/§11/
-  TD #15/TD #16).
+  TD #15/TD #16; sqlmap's adapter is done but not yet wired into the
+  pipeline/API and has no normalizer, see §7/§11/TD #17/TD #18).
 - OpenAI/Ollama/OpenRouter `AIProviderPort` implementations (deferred
   until a second real provider shape is known).
 - Network-isolated `scanner_worker` split (TD #12).
@@ -774,6 +874,45 @@ asserting true `Scan.status is COMPLETED`, not just adapter selection.
 Nothing here changes Step 5's own status either — still awaiting a
 scope decision, unaffected by this session.
 
+**Fourth out-of-sequence session (explicit instruction, after a
+clarifying question about which of the five remaining Phase 4 stubs to
+build next — burp/zap turned out to be `ImportScanner`-shaped, a
+different architecture; reconx/bughunter have no available spec in this
+repo; sqlmap was the only remaining stub matching Nmap/Nuclei's
+`ActiveScanner` pattern): Phase 4 — SQLMap scanner adapter — complete,
+adapter-only, see §7/§11/TD #17/TD #18.** Mirrors Nmap's own first
+session's scope exactly: `SqlmapAdapter` only, no pipeline/API wiring,
+no `ScannerPort`/registry/factory changes, no other adapter touched.
+The one design question this session had to resolve carefully —
+sqlmap has no documented machine-readable output contract the way
+nuclei/nmap do — was resolved per explicit instruction: rather than
+inventing an undocumented contract or fabricating a fragile text parser
+from memory, the adapter captures sqlmap's stdout honestly (tagged
+`"sqlmap-stdout"`) and **deliberately has no normalizer** (TD #18,
+verified by a real test that `UnsupportedScanOutputFormatError` is
+still raised, not just documented) — the same "preserve the existing
+model rather than fabricate" choice the instructions explicitly
+authorized. Nothing here changes Step 5's own status — still awaiting
+a scope decision, unaffected by this session.
+
+**Fifth out-of-sequence session (explicit instruction: attempt TD #18
+directly, with the same "stop and document rather than fabricate"
+safety valve made explicit up front): `sqlmap-stdout` normalizer —
+re-investigated, re-confirmed unresolved, see §7/§11/TD #18.** Not a
+repeat of the prior session's conclusion without checking — a fresh
+search of the entire `tests/` tree for any real captured sqlmap output
+or fixture, finding none; the only sqlmap output content anywhere in
+this repository remains `test_sqlmap_adapter.py`'s own `_SAMPLE_OUTPUT`,
+which the repository itself documents as fabricated, not real. Per
+direct instruction to parse only what the repository/tests establish as
+reliable, and given nothing is established as reliable, **zero files
+were modified this session** — no normalizer, no adapter change, no
+test change. TD #18's own entry (§12) was rewritten to record precisely
+what this session checked, so a future session (or Madhav) can see this
+was genuinely re-examined, not just left stale. Nothing here changes
+Step 5's own status — still awaiting a scope decision, unaffected by
+this session.
+
 **Phase 3 (frontend) implementation is approved and in progress**,
 following the 5-step plan (scaffold → API client infra → auth/session
 flow → organization + scan lifecycle UI → tests), one step at a time
@@ -830,5 +969,7 @@ Other backend-scope candidates, unrelated to Phase 3 frontend and still
 awaiting a scope decision: OAuth/MFA/password reset/email verification,
 a CSRF double-submit token, TD #12 (scanner_worker split),
 Findings/Assets/Reporting HTTP surface, full organization management,
-remaining Phase 4 scanner adapters (burp/zap/reconx/bughunter/sqlmap —
-§13; explicitly not started per this session's stop-after-Nmap scope).
+a future SQLMap pipeline/API wiring session (mirroring Nmap's own
+second session — TD #18 would still block full completion even once
+wired), remaining Phase 4 scanner adapters (burp/zap/reconx/bughunter
+— §13).
