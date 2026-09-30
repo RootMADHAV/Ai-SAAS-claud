@@ -61,6 +61,24 @@ class Settings(BaseSettings):
     minio_root_user: str | None = None
     minio_root_password: str | None = None
     minio_bucket: str | None = None
+    # PROJECT_STATE.md Phase 5 Milestone 2: Qdrant runs from day one, but
+    # was historically unused until Phase 5 RAG. Deliberately NOT
+    # validated in check_role_boundaries below the way anthropic_api_key
+    # is for worker_role=ingestion_worker -- Milestone 4's AnalysisService
+    # already treats its embedding_port/vector_store constructor
+    # parameters as fully optional (default None) and degrades to its
+    # pre-Milestone-4 behavior whenever either is absent, so requiring
+    # this value would be a bigger behavior change than Phase 5 has
+    # actually made: a scan can run, and always could, with no Qdrant
+    # configured at all. app/workers/tasks.py's
+    # _run_scan_workflow_from_settings (ingestion_worker's own
+    # composition root, via its _build_analysis_service helper) is the
+    # only place this value is ever read -- never in app/main.py's
+    # _lifespan (worker_role=api), which has never constructed
+    # AnalysisService at all since Milestone 7 -- so its role-gating is
+    # enforced by usage, the same way anthropic_api_key's is, just
+    # without an additional requiredness check here since nothing about
+    # this value is a hard precondition for a scan to complete.
     qdrant_url: str | None = None
 
     jwt_secret: str | None = None
@@ -158,6 +176,12 @@ class Settings(BaseSettings):
                 "ANTHROPIC_API_KEY is required for worker_role=ingestion_worker when "
                 "AI_DEFAULT_PROVIDER=anthropic (the default)"
             )
+
+        # Deliberately no analogous requiredness check for qdrant_url
+        # here -- see that field's own comment above for why: unlike
+        # anthropic_api_key just above, it is not a hard precondition
+        # for a scan to complete (AnalysisService's retrieval is
+        # optional-by-design, Phase 5 Milestone 4).
 
         if self.environment is Environment.PRODUCTION:
             if self.jwt_secret is not None and self.jwt_secret in _DEV_ONLY_SECRETS:

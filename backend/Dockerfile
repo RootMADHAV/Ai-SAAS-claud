@@ -17,6 +17,17 @@ FROM python:3.12-slim AS builder
 
 WORKDIR /build
 
+# Whether to install the Phase 5 RAG dependency stack (`sentence-
+# transformers` + `qdrant-client`, backend/pyproject.toml's `rag`
+# optional-dependency group) into this image -- "true" for the `worker`
+# service only (docker-compose.yml's `worker` build args), never for
+# `backend`/api, which never constructs either adapter (see
+# app/workers/tasks.py's `_build_analysis_service` -- imported lazily,
+# only inside ingestion_worker's own composition root). Defaults to
+# "false" so an unmodified `docker build` (or any build that doesn't
+# pass this arg) gets the smaller, RAG-free image -- the safer default.
+ARG INSTALL_RAG_DEPENDENCIES=false
+
 # Only pyproject.toml first, so Docker's layer cache is invalidated by a
 # dependency change, not by every application source-code change.
 COPY pyproject.toml ./
@@ -24,8 +35,27 @@ COPY app ./app
 
 RUN python -m venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
-RUN pip install --no-cache-dir --upgrade pip \
-    && pip install --no-cache-dir .
+RUN pip install --no-cache-dir --upgrade pip
+# CPU-only PyTorch, installed from PyTorch's own CPU wheel index BEFORE
+# sentence-transformers -- the default PyPI `torch` wheel bundles the
+# full CUDA/NVIDIA runtime regardless of whether a GPU is present
+# (Technical Debt #19, PROJECT_STATE.md section 12): confirmed in a
+# Phase 5 Milestone 1 sandbox install to add ~5.8GB, ~3.2GB of it pure
+# CUDA, for an adapter (SentenceTransformerEmbeddingPort) that is
+# CPU-only by design and never touches a GPU. Installing the CPU wheel
+# first satisfies sentence-transformers' own torch dependency before
+# pip ever gets a chance to resolve the CUDA-bundled one. NOTE: this
+# exact install step could not be executed/verified in this milestone's
+# sandbox -- download.pytorch.org is outside that sandbox's network
+# allowlist (the same limitation already recorded against TD #19) -- so
+# this is the standard, documented PyTorch CPU-install technique,
+# reproducible in a real Docker build, not one confirmed working here.
+RUN if [ "$INSTALL_RAG_DEPENDENCIES" = "true" ]; then \
+        pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu && \
+        pip install --no-cache-dir ".[rag]"; \
+    else \
+        pip install --no-cache-dir .; \
+    fi
 
 FROM python:3.12-slim AS runtime
 

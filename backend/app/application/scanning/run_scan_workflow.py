@@ -594,6 +594,7 @@ class RunScanWorkflowUseCase:
                         finding_id=finding.id,
                         prompt_version=PROMPT_VERSION,
                         created_at=pipeline_run_at,
+                        kb_version=item.ai_analysis.kb_version,
                         model_metadata=dict(item.ai_analysis.model_metadata),
                         ai_summary=item.ai_analysis.ai_summary,
                         ai_severity_estimate=item.ai_analysis.ai_severity_estimate,

@@ -21,6 +21,22 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# Phase 5 (RAG): sentence-transformers + qdrant-client, split out of the
+# base `dependencies` list above in Milestone 5 -- only
+# worker_role=ingestion_worker ever constructs either adapter
+# (app/workers/tasks.py's _build_analysis_service), so only that
+# process's Docker image needs them installed. Keeping them in the base
+# list would put both, including the CPU-only-by-design
+# sentence-transformers/torch stack (Technical Debt #19), on
+# worker_role=api's image for no reason. See backend/Dockerfile's
+# INSTALL_RAG_DEPENDENCIES build arg for where this group is actually
+# consumed, and `dev` below for why local/CI test runs still get it
+# unconditionally.
+rag = [
+    "sentence-transformers>=3.0",
+    "qdrant-client>=1.9",
+]
+
 # Grows per milestone. Do not add a dependency here until code in this
 # repo actually imports it -- an unused entry is a lie about what's built.
 dev = [
@@ -31,6 +47,17 @@ dev = [
     "mypy>=1.10",
     "httpx>=0.27",
     "celery-types>=0.22",
+    # Self-referential extra: every test file that imports Phase 5 code
+    # (test_sentence_transformer_provider.py, test_qdrant_vector_store.py,
+    # test_ingest_cwe_top25.py, test_analysis_service.py, and Milestone
+    # 5's own worker-composition tests) needs `rag` importable regardless
+    # of which Docker image would eventually run that code for real --
+    # `pip install -e ".[dev]"` is this project's one established
+    # local/CI verification command (PROJECT_STATE.md section 11), and
+    # it must keep working unchanged, not silently start failing at
+    # test-collection time because sentence-transformers/qdrant-client
+    # moved out of the base dependency list this milestone.
+    "security-platform-backend[rag]",
 ]
 
 [build-system]

@@ -73,6 +73,37 @@ docs/implementation_progress.md for the full account:
     per ``RunScanWorkflowUseCase``'s own docstring) already gives a
     human or a future scheduled job a correct way to retry, without
     needing Celery's own retry machinery layered on top of it.
+
+Phase 5 Milestone 5: ``_run_scan_workflow_from_settings`` (layer 2)
+conditionally constructs ``SentenceTransformerEmbeddingPort``/
+``QdrantVectorStorePort`` and wires them into ``AnalysisService``,
+alongside the existing ``AnthropicProvider`` -- via a small
+``_build_analysis_service`` helper, so the ``assert settings.
+anthropic_api_key is not None`` mypy-narrowing pattern below stays
+effective (see that helper's own docstring). Both are imported
+*lazily*, inside ``_build_analysis_service``'s own RAG-configured
+branch, not at this module's own top -- this module is imported by
+``app/api/dependencies.py`` (and therefore ``app/main.py``, the API
+process) purely to get the ``run_scan_workflow_task`` Celery task
+*object* so a route can call ``.delay(...)`` on it; the API process
+never executes this module's own composition-root function bodies. A
+top-level import here would force the API process's own image to have
+``sentence-transformers``/``qdrant-client`` installed too, just to
+import a task definition whose body it never runs (exactly the
+"unnecessarily in the API process" outcome Milestone 5's own
+instructions rule out). ``backend/pyproject.toml``'s new ``rag``
+optional-dependency group and ``backend/Dockerfile``'s
+``INSTALL_RAG_DEPENDENCIES`` build arg are what actually keep these
+packages out of the ``backend`` image; this lazy import is necessary
+but not sufficient on its own.
+
+When ``settings.qdrant_url`` is ``None`` (unset), ``AnalysisService`` is
+constructed exactly as it was before this milestone --
+``AnalysisService(provider=provider)``, the identical call shape -- so
+a deployment that has not configured Qdrant behaves exactly as it did
+pre-Phase-5: retrieval was always optional-by-design (Milestone 4), and
+this composition root preserves that all the way out to "not configured
+at all is a fully supported, unchanged configuration."
 """
 
 from __future__ import annotations
@@ -82,8 +113,10 @@ from typing import TYPE_CHECKING
 from uuid import UUID
 
 from app.ai_agents.analysis_service import AnalysisService
+from app.application.interfaces.ai_provider_port import AIProviderPort
 from app.application.interfaces.scanner_port import ActiveScanner
 from app.application.interfaces.storage_port import StoragePort
+from app.application.knowledge.ingest_cwe_top25 import CORPUS_NAME
 from app.application.scanning.run_scan_workflow import RunScanWorkflowUseCase, ScannerMismatchError
 from app.config import get_settings
 from app.infrastructure.ai_providers.anthropic_provider import AnthropicProvider
@@ -164,6 +197,41 @@ def _select_active_scanner(scanner_name: str) -> ActiveScanner:
     )
 
 
+def _build_analysis_service(*, provider: AIProviderPort, qdrant_url: str | None) -> AnalysisService:
+    """Constructs ``AnalysisService``, with CWE retrieval wired in only
+    when ``qdrant_url`` is configured -- see this module's own docstring
+    on the lazy imports below and why an unconfigured Qdrant URL must
+    produce the exact same ``AnalysisService(provider=provider)`` call
+    shape this composition root always made before Milestone 5.
+
+    Takes an already-constructed ``provider`` rather than building
+    ``AnthropicProvider`` itself, so the ``assert settings.
+    anthropic_api_key is not None`` a few lines above in
+    ``_run_scan_workflow_from_settings`` (mypy strict narrowing, per
+    this module's own existing comment on that pattern) stays effective
+    in the scope that needs it -- mypy does not carry an ``assert``'s
+    narrowing across a function call.
+    """
+    if qdrant_url is None:
+        return AnalysisService(provider=provider)
+
+    from app.infrastructure.embeddings.sentence_transformer_provider import (
+        EMBEDDING_VECTOR_SIZE,
+        SentenceTransformerEmbeddingPort,
+    )
+    from app.infrastructure.vector_store.qdrant_vector_store import QdrantVectorStorePort
+
+    return AnalysisService(
+        provider=provider,
+        embedding_port=SentenceTransformerEmbeddingPort(),
+        vector_store=QdrantVectorStorePort(
+            url=qdrant_url,
+            collection_name=CORPUS_NAME,
+            vector_size=EMBEDDING_VECTOR_SIZE,
+        ),
+    )
+
+
 async def _run_scan_workflow_from_settings(
     organization_id: UUID, scan_id: UUID, scanner_name: str
 ) -> None:
@@ -209,6 +277,8 @@ async def _run_scan_workflow_from_settings(
             "as of Milestone 6 -- only 'anthropic' does"
         )
     assert settings.anthropic_api_key is not None
+    provider = AnthropicProvider(api_key=settings.anthropic_api_key, model=settings.ai_model)
+    analysis_service = _build_analysis_service(provider=provider, qdrant_url=settings.qdrant_url)
 
     engine = create_engine(settings)
     try:
@@ -221,11 +291,7 @@ async def _run_scan_workflow_from_settings(
                 secret_key=settings.minio_root_password,
                 bucket=settings.minio_bucket,
             ),
-            analysis_service=AnalysisService(
-                provider=AnthropicProvider(
-                    api_key=settings.anthropic_api_key, model=settings.ai_model
-                )
-            ),
+            analysis_service=analysis_service,
             organization_id=organization_id,
             scan_id=scan_id,
         )

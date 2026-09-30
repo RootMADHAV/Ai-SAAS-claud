@@ -9,4 +9,14 @@ Milestone 3: ``scanner_port.py`` (``ScannerPort``/``ActiveScanner``/
 Milestone 6: ``ai_provider_port.py`` (``AIProviderPort``,
 ``AICompletionResult``, ``AIProviderError``) is now implemented.
 ``EventBusPort`` is not yet implemented -- see PROJECT_STATE.md.
+
+Phase 5 Milestone 1: ``embedding_port.py`` (``EmbeddingPort``,
+``EmbeddingResult``, ``EmbeddingError``) is now implemented -- a
+separate port from ``AIProviderPort`` by design, see that module's
+docstring.
+
+Phase 5 Milestone 2: ``vector_store_port.py`` (``VectorStorePort``,
+``VectorPoint``, ``VectorMatch``, ``VectorStoreError``) is now
+implemented -- collection init, upsert, and similarity search only, no
+delete/update. Not yet wired into application startup.
 """

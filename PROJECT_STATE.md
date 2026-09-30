@@ -65,7 +65,8 @@ repository port per bounded context. `EventBusPort` — planned
 | Database | PostgreSQL with Row-Level Security |
 | Cache/queue | Redis, Celery |
 | Object storage | MinIO, behind `StoragePort` |
-| Vector DB | Qdrant (running, unused until Phase 5 RAG) |
+| Vector DB | Qdrant, behind `VectorStorePort` (Phase 5 Milestone 2 -- collection init/upsert/search only; wired into `ingestion_worker`'s composition root as of Milestone 5, conditional on `QDRANT_URL`) |
+| Embeddings | `sentence-transformers` (local, CPU-only, `all-MiniLM-L6-v2` default) behind `EmbeddingPort` (Phase 5 Milestone 1; wired alongside Qdrant as of Milestone 5) |
 | AI providers | Anthropic (built); OpenAI/Ollama/OpenRouter deferred, behind `AIProviderPort` |
 | Auth | JWT httpOnly cookies (access) + opaque hashed/rotating refresh token (also httpOnly cookie) |
 | IDs | ULID, generated in app code, stored as native Postgres UUID |
@@ -177,6 +178,134 @@ diverging (§14). Full rationale: `docs/implementation_progress.md`.
   previously-hit bug, not a style preference).
 - `DomainEvent` base is not `slots=True`; `utcnow()` is a plain function,
   not an injectable `Clock` — both YAGNI until a real need appears.
+- **Phase 5 planning decision: `EmbeddingPort` is a separate port from
+  `AIProviderPort`, not an extension of it** — different capability
+  shape (text → vector, not text → text), same reasoning that already
+  split `ScannerPort` into `ActiveScanner`/`ImportScanner`. Concrete
+  adapter: local `sentence-transformers` (`all-MiniLM-L6-v2`), CPU-only
+  by design (no CUDA/GPU handling attempted). Belongs to
+  `ingestion_worker`, the same process `AnthropicProvider`/
+  `AnalysisService` already belong to — nothing constructs it from
+  `backend` (see `app/config.py`'s `check_role_boundaries`). Initial
+  knowledge corpus (also locked): CWE Top 25 (MITRE/CISA), one chunk
+  per entry — ingestion is not yet built (Milestone 1 only implemented
+  the port + adapter, see §7).
+- **Phase 5 Milestone 2: `VectorStorePort` mirrors `StoragePort`'s own
+  binding rule** — one instance bound to exactly one collection (and,
+  for the concrete adapter, its vector size/distance) at construction,
+  never a per-call parameter. Scoped to exactly three operations
+  (`ensure_collection`, `upsert`, `search`) — no delete/update/filter/
+  pagination, matching the planned Milestone 3/4 flow only. Concrete
+  adapter (`QdrantVectorStorePort`) uses `qdrant-client`'s native
+  `AsyncQdrantClient` directly, not `asyncio.to_thread` — unlike Minio/
+  sentence-transformers, this SDK already ships a real async client,
+  mirroring `AnthropicProvider`'s own precedent. Default distance
+  metric: cosine (standard for sentence-transformers embeddings).
+  Point ids must be UUID-formatted strings or unsigned integers — a
+  Qdrant server-side constraint; a natural id that isn't already
+  UUID-shaped (e.g. "CWE-79") needs a deterministic UUID derived from
+  it before Milestone 3 can write it. Not wired into application
+  startup; TD #19 (CPU-only PyTorch footprint) is unrelated to this
+  milestone and remains deferred to Milestone 5.
+- **Phase 5 Milestone 3: CWE Top 25 ingestion is a plain module of
+  three pure functions + one constructor-injected use case, not a
+  class hierarchy** -- `parse_cwe_top25_xml` (source parsing/
+  filtering), `build_cwe_chunk` (chunk-text construction), and
+  `cwe_point_id` (deterministic id) are independently testable module-
+  level functions; `IngestCweTop25UseCase` orchestrates them plus
+  `EmbeddingPort`/`VectorStorePort` (both constructor-injected,
+  mirroring `TriggerScanUseCase`'s own convention). Deliberately kept
+  independent of `AnalysisService` -- lives in the new
+  `app/application/knowledge/` folder, not `app/ai_agents/`. Corpus
+  source: `backend/data/cwe/2025_top25.xml`, the vendored official
+  MITRE CWE View-1435 XML export for the 2025 Top 25 (Madhav placed
+  the file directly; not downloaded or reconstructed from memory --
+  see §16 for the blocker this resolved). Deterministic point ids:
+  `uuid.uuid5(uuid.NAMESPACE_URL, f"https://cwe.mitre.org/data/
+  definitions/{cwe_id}.html")` -- reproducible without this module
+  inventing its own namespace UUID, and safe for `upsert`'s insert-or-
+  replace semantics on a re-run. Parser validates defensively (root
+  `Name` contains "2025"/"Top 25", exactly 25 `Weakness` elements,
+  every entry has an id/name/description) and raises `CweSourceError`
+  -- a new exception distinct from `EmbeddingError`/`VectorStoreError`
+  -- rather than silently proceeding on a malformed or substituted
+  source. No refresh/update mechanism -- static one-time ingestion is
+  the locked MVP scope (a future year's list is a new corpus decision,
+  not a parameter of this one).
+- **Phase 5 Milestone 4: retrieval lives entirely inside
+  `AnalysisService`, not in `RunScanWorkflowUseCase`.** `EmbeddingPort`/
+  `VectorStorePort` are optional constructor-injected dependencies on
+  `AnalysisService` (default `None`, mirroring `AIProviderPort`'s own
+  DI convention) -- when both are supplied, `analyze()` embeds a query
+  built from the finding's own title/description, retrieves a small
+  top-k (default 3) set of CWE matches, and includes them in the
+  prompt as clearly-labeled reference context, never as instructions.
+  A retrieval-layer failure (`EmbeddingError`/`VectorStoreError` from
+  either port) or zero matches degrades to exactly the pre-Milestone-4
+  prompt/behavior -- never fails `analyze()`. `PROMPT_VERSION` bumped
+  to `"v2"`. Provenance (retrieved CWE ids/scores, embedding model,
+  corpus/version, top-k limit -- never a raw vector) is added to
+  `FindingAnalysis.model_metadata`'s `"retrieval"` key only when there
+  was at least one match. `run_scan_workflow.py` needed **zero**
+  changes -- it only imports the `PROMPT_VERSION` symbol and
+  constructs `AnalysisService(provider=...)`, both unchanged-compatible
+  call shapes. **Note for a future session:** `FindingAnalysis` already
+  has its own dedicated `kb_version: str | None` column (migrated since
+  Milestone 2, docstring: "nullable -- no RAG until Phase 5"), clearly
+  provisioned for exactly this purpose -- this milestone deliberately
+  did not populate it, since the instruction named `model_metadata`
+  specifically and populating `kb_version` too would have meant
+  changing `FindingAnalysisResult`'s shape and `_persist`'s call, a
+  larger footprint than asked for. Worth a explicit decision in a
+  future session, not a silent choice either way.
+- **Phase 5 Milestone 5: RAG wiring lives in `app/workers/tasks.py`'s
+  new `_build_analysis_service` helper, never in `app/main.py`.**
+  `_run_scan_workflow_from_settings` (ingestion_worker's composition
+  root) calls it with an already-constructed `provider` (so the
+  `assert settings.anthropic_api_key is not None` mypy-narrowing a few
+  lines above stays effective -- mypy does not carry an assert's
+  narrowing across a function call) and `settings.qdrant_url`. When
+  `qdrant_url` is `None`, the call is `AnalysisService(provider=
+  provider)` -- byte-identical to the pre-Milestone-5 shape. When set,
+  `SentenceTransformerEmbeddingPort`/`QdrantVectorStorePort` are
+  imported *lazily*, inside that helper's own RAG-configured branch,
+  not at `tasks.py`'s top -- `app/api/dependencies.py` (and therefore
+  `app/main.py`, the API process) imports this module purely for the
+  `run_scan_workflow_task` Celery task object, never executing this
+  composition root's own function bodies, so a top-level import would
+  force `backend`'s image to have `sentence-transformers`/
+  `qdrant-client` installed for no reason. `qdrant_url` itself stays
+  unvalidated in `check_role_boundaries` (unlike `anthropic_api_key`)
+  -- requiring it would be a bigger behavior change than Phase 5 has
+  made: a scan can run, and always could, with no Qdrant configured,
+  since `AnalysisService`'s retrieval is optional-by-design (Milestone
+  4). Collection name: `IngestCweTop25UseCase`'s own `CORPUS_NAME`
+  (`"cwe_top25"`), imported, not duplicated as a literal. Vector size:
+  a new `EMBEDDING_VECTOR_SIZE = 384` constant on
+  `SentenceTransformerEmbeddingPort` itself (co-located with
+  `DEFAULT_MODEL_NAME`, since it's a fixed fact about that one model,
+  not a general property this adapter could vary independently).
+  **`FindingAnalysis.kb_version` is now populated** (resolving
+  Milestone 4's own open note above): confirmed, by inspecting the ORM
+  model and repository mapping, to be the intended persisted
+  representation (an already-migrated, dedicated column whose own
+  docstring reads "nullable -- no RAG until Phase 5") -- a new
+  `_build_kb_version` helper in `analysis_service.py` sets it to
+  `"<corpus>:<corpus_version>"` (e.g. `"cwe_top25:2025"`) when
+  retrieval had at least one match, else `None`, threaded through
+  `FindingAnalysisResult` and `_persist`. **TD #19 (CPU-only PyTorch)
+  addressed in code/config this session, not build-verified** --
+  `backend/pyproject.toml` gained a `rag` optional-dependency group
+  (`sentence-transformers`/`qdrant-client`, split out of the base
+  `dependencies` list; `dev` self-references it so `pip install -e
+  ".[dev]"` keeps working unchanged), and `backend/Dockerfile` gained
+  an `INSTALL_RAG_DEPENDENCIES` build arg (default `false`) that,
+  when `"true"`, installs `torch` from PyTorch's own CPU wheel index
+  before `pip install ".[rag]"`. `docker-compose.yml`'s `worker`
+  service passes that arg; `backend` does not, so it gets the smaller,
+  RAG-free image via the Dockerfile's own default. Neither the CPU-only
+  torch install nor the image-size reduction could be verified by an
+  actual Docker build this session -- see §11/TD #19.
 
 ## 5. Folder structure (current)
 
@@ -186,17 +315,27 @@ Root: `PROJECT_STATE.md`, `README.md`, `docker-compose.yml`,
 pending — §13), `frontend/` (Phase 3, scaffold + API client + auth flow
 + org/scan UI complete — §7).
 
-`backend/`: `pyproject.toml`, `Dockerfile`, `.dockerignore`,
+`backend/`: `pyproject.toml` (base `dependencies` + `dev`/`rag`
+optional groups as of Phase 5 Milestone 5, see §4/§10), `Dockerfile`
+(`INSTALL_RAG_DEPENDENCIES` build arg as of Milestone 5, see §4),
+`.dockerignore`,
 `alembic.ini`, `alembic/env.py`,
-`alembic/versions/6bdbf0ab25b0_initial_schema.py` (19 tables + RLS).
+`alembic/versions/6bdbf0ab25b0_initial_schema.py` (19 tables + RLS),
+`data/cwe/2025_top25.xml` (vendored official MITRE CWE View-1435 XML
+export, 2025 Top 25 — Phase 5 Milestone 3's corpus source of truth,
+placed directly by Madhav, not downloaded by Claude — see §4/§16).
 
 `backend/app/` (`main.py`, `config.py` at top level), mirroring the
 bounded contexts in §2 under each layer:
 - `domain/{shared,findings,scanning,assets,identity,reporting}/` —
   entities/value objects done for all six.
 - `application/interfaces/` (all repository ports + `ScannerPort`,
-  `StoragePort`, `AIProviderPort`, `RefreshTokenRepositoryPort`;
-  `EventBusPort` pending), `application/scanning/` (done),
+  `StoragePort`, `AIProviderPort`, `RefreshTokenRepositoryPort`,
+  `EmbeddingPort`, `VectorStorePort` (Phase 5 Milestones 1-2);
+  `EventBusPort` pending),
+  `application/knowledge/` (`IngestCweTop25UseCase`, Phase 5
+  Milestone 3 — deliberately independent of `ai_agents/`),
+  `application/scanning/` (done),
   `application/identity/` (done; invite/membership pending),
   `application/{assets,findings,reporting}/` (empty scaffolds).
 - `api/dependencies.py`,
@@ -207,14 +346,29 @@ bounded contexts in §2 under each layer:
   (`MinioStoragePort`), `infrastructure/security/` (`target_validation`,
   `password_hashing`, `token_service`), `infrastructure/ai_providers/`
   (`anthropic_provider`; OpenAI/Ollama/OpenRouter pending),
-  `infrastructure/{vector_store,event_bus,observability}/` (empty).
+  `infrastructure/embeddings/` (`SentenceTransformerEmbeddingPort`,
+  Phase 5 Milestone 1), `infrastructure/vector_store/`
+  (`QdrantVectorStorePort`, Phase 5 Milestone 2),
+  `infrastructure/{event_bus,observability}/` (empty).
 - `scanner_engine/adapters/{nuclei,nmap,sqlmap}/` (done, `sqlmap`
   adapter-only — no pipeline/API wiring, no normalizer yet, see §7);
-  `burp`/`zap`/`reconx`/`bughunter` (empty Phase-4 stubs).
-- `ai_agents/analysis_service.py` (no `BaseAgent` yet);
-  `workers/{celery_app,tasks}.py`.
+  `burp`/`zap` (empty Phase-4 `ImportScanner`-shaped stubs).
+  `reconx`/`bughunter` — permanently excluded from this project's
+  scanner roster by explicit decision (Madhav's own separate, earlier
+  ReconX/BugHunter PRO projects; not reused, ported, reconstructed, or
+  referenced going forward — see §13). Their now-orphaned stub folders
+  were confirmed unused (no imports, no tests, no wiring anywhere in
+  this repository) and safe to delete, but could not actually be
+  removed this session — the Filesystem MCP connector exposes no
+  delete/rmdir tool (see §15); flagged for manual deletion or a future
+  session with delete capability.
+- `ai_agents/analysis_service.py` (no `BaseAgent` yet; Phase 5
+  Milestone 4 added optional CWE-retrieval, see §4; Milestone 5
+  populated `kb_version`);
+  `workers/{celery_app,tasks}.py` (`tasks.py`'s `_build_analysis_service`
+  wires Phase 5 retrieval as of Milestone 5, see §4).
 
-`backend/tests/`: `conftest.py`; `unit/` (32 files); `integration/`
+`backend/tests/`: `conftest.py`; `unit/` (36 files); `integration/`
 (`support.py` + 13 files, against real Postgres).
 
 ## 6. Domain model summary
@@ -253,11 +407,16 @@ transition *enforcement* still requires future use cases.
 | — | Auth — logout endpoint (not a milestone) | `POST /api/v1/auth/logout`: `LogoutUseCase` (`app/application/identity/logout.py`, tolerant of an unknown/already-revoked token — treated as a successful no-op, not an error) revokes the presented refresh token via the same `RefreshTokenRepositoryPort.revoke` rotation already exercises; `_clear_auth_cookies()` (`app/api/v1/auth.py`) clears both cookies with the same attributes `_set_auth_cookies` used to set them. Deliberately does not depend on `get_current_user` — an expired access token must not block logout. 204, no body either way. See §8/§9. |
 | — | Phase 3 frontend — Step 3: auth/session flow (not a milestone) | `frontend/src/lib/auth/`: `AuthProvider`/`useAuth` (client-side session-state mirror — never reads/stores a token, only reflects what the backend's responses said), restoring a session on mount via the existing `refreshSession()` call (no dedicated `/auth/me` endpoint — a documented design choice, not a gap). `RequireAuth` — client-side-only route guard; deliberately no `middleware.ts` (would need either sharing `JWT_SECRET` with the edge runtime or a cookie-presence-only check that buys little over the already-known session state) — never the security boundary, which stays entirely server-side. `frontend/src/app/{login,register,dashboard}/page.tsx` (dashboard is a minimal protected placeholder, not Step 4's real UI); `frontend/src/components/nav-bar.tsx` (basic authenticated/unauthenticated nav state). Added `logout()` to `lib/api/auth.ts` (the one gap Step 2 correctly left out of scope). A real bug was caught by the new component test, not just avoided: `logout()`'s original `try/finally` (no `catch`) still rethrows after cleanup, leaving an unhandled promise rejection at every call site on a network failure — fixed to catch-and-log instead. `npm run typecheck`/`lint`/`test` (30/30)/`build` all clean in sandbox before transplant. No organization/scan UI — Steps 4-5 remain. |
 | — | Phase 3 frontend — Step 4: organization + scan lifecycle UI (not a milestone) | `frontend/src/lib/organization/use-selected-organization.ts`: the one piece of org state this MVP needs client-side (which organization is selected), persisted to `localStorage` — explicitly not a credential (an org id alone grants no access; the backend's `require_organization_member` is what actually decides), and explicitly not multi-org management (a single id, not a list — the backend still has no "list my organizations" endpoint, §13). `frontend/src/lib/scans/use-scan-polling.ts`: bounded polling (fixed 3s interval, recursive `setTimeout` so requests never overlap, stops on terminal status/unmount/a 200-poll ―~10 min― safety cap). `frontend/src/components/{create-organization-form,new-scan-form,scan-detail}.tsx`; `frontend/src/app/scans/[scanId]/page.tsx` (new route); `frontend/src/app/dashboard/page.tsx` rewritten to bootstrap an organization then show scan creation. Added `frontend/src/lib/api/error-message.ts` (`describeApiError()`) to consolidate the instanceof-chain error handling Step 3's pages had each duplicated inline. `npm run typecheck`/`lint`/`test` (47/47)/`build` all clean in sandbox before transplant. No findings/assets/reporting UI, no RBAC/multi-org management — out of scope by design, not deferred. |
-| — | Phase 4 — Nmap scanner adapter (not a milestone; out-of-sequence explicit-instruction session, ahead of Phase 3 frontend Step 5) | `scanner_engine/adapters/nmap/adapter.py`: `NmapAdapter(ActiveScanner)`, following `NucleiAdapter`'s exact shape — routes through the existing `validate_target`/`run_scanner_subprocess`, returns the existing `ScanOutput` shape, no new abstractions/registry/pipeline changes. Scan type pinned to `-sT -Pn` (TCP connect + skip host discovery, both unprivileged) — the code-level "no privileged/raw-packet scanning" requirement, on top of (not instead of) `run_scanner_subprocess`'s own non-root guard. Target is always the single already-validated hostname appended last, never a range — no target-expansion surface. Output format tagged `nmap-xml` (nmap's own `-oX -`), unparsed beyond a shallow `<nmaprun` sanity check (real parsing stays normalization's job, per §1's Scanning/Findings boundary). Explicitly handles: missing binary (`FileNotFoundError` → `ScannerExecutionError`), timeout (propagates `ScannerTimeoutError` from `run_scanner_subprocess` uncaught), non-zero exit (always a hard failure for nmap — deliberately stricter than nuclei's tolerant classification; see the adapter's own comment on why), empty output, and malformed/non-XML output. `tests/unit/test_nmap_adapter.py` — 9 new tests, fakes/spies only, no real `nmap` binary required. No ZAP/Burp/SQLMap/ReconX/BugHunter, no `ScannerPort` changes, no wiring into the API layer's scanner-name literal or the pipeline — explicitly out of scope, stopped after Nmap per instruction. |
+| — | Phase 4 — Nmap scanner adapter (not a milestone; out-of-sequence explicit-instruction session, ahead of Phase 3 frontend Step 5) | `scanner_engine/adapters/nmap/adapter.py`: `NmapAdapter(ActiveScanner)`, following `NucleiAdapter`'s exact shape — routes through the existing `validate_target`/`run_scanner_subprocess`, returns the existing `ScanOutput` shape, no new abstractions/registry/pipeline changes. Scan type pinned to `-sT -Pn` (TCP connect + skip host discovery, both unprivileged) — the code-level "no privileged/raw-packet scanning" requirement, on top of (not instead of) `run_scanner_subprocess`'s own non-root guard. Target is always the single already-validated hostname appended last, never a range — no target-expansion surface. Output format tagged `nmap-xml` (nmap's own `-oX -`), unparsed beyond a shallow `<nmaprun` sanity check (real parsing stays normalization's job, per §1's Scanning/Findings boundary). Explicitly handles: missing binary (`FileNotFoundError` → `ScannerExecutionError`), timeout (propagates `ScannerTimeoutError` from `run_scanner_subprocess` uncaught), non-zero exit (always a hard failure for nmap — deliberately stricter than nuclei's tolerant classification; see the adapter's own comment on why), empty output, and malformed/non-XML output. `tests/unit/test_nmap_adapter.py` — 9 new tests, fakes/spies only, no real `nmap` binary required. No ZAP/Burp/SQLMap, no `ScannerPort` changes, no wiring into the API layer's scanner-name literal or the pipeline — explicitly out of scope, stopped after Nmap per instruction. |
 | — | Phase 4 — Nmap adapter wiring into scan pipeline/API (not a milestone; second out-of-sequence explicit-instruction session, directly following the adapter-only one above) | Made `nmap` actually selectable/executable through the existing scan flow, without a registry/factory/`ScannerPort` redesign. `app/api/v1/schemas.py`: `scanner_name: Literal["nuclei", "nmap"]`. `app/api/dependencies.py`: `AppState.active_scanner` (singular) → `active_scanners: tuple[ActiveScanner, ...]`; `get_active_scanner` → `get_active_scanners`; `ScanDispatcher` widened to carry `scanner_name` alongside the ids. `app/main.py`: `_lifespan` constructs both `NucleiAdapter()` and `NmapAdapter()`. `app/api/v1/scans.py`: `run_scan` checks `scan.scanner_name` against the whole wired-names set (409 if unmatched) and passes `scan.scanner_name` through to the dispatcher. `app/workers/tasks.py`: new `_select_active_scanner(scanner_name)` helper — an explicit if/elif over exactly the two known adapters (not a registry — see §4), reusing `ScannerMismatchError` for an unrecognized name; `scanner_name` threaded through `_run_scan_workflow_from_settings`/`run_scan_workflow_task`. `RunScanWorkflowUseCase`/`execute_scan_workflow`/the 8-step pipeline/target validation/subprocess boundary/every other adapter — all untouched, confirmed by direct diff review. New `tests/unit/test_workers_tasks.py` (3 pure-function tests for `_select_active_scanner`); updated `test_api_dependencies.py`, `test_api_schemas.py`, `test_api_scans.py` (+3 new nmap-path tests), `test_main_lifespan.py`, `test_scan_worker_task.py` (+1 new integration test proving the worker selects `NmapAdapter`, not `NucleiAdapter`, for an nmap-scoped scan). |
 | — | Phase 4 — Nmap XML normalizer (not a milestone; third out-of-sequence explicit-instruction session, resolving TD #16) | `app/application/scanning/normalization.py`: `normalize_scan_output` gained a second dispatch branch for `"nmap-xml"` (plain if/elif alongside the existing `"nuclei-jsonl"` branch — explicitly not a `NormalizerPort`, per instruction not to introduce new pipeline/scanner abstractions; mirrors the `_select_active_scanner` precedent). New `_parse_nmap_xml`/`_nmap_host_value`/`_nmap_port_to_normalized`/`_nmap_service_description` (stdlib `xml.etree.ElementTree`, no new dependency) turn nmap's `-oX` XML into one `NormalizedFinding` per **open** port across every **up** host — closed/filtered ports and down hosts contribute nothing. Every nmap-derived finding is `raw_severity="info"` with no CVE/CVSS candidate (an honest reflection of what a plain `-sT -Pn` TCP-connect scan with no NSE vulnerability scripts actually detects — see `NmapAdapter`'s own scope). `template_id="open-port-{protocol}-{portid}"` gives the same per-scan-recurring-finding fingerprint stability nuclei's `template-id` already provides. `host` prefers a resolved hostname over the raw IP, mirroring nuclei's own host/ip fallback. Ten new `test_normalization.py` cases (single/multiple open ports, closed/filtered-port exclusion, down-host exclusion, hostname-vs-address preference, missing-service handling, empty input, malformed XML, multi-host); the pre-existing `test_unsupported_output_format_raises` (previously asserting `"nmap-xml"` itself was unsupported) was updated to use `"burp-xml"` instead, since that claim is no longer true. `tests/integration/test_scan_worker_task.py`'s nmap-selection test (added by the wiring session immediately above) was upgraded in step: its fake scanner now emits real nmap-XML-shaped output for the `"nmap-xml"` persona (previously always emitted nuclei-JSON-shaped output regardless of persona, which this new normalizer would have flagged as malformed XML), and the test now asserts genuine full `Scan.status is COMPLETED` — matching its nuclei sibling test — rather than only the `EXECUTE_SCANNER` step's status, since normalization can now actually carry an nmap-scoped scan all the way through. |
 | — | Phase 4 — SQLMap scanner adapter (not a milestone; fourth out-of-sequence explicit-instruction session, adapter-only — mirrors Nmap's own first session's scope exactly) | `scanner_engine/adapters/sqlmap/adapter.py`: `SqlmapAdapter(ActiveScanner)`, following `NmapAdapter`'s exact shape — routes through the existing `validate_target`/`run_scanner_subprocess`, returns the existing `ScanOutput` shape, no new abstractions/registry/pipeline changes, no wiring into `AppState.active_scanners`/`_select_active_scanner`/the `scanner_name` API literal (deferred to a future wiring session, exactly mirroring Nmap's own three-session arc). Target passed to sqlmap's `-u` flag is `validated.original` (the caller's exact target string, e.g. a full URL with a query parameter to actually test), not `validated.hostname` — SQL injection testing needs an endpoint/parameter, not just a bare host; `validate_target`'s SSRF checks already cover whatever host is embedded in it regardless of shape. Flags pinned explicitly rather than left to sqlmap's own defaults: `--batch` (required — without it sqlmap prompts interactively and the subprocess provides no stdin), `--risk=1 --level=1` (least-aggressive payload settings), `--technique=BEUT` (boolean-blind/error-based/UNION/time-blind — excludes `S`, stacked queries, which can run arbitrary additional destructive SQL, mirroring Nmap's own no-privileged/no-exploitative-behavior stance). Output tagged honestly as `"sqlmap-stdout"` — captured stdout text, not a documented machine-readable contract (sqlmap has no `-oX`/`--format=json` equivalent for injection-point findings) — **deliberately has no normalizer** (TD #18): fabricating a parser for sqlmap's human-readable progress/summary text was explicitly rejected as inventing an undocumented contract; `normalize_scan_output("sqlmap-stdout", ...)` currently raises `UnsupportedScanOutputFormatError`, verified by a new test, not just documented. Non-zero-exit/empty-output classification deliberately differs from both existing adapters (documented in the adapter's own code): unlike nmap, a non-zero exit alone is not an automatic hard failure (sqlmap's exit-code convention isn't confidently known); unlike nuclei, truly empty output is *always* a failure regardless of exit code (sqlmap always prints banner/status text on any real run, unlike nuclei's deliberately silent mode). `tests/unit/test_sqlmap_adapter.py` — 9 new tests, fakes/spies only, no real `sqlmap` binary required; 1 new `test_normalization.py` case confirming the unsupported-format claim. No ScannerPort/pipeline/registry changes, no other adapter touched — confirmed by direct diff review. |
 | — | Phase 4 — `sqlmap-stdout` normalizer re-investigation (not a milestone; fifth out-of-sequence explicit-instruction session; TD #18 re-confirmed, not resolved — no code changed) | Explicitly instructed to attempt implementing the normalizer, with a directive to parse only what the repository/tests establish as reliable and to stop and document rather than fabricate if the available output is insufficient. Re-inspected `normalization.py`, both existing normalizers, `SqlmapAdapter`, and `test_sqlmap_adapter.py`, then searched the entire `tests/` tree for any real captured sqlmap output/fixture — found none; the only sqlmap output content anywhere in the repository is `test_sqlmap_adapter.py`'s own `_SAMPLE_OUTPUT`, which the repository itself documents as a fabricated stand-in, not a real reference. Per direct instruction, stopped rather than write a parser grounded in outside knowledge the repository doesn't establish as reliable. Zero files modified; TD #18 (§12) rewritten to record precisely what was re-checked this session, not just re-stated. Verification re-run anyway for a genuine current confirmation (not resting on the prior session's numbers) — see §11. |
+| — | Documentation/roadmap cleanup (not a milestone; sixth out-of-sequence explicit-instruction session; no source code changed) | Two documentation-only corrections, see §16: (1) ReconX and BugHunter PRO permanently excluded from this project's scanner roster — removed from the roster/lists/counts/TD-references/roadmap text wherever they appeared as remaining/future work across this file, `docs/session_state.md`, and `docs/implementation_progress.md`; their two stub adapter folders confirmed unused (no imports, no tests, no wiring) but could not be deleted — no delete tool available via the Filesystem MCP, see §15. (2) The unsupported "14"/"12 remaining" scanner-adapter figures (no named source anywhere in the repository) replaced with an accurate statement naming only what the repository establishes: implemented (`nuclei`, `nmap`, `sqlmap`), scaffolded-but-unimplemented `ImportScanner`-shaped stubs (`burp`, `zap`), and an explicit note that the full Phase 4 roster is not enumerated here. No scanner code, registry, or factory added or changed. |
+| — | Phase 5 Milestone 1 — `EmbeddingPort` + `sentence-transformers` adapter (not part of numbered Milestones 1–7 above; first Phase 5 session) | `app/application/interfaces/embedding_port.py`: `EmbeddingPort` (ABC, one method `embed(text) -> EmbeddingResult`), `EmbeddingResult`, `EmbeddingError` — a separate port from `AIProviderPort`, not an extension of it (see §4). `app/infrastructure/embeddings/sentence_transformer_provider.py`: `SentenceTransformerEmbeddingPort`, loads `all-MiniLM-L6-v2` once at construction (`device="cpu"` explicit), wraps the synchronous `.encode()` call in `asyncio.to_thread` (mirrors `MinioStoragePort`'s precedent). `pyproject.toml`: `sentence-transformers>=3.0` added to base `dependencies` (same shared-image placement as `anthropic`, matching precedent — see §12 TD #19 for the real image-size consequence this surfaced). No Qdrant/`VectorStorePort`, no ingestion, no `AnalysisService` change — explicitly out of scope, stopped after Milestone 1 per instruction. |
+| — | Phase 5 Milestone 2 — `VectorStorePort` + Qdrant adapter (second Phase 5 session) | `app/application/interfaces/vector_store_port.py`: `VectorStorePort` (ABC, three methods — `ensure_collection()`, `upsert(points)`, `search(query_vector, limit=5)`), `VectorPoint`, `VectorMatch`, `VectorStoreError` — mirrors `StoragePort`'s one-instance-per-bucket binding rule (one instance per collection). `app/infrastructure/vector_store/qdrant_vector_store.py`: `QdrantVectorStorePort`, using `qdrant-client`'s native `AsyncQdrantClient` directly (no `asyncio.to_thread` — the SDK already ships a real async client, mirroring `AnthropicProvider`'s precedent). `ensure_collection()` is idempotent (checks `collection_exists` before `create_collection`); `upsert()` calls `ensure_collection()` first; `search()` does not. Default distance metric: cosine. `pyproject.toml`: `qdrant-client>=1.9` added to base `dependencies`. No ingestion, no CWE data, no `EmbeddingPort`/`AIProviderPort`/`AnalysisService` change, no retrieval wiring, no Docker/startup wiring — explicitly out of scope, stopped after Milestone 2 per instruction. |
+| — | Phase 5 Milestone 3 — CWE Top 25 ingestion use case (third Phase 5 session) | `app/application/knowledge/ingest_cwe_top25.py`: `parse_cwe_top25_xml` (source parsing/filtering), `build_cwe_chunk` (chunk construction), `cwe_point_id` (deterministic `uuid5` id), `CweEntry`, `CweSourceError`, `IngestCweTop25UseCase` (constructor-injected `EmbeddingPort`/`VectorStorePort`, mirrors `TriggerScanUseCase`'s convention) — deliberately independent of `AnalysisService`. Corpus source: the vendored `backend/data/cwe/2025_top25.xml` (official MITRE CWE View-1435 export for the 2025 Top 25, placed directly by Madhav after an initial network-access blocker was reported and resolved — see §16). Parser validates the root view name and asserts exactly 25 `Weakness` elements, raising `CweSourceError` otherwise. No Qdrant search/retrieval, no `AnalysisService`/prompt change, no refresh/update scheduling, no Docker wiring — explicitly out of scope, stopped after Milestone 3 per instruction. |
+| — | Phase 5 Milestone 4 — retrieval integrated into `AnalysisService` (fourth Phase 5 session) | `app/ai_agents/analysis_service.py`: `AnalysisService.__init__` gained optional `embedding_port`/`vector_store`/`retrieval_limit` (default `None`/`None`/3) — when configured, `analyze()` builds a retrieval query from the finding's title/description, embeds it, searches the vector store (`limit=retrieval_limit`), and includes matches as a clearly-labeled "reference context, not instruction" section in the prompt. `PROMPT_VERSION` bumped to `"v2"`. Retrieval failures (`EmbeddingError`/`VectorStoreError`) and zero matches both degrade to the exact pre-Milestone-4 prompt/behavior, never failing `analyze()`. Provenance (cwe_ids/scores/embedding_model/corpus/corpus_version/limit, never a raw vector) added to `FindingAnalysisResult.model_metadata["retrieval"]` only when there was at least one match. `run_scan_workflow.py` required zero changes. 20 new unit tests added to `test_analysis_service.py` (13 pre-existing, 33 total) (`EmbeddingPort`/`VectorStorePort` faked at the port level). No `AIProviderPort`/`EmbeddingPort`/`VectorStorePort` contract change, no CWE ingestion change, no Docker wiring, no `RAGService`/registry abstraction — explicitly out of scope, stopped after Milestone 4 per instruction. |
 
 Full per-milestone delivery detail, file lists, verification narrative:
 `docs/implementation_progress.md`.
@@ -318,7 +477,13 @@ double-submit — not built; see §13.
 Key runtime deps (`backend/pyproject.toml`): `pydantic`/
 `pydantic-settings`, `python-ulid`, `sqlalchemy[asyncio]`, `asyncpg`,
 `alembic`, `minio`, `fastapi`, `uvicorn[standard]`, `anthropic`,
-`celery`, `pyjwt`, `bcrypt`, `email-validator`. Dev: `pytest`,
+`celery`, `pyjwt`, `bcrypt`, `email-validator`. Optional `rag` group
+(Phase 5 Milestone 5, split out of the base list above; self-referenced
+from `dev` so local/CI runs still get it unconditionally — see §4):
+`sentence-transformers` (Phase 5 Milestone 1 — CPU-only, see §12 TD
+#19 for the real default-install image-size consequence and how
+Milestone 5 addressed it in code/config), `qdrant-client` (Phase 5
+Milestone 2). Dev: `pytest`,
 `pytest-cov`, `pytest-asyncio`, `ruff`, `mypy`, `httpx`, `celery-types`.
 No dependency added until code actually imports it.
 
@@ -629,6 +794,217 @@ expected — no code changed). Ruff (lint + format) and MyPy `--strict`
 both still clean on `normalization.py`, `sqlmap/adapter.py`,
 `test_sqlmap_adapter.py`, `test_normalization.py`.
 
+**Phase 5 Milestone 1 — `EmbeddingPort` + `sentence-transformers`
+adapter.** A narrower, isolated reconstruction than every backend entry
+above — deliberately so: the two new files (`embedding_port.py`,
+`sentence_transformer_provider.py`) have zero imports from the rest of
+`app/`, so only a minimal package skeleton plus these two files and
+their test were reconstructed in Claude's sandbox, not the full `app/`
+tree. **`pytest tests/ -v` → 8 passed, 0 failed** (all new —
+`test_sentence_transformer_provider.py`: default/configured model name,
+constructor loads the model once with `device="cpu"`, `embed()` returns
+the correct vector/model, non-native numeric values narrowed to plain
+`float`, text passed through to `encode()` correctly, underlying
+failures translated to `EmbeddingError` without losing the original
+message), 100% coverage on both new modules. `SentenceTransformer` is
+fully mocked in every test — no real model download/load ever happens
+(confirmed indirectly: the run completed in ~9s). Ruff (lint + format)
+and MyPy `--strict` both clean on all three new files. Byte-count
+integrity check (`get_file_info` vs. sandbox `wc -c`) confirmed an
+exact-match transplant for all three (`embedding_port.py`: 2787 bytes;
+`sentence_transformer_provider.py`: 4207 bytes;
+`test_sentence_transformer_provider.py`: 5449 bytes). **Not re-run:**
+the rest of the suite — this session's own files are fully isolated
+from every other module, per the standing per-session scope note above.
+**A real, unanticipated finding surfaced during sandbox verification,
+not from the design discussion:** installing `sentence-transformers`
+via plain PyPI pulls the default CUDA-enabled `torch` build — 5.8GB
+installed in the sandbox venv, 3.2GB of it pure NVIDIA/CUDA packages,
+for a CPU-only adapter. See TD #19.
+
+**Phase 5 Milestone 2 — `VectorStorePort` + Qdrant adapter.** Same
+isolated-reconstruction approach as Milestone 1 — `vector_store_port.py`/
+`qdrant_vector_store.py` have zero imports from the rest of `app/`
+beyond `embedding_port.py`'s own sibling pattern, so the Milestone 1
+sandbox skeleton was extended, not rebuilt. **`pytest tests/ -v` → 17
+passed, 0 failed** (9 new — `test_qdrant_vector_store.py`:
+`ensure_collection` creates when missing/skips when present/translates
+failures, `upsert` ensures the collection first then writes points with
+correct id/vector/payload shape and translates failures, `search`
+returns matches with string-converted ids and `{}`-defaulted payload,
+passes the query vector and `limit` through correctly, does *not* call
+`ensure_collection`, and translates failures; plus the 8 pre-existing
+Milestone 1 tests, re-run unchanged and still passing — confirming no
+regression). 100% coverage on both new modules. `AsyncQdrantClient` is
+fully mocked in every test (a fake class with async methods, mirroring
+`test_anthropic_provider.py`'s own pattern for an SDK with a native
+async client, rather than `test_minio_storage.py`'s sync-wrapped-client
+pattern) — no running Qdrant container is required or contacted; the
+docker-compose `qdrant` service has no host port mapping in any case
+(only reachable from other containers on the `queue` network), so a
+real-server test was never possible from this sandbox. Ruff (lint +
+format) and MyPy `--strict` both clean on all three new/extended files.
+Byte-count integrity check (`get_file_info` vs. sandbox `wc -c`)
+confirmed an exact-match transplant for all three
+(`vector_store_port.py`: 4442 bytes; `qdrant_vector_store.py`: 4012
+bytes; `test_qdrant_vector_store.py`: 8288 bytes). **Not re-run:** the
+rest of the suite, per the same standing per-session scope note. No new
+image-size-class finding this session — `qdrant-client`'s own
+dependency footprint is ordinary (no CUDA/GPU-adjacent packages
+pulled). See TD #20 for this adapter's own mocked-only verification
+gap, the same class of gap already recorded for `MinioStoragePort`/
+`NucleiAdapter` (TD #6/#7).
+
+**Phase 5 Milestone 3 — CWE Top 25 ingestion use case.** Same
+isolated-reconstruction approach as Milestones 1-2 — the new module
+imports only `EmbeddingPort`/`VectorStorePort` (both already in the
+sandbox skeleton) plus stdlib, so no further package reconstruction was
+needed. **`pytest tests/unit/test_ingest_cwe_top25.py -v` → 23 passed,
+0 failed** (parsing/filtering: exact-25 extraction, wrong-count/
+malformed-XML/wrong-view-name/missing-id-or-name/missing-description
+all raise `CweSourceError`; id/name/description extraction; nested
+`xhtml:p` markup flattened and whitespace collapsed; multiple
+mitigations joined with phase labels; mitigations with no description
+text skipped; no-mitigations case. Chunk construction: includes id/
+name/description/mitigations, omits the mitigations section when
+empty, deterministic across calls. Deterministic ids: valid UUID
+string, stable for the same CWE id, distinct across different CWE ids.
+Orchestration: embeds and upserts all 25 entries in one `upsert` call,
+upserted point has the expected deterministic id/vector/payload
+shape, missing/malformed source file raises `CweSourceError`,
+`EmbeddingError`/`VectorStoreError` propagate unchanged — not wrapped
+or swallowed). 100% coverage on the new module. Full sandbox suite
+(`pytest tests/ -v`) → **40 passed, 0 failed** (23 new + 8 Milestone 1
++ 9 Milestone 2, re-run unchanged and still passing — confirming no
+regression). Ruff (lint + format) and MyPy `--strict` both clean.
+Byte-count integrity check (`get_file_info` vs. sandbox `wc -c`)
+confirmed an exact-match transplant for both new files
+(`ingest_cwe_top25.py`: 9566 bytes; `test_ingest_cwe_top25.py`: 14289
+bytes). No real CWE source file, embedding model, or Qdrant server
+was used in any test — XML fixtures are built programmatically,
+mirroring the vendored source's structure as directly inspected, not
+copied from it.
+
+**A real, significant verification limitation, disclosed rather than
+glossed over: the vendored 1.21MB source file's exact weakness count
+was not confirmed by full manual enumeration this session.** The
+Filesystem MCP's `read_text_file` has an effective per-call response
+cap well under the file's own 1.21MB size (observed ceiling ~500-520KB
+for both `head` and `tail`), and extensive `head`/`tail` bisection from
+both ends of the file could not be made to meet in the middle —
+roughly 250KB in the file's interior was never directly read this
+session. What *was* directly confirmed: the root element's exact,
+specific self-declaration (`Name="VIEW LIST: CWE-1435: Weaknesses in
+the 2025 CWE Top 25 Most Dangerous Software Weaknesses"`, official
+MITRE `cwe-7` XML namespace/schema), the file's OS modification
+timestamp exactly matching its own internal `Date="2026-04-30"`
+attribute, 19 distinct non-duplicate `Weakness` entries sampled with
+zero structural anomalies, and a well-formed closing tag. See TD #21.
+
+**Phase 5 Milestone 4 — retrieval integrated into `AnalysisService`.**
+Narrower reconstruction than Milestone 3 — the changed module
+(`analysis_service.py`) and its test now also need `ai_provider_port.py`
+and `domain/shared/enums.py` (both already-stable dependencies,
+reconstructed verbatim, zero changes) alongside the existing
+`embedding_port.py`/`vector_store_port.py`. **`pytest tests/unit/
+test_analysis_service.py -v` → 33 passed, 0 failed** (13 pre-existing
+Milestone 6 tests, re-run unchanged and still passing — confirming no
+regression — plus 20 new: retrieval query construction (title+
+description, title-only, deterministic), context formatting (multi-
+match join, missing-payload skip, empty case), embedding invocation
+(query text passed to `embed()`), vector-store search invocation
+(embedded vector + configured/default `limit` passed to `search()`),
+prompt injection (retrieved text present and clearly labeled "not an
+instruction"/"background information only", existing finding fields
+still present alongside it, no context section when zero matches, an
+exact byte-for-byte regression check that the unconfigured-ports prompt
+is unchanged from pre-Milestone-4), provenance metadata (cwe_ids/
+scores/embedding_model/corpus/corpus_version/limit present and
+correct, provider/model provenance preserved alongside it, no raw
+vector anywhere in the serialized metadata), empty-results behavior
+(analysis still succeeds, no retrieval key, no context section), and
+embedding/vector-store failure behavior (both `EmbeddingError` and
+`VectorStoreError` caught internally, analysis still succeeds with the
+pre-Milestone-4 prompt, the AI provider is still called exactly once).
+100% coverage on `analysis_service.py`. Ruff (lint + format) and MyPy
+`--strict` both clean on the changed module and its test (19 source
+files in the reconstructed package). Byte-count integrity check
+(`get_file_info` vs. sandbox `wc -c`) confirmed an exact-match
+transplant for both files (`analysis_service.py`: 16275 bytes;
+`test_analysis_service.py`: 21670 bytes). **Not re-run this session:**
+`test_run_scan_workflow.py` itself — `run_scan_workflow.py` required
+zero code changes (confirmed by direct review: it only imports the
+`PROMPT_VERSION` symbol and constructs `AnalysisService(provider=...)`,
+both fully backward-compatible with the new optional parameters), and
+reconstructing its full transitive dependency tree (six domain
+packages, scanner_engine, every repository port) for a file this
+session did not touch was judged disproportionate to the change's own
+isolated footprint. The new optional-parameter default-`None` path
+that file's harness exercises is directly covered by
+`test_analyze_does_not_retrieve_when_ports_are_not_configured` and
+`test_prompt_is_unchanged_from_pre_milestone_4_shape_when_not_configured`
+above. No new image-size or mocked-only-verification-class finding
+this session — no new dependency was added, and both ports involved
+are simple fakes at the same tier already used for the AI provider
+itself in this same test file.
+
+**Phase 5 Milestone 5 — RAG wiring, CPU-only PyTorch, `kb_version`.**
+A wider reconstruction than Milestone 4's own, and one that surfaced
+real memory-drift risk this session actively guarded against: an
+initial sandbox reconstruction of `run_scan_workflow.py` (attempted
+from recollection to save a read) turned out to not match the real
+file's actual `_PipelineItem`/`_run_step` structure. Caught before any
+production edit was made, by re-fetching every file actually being
+edited fresh, immediately before constructing each edit, rather than
+trusting the sandbox copy — every real transplant this session is
+verified against a same-turn fresh read, not the sandbox. **Sandbox
+`pytest tests/unit/ -q` → 82 passed, 0 failed** (73 pre-existing
+across Milestones 1-4, re-run unchanged and still passing, plus 9 new:
+4 `kb_version` cases in `test_analysis_service.py` — populated as
+`"cwe_top25:2025"` when matches exist, `None` for no-matches/
+not-configured/malformed-payload — and 5 in the new
+`test_tasks_composition.py`, isolating `tasks.py`'s new
+`_build_analysis_service` helper: unconfigured returns `provider`-only
+(byte-identical call shape), configured wires both adapters with the
+correct `collection_name`/`vector_size` sourced from `CORPUS_NAME`/
+`EMBEDDING_VECTOR_SIZE` rather than duplicated literals, and the RAG
+adapter classes are never even imported on the unconfigured path).
+100% coverage on `analysis_service.py`; `tasks.py` itself only 56%
+(this session's own `_build_analysis_service` addition, not the rest of
+that file — see below). Ruff (lint + format) and MyPy `--strict` both
+clean across the reconstructed package (71 files). Self-referential
+`rag` extras (`pip install -e ".[dev]"` pulling in
+`security-platform-backend[rag]`) confirmed working in the sandbox
+before being written to `pyproject.toml`.
+
+**Real, explicitly bounded verification gaps, not glossed over:**
+(1) **`test_scan_worker_task.py` (the full Postgres-backed integration
+harness for `tasks.py`) was not re-run this session** — given the
+memory-drift risk just described, faithfully reconstructing that
+harness (and the ~25-file domain/infrastructure tree it needs) was
+judged too failure-prone to trust as a pass/fail signal; the new,
+narrower `test_tasks_composition.py` covers the actual new logic
+directly instead, and every other file that harness exercises was
+confirmed unchanged by direct diff review during the real edits (only
+`_build_analysis_service` and its call site changed in `tasks.py`).
+(2) **No real Qdrant server was reachable this session** (TD #20
+unchanged — same network/topology constraints as Milestone 2). (3) **No
+actual Docker build was run** — the Filesystem MCP has no
+command-execution tool (§15) and Claude's own sandbox cannot build
+Docker images; the `INSTALL_RAG_DEPENDENCIES` conditional-install/
+CPU-only-torch-index Dockerfile logic is standard, well-documented
+technique, not something confirmed working end-to-end here — see TD
+#19's updated entry. (4) **The full real-repository test suite** (all
+~48 unit + integration files) **was not run against the actual repo**
+— no execution access exists against
+`C:\Users\gamer\Downloads\claudeOnly` directly (§15); verification is
+sandbox-only, as it has been for every session, but this session's
+sandbox coverage of the untouched surrounding system is narrower than
+some prior sessions' (e.g. the Nmap-wiring session's full-package
+reconstruction) for the reasons in (1). Recommend a real `docker build`
+and a full `pytest tests/ -q` run in an environment with execution
+access (e.g. Claude Code) for final confirmation of both.
+
 ## 12. Active technical debt
 
 1. `domain/shared/enums.py` — staging area for enums belonging to
@@ -749,17 +1125,76 @@ both still clean on `normalization.py`, `sqlmap/adapter.py`,
     deliberately conservative, explicitly-fragility-flagged text parser
     is later judged worth the risk by a human decision — not by
     guessing at stdout formatting from memory a third time.
+19. ~~**`sentence-transformers`'s default PyPI install pulls the full
+    CUDA-enabled `torch` build, not a CPU-only one.**~~ — **addressed in
+    code/config, Phase 5 Milestone 5; not confirmed by an actual Docker
+    build.** Originally confirmed in Claude's sandbox (Milestone 1):
+    5.8GB installed, 3.2GB of it pure NVIDIA/CUDA packages, for an
+    adapter that is CPU-only by design (§4) and never touches a GPU.
+    Milestone 5's fix: `backend/pyproject.toml` moved
+    `sentence-transformers`/`qdrant-client` into a new `rag`
+    optional-dependency group (out of the base `dependencies` every
+    image installs); `backend/Dockerfile` gained an
+    `INSTALL_RAG_DEPENDENCIES` build arg (default `false`) that, when
+    `"true"`, installs `torch` from `https://download.pytorch.org/whl/
+    cpu` before `pip install ".[rag]"`; `docker-compose.yml`'s `worker`
+    service passes that arg, `backend` does not — so `backend`'s image
+    gets neither the RAG stack nor the CUDA bloat, and `worker`'s gets
+    the RAG stack via the CPU-only wheel index specifically. Standard,
+    well-documented PyTorch technique, not invented this session — but
+    genuinely **not verified by an actual `docker build`**: the
+    Filesystem MCP has no command-execution tool (§15), Claude's sandbox
+    cannot build Docker images, and `download.pytorch.org` remains
+    outside Claude's own sandbox network allowlist regardless (the same
+    limitation noted when this item was first opened). Run a real
+    `docker build --build-arg INSTALL_RAG_DEPENDENCIES=true` for
+    `worker` and inspect the resulting image size/layers to close this
+    out for real.
+20. **`QdrantVectorStorePort` verified only against a mocked
+    `AsyncQdrantClient` — no real Qdrant server reachable in the
+    verification environment.** Same shape as TD #6 (`MinioStoragePort`)/
+    TD #7 (`NucleiAdapter`); resolved the same way when a real-server
+    CI/sandbox environment exists. Distinct from those two in one way:
+    even a running local Qdrant wouldn't have helped here regardless —
+    `docker-compose.yml`'s `qdrant` service has no host port mapping,
+    so it is reachable only from other containers on the `queue`
+    network, never from Claude's sandbox.
+21. **The vendored `backend/data/cwe/2025_top25.xml`'s exact weakness
+    count (25) was not confirmed by full manual enumeration — only by
+    strong partial evidence plus the parser's own runtime assertion.**
+    See §11 for exactly what was and wasn't directly read this session
+    (19/25 distinct entries sampled, zero anomalies, correct root/
+    schema/namespace/mtime). `parse_cwe_top25_xml` asserts
+    `len(weaknesses) == 25` at parse time and raises `CweSourceError`
+    otherwise — so a genuine mismatch will fail loudly the first time
+    `IngestCweTop25UseCase` actually runs against the real file, not
+    silently proceed with a wrong corpus. Resolved the moment Milestone
+    3's use case is actually run once (in a real environment, or a
+    future session with a way to read the whole file directly) — not a
+    design gap, a one-time manual-verification gap under this session's
+    own tool constraints.
 
 ## 13. Deferred / excluded work
 
 - Findings/Assets/Reporting application-layer use cases and HTTP routes.
 - `EventBusPort` and its implementation; `FindingCreated` publication
   (planned, no port yet).
-- Remaining 12 scanner adapters (Phase 4 — burp, zap, reconx,
-  bughunter, etc.; nmap now done and fully wired — selection,
+- Remaining Phase 4 scanner adapters beyond Nuclei/Nmap/SQLMap: the
+  repository does not establish an authoritative complete roster — the
+  previously-cited "14 total" figure (and this file's own derived
+  "12 remaining") had no named source anywhere in the repository and
+  is no longer treated as reliable, corrected this session — see
+  `docs/implementation_progress.md`'s dated correction and
+  `docs/session_state.md`. Concretely scaffolded but unimplemented:
+  `burp`/`zap` (`ImportScanner`-shaped stub folders, no `execute()`/no
+  logic yet, see §5). Nmap now done and fully wired — selection,
   execution, and normalization — into the pipeline/API, see §7/§11/
   TD #15/TD #16; sqlmap's adapter is done but not yet wired into the
-  pipeline/API and has no normalizer, see §7/§11/TD #17/TD #18).
+  pipeline/API and has no normalizer, see §7/§11/TD #17/TD #18. ReconX
+  and BugHunter PRO (Madhav's own separate, earlier projects) are
+  permanently excluded from this project's scanner roster by explicit
+  decision — not reused, ported, reconstructed, or referenced going
+  forward; see §5 for their stub folders' status.
 - OpenAI/Ollama/OpenRouter `AIProviderPort` implementations (deferred
   until a second real provider shape is known).
 - Network-isolated `scanner_worker` split (TD #12).
@@ -789,7 +1224,20 @@ both still clean on `normalization.py`, `sqlmap/adapter.py`,
   `GET /api/v1/organizations` (or `/me/organizations`) in a future
   session and `use-selected-organization.ts` is the one place that
   would change to source from it instead.
-- Qdrant/RAG integration (Phase 5).
+- Qdrant/RAG integration (Phase 5) — `EmbeddingPort` +
+  `sentence-transformers` adapter (Milestone 1), `VectorStorePort` +
+  Qdrant adapter (Milestone 2), CWE Top 25 ingestion (Milestone 3),
+  `AnalysisService` retrieval integration (Milestone 4), and
+  application wiring + CPU-only-PyTorch image split + `kb_version`
+  (Milestone 5) now implemented, see §7/§11/§12 TD #19/#20/#21. Wired
+  into `ingestion_worker`'s composition root as of Milestone 5,
+  conditional on `QDRANT_URL` being set (`app/main.py`/the API process
+  still never constructs either adapter). Not yet confirmed against a
+  real running Qdrant service or an actual Docker build — see §11.
+  Nothing further is deferred for Phase 5 as originally scoped; any
+  additional Phase 5 work (a real-environment verification pass, a
+  second knowledge source, retrieval tuning, etc.) is new scope, not a
+  carry-over.
 - The eight `docs/*.md` files named in §5 — described only in chat
   history, never written; this file is the interim substitute.
 - Phase 3 (frontend) — in progress, Step 4 of 5 complete (§7).
@@ -877,8 +1325,10 @@ scope decision, unaffected by this session.
 **Fourth out-of-sequence session (explicit instruction, after a
 clarifying question about which of the five remaining Phase 4 stubs to
 build next — burp/zap turned out to be `ImportScanner`-shaped, a
-different architecture; reconx/bughunter have no available spec in this
-repo; sqlmap was the only remaining stub matching Nmap/Nuclei's
+different architecture; the other two then-remaining stub candidates
+had no available spec in this repo (permanently excluded from this
+project's scanner roster by a later explicit decision — see §13);
+sqlmap was the only remaining stub matching Nmap/Nuclei's
 `ActiveScanner` pattern): Phase 4 — SQLMap scanner adapter — complete,
 adapter-only, see §7/§11/TD #17/TD #18.** Mirrors Nmap's own first
 session's scope exactly: `SqlmapAdapter` only, no pipeline/API wiring,
@@ -971,5 +1421,211 @@ a CSRF double-submit token, TD #12 (scanner_worker split),
 Findings/Assets/Reporting HTTP surface, full organization management,
 a future SQLMap pipeline/API wiring session (mirroring Nmap's own
 second session — TD #18 would still block full completion even once
-wired), remaining Phase 4 scanner adapters (burp/zap/reconx/bughunter
-— §13).
+wired), remaining Phase 4 scanner adapters (burp/zap — §13; reconx/
+bughunter are permanently excluded from this project's roster, not
+remaining work).
+
+**Sixth out-of-sequence session (explicit instruction): documentation/
+roadmap cleanup only — no scanner implemented, no source-code change,
+see §5/§7/§13.** Two corrections, both documentation-only: (1) ReconX
+and BugHunter PRO (Madhav's own separate, earlier projects) permanently
+excluded from this project's scanner roster — removed from the
+roster/lists/counts/TD-references/roadmap text in this file,
+`docs/session_state.md`, and `docs/implementation_progress.md`
+wherever they appeared as remaining/future work. Their two now-orphaned
+stub adapter folders (`scanner_engine/adapters/{reconx,bughunter}/`)
+were confirmed unused — no imports, no tests, no wiring anywhere in
+this repository — and safe to delete, but could not actually be removed
+this session, since the Filesystem MCP connector exposes no
+delete/rmdir tool (see §15); flagged for manual deletion or a future
+session with delete capability. (2) The unsupported "remaining fourteen
+scanner adapters" claim in `docs/implementation_progress.md` (and this
+file's own derived "12 remaining") had no named source anywhere in the
+repository; replaced throughout with an accurate statement naming only
+what the repository actually establishes — implemented (`nuclei`,
+`nmap`, `sqlmap`), scaffolded-but-unimplemented `ImportScanner`-shaped
+stubs (`burp`, `zap`), and an explicit acknowledgment that no complete
+Phase 4 roster is enumerated in this repository, rather than a
+fabricated count. No scanner code, registry, or factory was added or
+changed. Nothing here changes Step 5's own status, TD #18, or any other
+open item — all remain exactly where the fifth session left them.
+
+**Seventh out-of-sequence session (explicit instruction): Phase 5
+planning + Milestone 1 — `EmbeddingPort` + `sentence-transformers`
+adapter — complete, see §4/§7/§11/§12 TD #19.** A planning-only
+recon session first resolved two locked decisions (§4): `EmbeddingPort`
+is separate from `AIProviderPort`; concrete adapter is local
+`sentence-transformers` (`all-MiniLM-L6-v2`, CPU-only), belonging to
+`ingestion_worker`; initial knowledge corpus is CWE Top 25 (ingestion
+deferred). This session then implemented Milestone 1 only: the port +
+adapter + unit tests (8 new, `SentenceTransformer` fully mocked) +
+the one new dependency. No Qdrant, no `VectorStorePort`, no ingestion,
+no CWE data, no `AnalysisService`/retrieval-logic change — all
+explicitly out of scope per instruction. One genuine, previously
+unquantified consequence surfaced by sandbox verification, not fixed
+this session: `sentence-transformers`'s default PyPI install pulls the
+full CUDA-enabled `torch` build (5.8GB, 3.2GB pure CUDA) even though
+this adapter is CPU-only — TD #19, needs a real decision before
+Milestone 5 (Docker wiring). **Stopped after Milestone 1 per explicit
+instruction — awaiting approval before Milestone 2**
+(`VectorStorePort` + Qdrant adapter). Nothing here changes Step 5's own
+status, TD #18, or any other open item.
+
+**Eighth out-of-sequence session (explicit instruction): Phase 5
+Milestone 2 — `VectorStorePort` + Qdrant adapter — complete, see
+§4/§7/§11/§12 TD #20.** Read the current repo state fresh rather than
+relying on the seventh session's own account (confirmed it matched
+exactly — no drift). Implemented the port (`ensure_collection`,
+`upsert`, `search` only — mirrors `StoragePort`'s one-instance-per-
+bucket binding rule) and the Qdrant adapter (native `AsyncQdrantClient`,
+cosine distance default, UUID/uint point-id constraint documented not
+enforced pre-emptively) + 9 new unit tests (`AsyncQdrantClient` fully
+mocked) + the one new dependency. Every design choice needed for the
+port contract (async-native vs. `to_thread`, distance-metric default,
+point-id format, ensure-before-upsert-but-not-before-search) was
+derivable from existing convention or an SDK-imposed constraint — none
+required stopping to ask. No CWE ingestion, no CWE data, no
+`EmbeddingPort`/`AIProviderPort`/`AnalysisService` change, no retrieval
+wiring, no Docker networking change, no refresh/update mechanism, no
+registry/framework abstraction — all explicitly out of scope per
+instruction. TD #19 (CPU-only PyTorch footprint) was left exactly as-is
+per instruction — not addressed, not referenced as blocking this
+milestone. One new, honest verification-tier gap recorded, not fixed:
+TD #20 (`QdrantVectorStorePort` verified only against a mock — no real
+Qdrant server reachable in this environment; the `docker-compose.yml`
+`qdrant` service has no host port mapping in any case). **Stopped after
+Milestone 2 per explicit instruction — awaiting approval before
+Milestone 3** (CWE Top 25 ingestion). Nothing here changes Step 5's own
+status, TD #18, or any other open item.
+
+**Ninth out-of-sequence session (explicit instruction): Phase 5
+Milestone 3 — CWE Top 25 ingestion use case — complete, see
+§4/§5/§7/§11/§12 TD #21.** Began with a genuine blocker, reported
+rather than routed around: no reachable, verifiable, current source
+for the actual CWE Top 25 data existed from Claude's sandbox or this
+repository (`cwe.mitre.org`/`cisa.gov` both hard-blocked by the
+sandbox's network allowlist, `x-deny-reason: host_not_allowed`; the
+only candidate PyPI package was a stale 2020 pickle with no Top-25
+curation; nothing in the repository itself). Per explicit instruction
+not to substitute or reconstruct from memory, implementation did not
+begin until Madhav resolved the blocker by placing the vendored file
+directly in the repository and locking the corpus to the 2025 edition/
+View-1435. Located it (`backend/data/cwe/2025_top25.xml`), inspected
+its structure directly (official MITRE `cwe-7` XML schema/namespace,
+root self-declared as "VIEW LIST: CWE-1435: ... 2025 CWE Top 25",
+mtime matching its own internal `Date` attribute, 19/25 distinct
+entries sampled with zero anomalies — see §11/TD #21 for exactly what
+could and couldn't be confirmed under this session's own tool
+constraints), then implemented Milestone 3 only:
+`app/application/knowledge/ingest_cwe_top25.py` — three independently-
+tested pure functions (`parse_cwe_top25_xml`, `build_cwe_chunk`,
+`cwe_point_id`) plus `IngestCweTop25UseCase` (constructor-injected
+`EmbeddingPort`/`VectorStorePort`, mirrors `TriggerScanUseCase`'s
+convention), 23 new unit tests (both ports faked directly, no real
+model/file/server), no new dependency (stdlib `xml.etree.ElementTree`
+only). Deliberately kept independent of `AnalysisService` — new
+`app/application/knowledge/` folder, not `app/ai_agents/`. No CWE
+ingestion of a wrong/substituted corpus, no retrieval, no Qdrant search
+beyond what Milestone 2 already built, no `EmbeddingPort`/
+`VectorStorePort` contract change (none was needed), no refresh/update
+scheduling, no Docker wiring — all explicitly out of scope, stopped
+after Milestone 3 per instruction. TD #19/#20 left exactly as-is per
+instruction. One new, honestly-disclosed verification gap: TD #21 (the
+real file's exact 25-entry count wasn't manually exhaustively counted
+this session, due to a Filesystem MCP per-call response-size ceiling
+well under the file's own size — closed defensively by the parser's
+own `len(weaknesses) == 25` runtime assertion, not silently assumed).
+**Stopped after Milestone 3 per explicit instruction — awaiting
+approval before Milestone 4** (`AnalysisService` retrieval
+integration). Nothing here changes Step 5's own status, TD #18, or any
+other open item.
+
+**Tenth out-of-sequence session (explicit instruction): Phase 5
+Milestone 4 — retrieval integrated into `AnalysisService` — complete,
+see §4/§5/§7/§11.** Inspected `AnalysisService`, `RunScanWorkflowUseCase`,
+`FindingAnalysis`, `EmbeddingPort`, `VectorStorePort`, and their
+existing tests fresh before editing, per instruction. A genuine gift
+found during inspection, not invented: `FindingAnalysis` already has
+its own dedicated `kb_version: str | None` column, migrated since
+Milestone 2 with a docstring reading "nullable -- no RAG until Phase
+5" -- confirming no new persistence model was needed, exactly as
+instructed; `model_metadata` (the field the instruction specifically
+named) carries the new `"retrieval"` provenance, `kb_version` was
+deliberately left unpopulated this session (see §4's own note -- a
+future-session decision, not a silent one). Every design choice needed
+(optional-DI shape mirroring `AIProviderPort`'s own convention,
+retrieval living inside `AnalysisService` rather than
+`RunScanWorkflowUseCase`, retrieval failures degrading to pre-
+Milestone-4 behavior rather than propagating) was derivable from
+existing convention -- none required stopping to report a blocker.
+Implemented: optional `embedding_port`/`vector_store`/`retrieval_limit`
+on `AnalysisService.__init__`; a retrieval query built from the
+finding's own title/description; embed → search → format → inject as
+a clearly-labeled "reference context, not instruction" prompt section;
+`PROMPT_VERSION` bumped to `"v2"`; provenance in `model_metadata
+["retrieval"]` (cwe_ids/scores/embedding_model/corpus/corpus_version/
+limit, never a raw vector) added only when there was at least one
+match; 20 new unit tests. No `RAGService`/`RetrieverBase`/registry, no
+`AIProviderPort` extension, no Qdrant adapter change, no new
+persistence model, no scanner/CWE-ingestion/Docker/TD #19/TD #20
+change -- all explicitly out of scope, stopped after Milestone 4 per
+instruction. `run_scan_workflow.py` required zero changes -- confirmed
+by direct review, not just by claim -- so its own test file was not
+re-run this session (see §11 for exactly why that judgment call was
+made and what still covers the relevant path). **Stopped after
+Milestone 4 per explicit instruction -- awaiting approval before
+Milestone 5** (wiring: constructing `AnalysisService` with real
+retrieval ports in `app/main.py`/`app/workers/tasks.py`, and TD #19's
+Docker-image decision). Nothing here changes Step 5's own status, TD
+#18, or any other open item.
+
+**Eleventh out-of-sequence session (explicit instruction): Phase 5
+Milestone 5 — RAG wiring, CPU-only-PyTorch image split, `kb_version`
+— complete (with explicitly bounded verification gaps), see
+§4/§5/§7/§10/§11/§12 TD #19/#20.** Inspected `main.py`, worker
+composition/Celery tasks, `Settings`/role-boundary validation,
+Dockerfile/docker-compose, the existing Anthropic wiring, Qdrant
+config, `AnalysisService` construction, and current Phase 5/
+integration test conventions fresh before editing, per instruction.
+Caught and corrected a real memory-drift risk mid-session: an initial
+sandbox reconstruction of `run_scan_workflow.py`, attempted from
+recollection, did not match the real file's actual structure. Every
+subsequent production edit was made only after a same-turn fresh read
+of the exact file being changed, never from the sandbox copy — see
+§11 for the full account.
+
+Implemented: `tasks.py`'s new `_build_analysis_service(*, provider,
+qdrant_url)`, lazily importing `SentenceTransformerEmbeddingPort`/
+`QdrantVectorStorePort` only when configured, so `backend`'s image
+never needs to import either; unconfigured call shape byte-identical
+to pre-Milestone-5. `qdrant_url` confirmed deliberately unvalidated in
+`check_role_boundaries` (preserves Milestone 4's graceful-degradation
+design) and usage-gated to `ingestion_worker` alone, documented in
+place. `EMBEDDING_VECTOR_SIZE = 384` added to
+`sentence_transformer_provider.py` as the single source of truth for
+the vector store's dimensioning. `kb_version` inspected (ORM mapping,
+repository round-trip) and confirmed as the intended persisted
+representation, not assumed -- populated via a new `_build_kb_version`
+helper, threaded through `FindingAnalysisResult` and `_persist`. TD
+#19 addressed in code/config: `pyproject.toml`'s new `rag` optional
+group (self-referenced from `dev`), `Dockerfile`'s
+`INSTALL_RAG_DEPENDENCIES` arg installing CPU-only `torch` first,
+`docker-compose.yml`'s `worker` (not `backend`) opting in plus gaining
+`QDRANT_URL` and a `qdrant` `depends_on` entry -- determined the
+existing single-Dockerfile-plus-optional-dependency-groups
+architecture already supported this split cleanly, so no larger
+deployment refactor was attempted, per instruction. 9 new unit tests.
+No new knowledge source, no corpus/embedding-model change, no
+`EmbeddingPort`/`VectorStorePort` redesign, no scanner behavior change,
+no new retrieval features, no scheduled refresh, no security/network-
+boundary weakening, no `secure=True` cookie change, no revived
+scanners — all explicitly out of scope, stopped after Milestone 5 per
+instruction.
+
+**Explicitly not claimed as verified, per instruction:** real Qdrant
+integration (TD #20, unchanged -- no reachable server this session
+either) and an actual Docker build (TD #19's updated entry -- no
+execution access to build one). Both are standard, well-reasoned
+designs, not confirmed working end to end. **Stopped after Milestone 5
+per explicit instruction -- no Phase 6 or further work begun.** Nothing
+here changes Step 5's own status, TD #18, or any other open item.

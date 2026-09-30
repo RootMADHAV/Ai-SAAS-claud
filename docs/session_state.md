@@ -1,115 +1,209 @@
 # Session State
 
-Overwritten at the end of every coding session — reflects the most
+Overwritten at the end of every coding session -- reflects the most
 recent session only. Cumulative history: `docs/implementation_progress.md`.
 Permanent architecture/decisions reference: `PROJECT_STATE.md`.
 
 ## Date
-2026-09-14
+2026-09-25
 
 ## Last completed task
-TD #18 re-investigation: `sqlmap-stdout` normalizer. A fifth
-out-of-sequence explicit-instruction session, directly following the
-SQLMap adapter session, explicitly instructed to attempt the
-normalizer with a "stop and document rather than fabricate" safety
-valve made explicit up front.
+Phase 5 Milestone 5 -- an eleventh out-of-sequence explicit-instruction
+session, directly following the tenth (Milestone 4). Goal: finish Phase
+5 wiring/verification so the RAG path works through the real
+application composition/deployment path.
 
-**Outcome: zero files modified (except `PROJECT_STATE.md`).** The
-instruction was to parse only what the repository/tests establish as a
-reliable SQLMap stdout format, and to stop and document if the
-available output is insufficient for safe structured findings, rather
-than fabricate semantics. It is insufficient — re-confirmed by fresh
-investigation this session, not assumed from the prior session's note.
+**Inspection before editing (per instruction):** read fresh from disk:
+`app/main.py`, `app/workers/tasks.py`, `app/config.py`, `backend/
+Dockerfile`, `docker-compose.yml`, `app/infrastructure/ai_providers/
+anthropic_provider.py`, Qdrant's docker-compose config, `AnalysisService`
+construction, current Phase 5 tests, and integration/e2e test
+conventions (`tests/conftest.py`, `tests/integration/support.py`,
+`test_scan_worker_task.py`).
 
-**What was checked this session:** `normalization.py` (both existing
-normalizers, to confirm the established pattern — real, documented,
-stable machine-readable formats in both cases: nuclei's `-jsonl`,
-nmap's `-oX` XML), `SqlmapAdapter` and its module docstring,
-`test_sqlmap_adapter.py`, and then — the part that made this a genuine
-re-investigation rather than a repeat — a fresh search of the entire
-`tests/` directory tree (`directory_tree`, both `unit/` and
-`integration/`) for any real captured sqlmap output, fixture, or
-sample file that might serve as a ground-truth reference. None exists.
-The *only* sqlmap output content anywhere in this repository is
-`test_sqlmap_adapter.py`'s own `_SAMPLE_OUTPUT` constant — and it is
-explicitly commented, in the repository's own words, as "a plausible
-stand-in for sqlmap's own stdout... not a byte-perfect reproduction of
-real sqlmap output." The repository itself documents that nothing
-reliable exists to parse.
+**A real mistake made and corrected mid-session, disclosed rather than
+hidden:** to build a fuller sandbox reconstruction than Milestone 4's
+(this milestone touches `run_scan_workflow.py`, unlike Milestone 4,
+which avoided it entirely), an initial attempt reconstructed several
+files from recollection to save read calls. One of them --
+`run_scan_workflow.py` -- turned out **not** to match the real file's
+actual structure (guessed a `_PipelineFindingItem`/single-
+`active_scanners` shape; the real file has a `_DedupResult`/
+`_PipelineState`/single-`active_scanner` shape, entirely different).
+Caught before any production edit was made by re-fetching the file
+fresh and comparing. From that point on, **every subsequent production
+edit was made only against a same-turn fresh read of the exact file
+being changed** -- the sandbox reconstruction was used only for testing
+confidence on the new logic in isolation, never as the source for a
+real edit. `config.py` and `tasks.py`, independently re-verified the
+same way, matched their fresh reads exactly.
 
-**Why no parser was written anyway:** sqlmap's real, well-known stdout
-format (the "Parameter: X (METHOD)" block structure) is something I
-have reasonable general confidence in from training knowledge, but the
-instruction specifically scoped what counts as usable evidence to what
-the *repository* establishes, not what I recall from outside
-knowledge — and building a parser from memory, however confident, is
-exactly the "invent an undocumented contract" the instruction ruled
-out, just relocated from the code to my own recollection instead of
-the codebase. Treating my own unverified memory as a reliable source
-would have quietly reintroduced the fabrication risk the instruction
-was written to prevent.
+**Key finding during inspection:** `app/main.py`'s `_lifespan`
+(worker_role=api) already does not construct `AnalysisService`/
+`AnthropicProvider`/`MinioStoragePort` at all (confirmed unchanged since
+Milestone 7) -- the API process was already correctly excluded from
+this composition, satisfying "not unnecessarily in the API process"
+before any Milestone 5 code was written. The actual composition root is
+`app/workers/tasks.py`'s `_run_scan_workflow_from_settings`
+(`worker_role=ingestion_worker`), confirmed by tracing
+`app/api/dependencies.py`'s import of `run_scan_workflow_task` (only
+the Celery task *object*, never executing that module's own function
+bodies from the API process).
+
+**Design decisions, all derivable from existing convention or explicit
+instruction (none required stopping to report a blocker):**
+1. Retrieval wiring lives in a new `tasks.py` helper,
+   `_build_analysis_service(*, provider, qdrant_url)` -- takes an
+   already-constructed `provider` (not `Settings` itself) so the
+   existing `assert settings.anthropic_api_key is not None` mypy-strict
+   narrowing pattern a few lines above stays effective (mypy does not
+   carry an `assert`'s narrowing across a function call).
+2. `qdrant_url` stays **unvalidated** in `check_role_boundaries` --
+   unlike `anthropic_api_key`, requiring it would be a bigger behavior
+   change than Phase 5 has actually made: `AnalysisService`'s retrieval
+   is optional-by-design (Milestone 4), so a scan can run, and always
+   could, with no Qdrant configured at all. When `qdrant_url` is `None`,
+   `_build_analysis_service` returns `AnalysisService(provider=
+   provider)` -- the exact call shape used before this milestone.
+3. `SentenceTransformerEmbeddingPort`/`QdrantVectorStorePort` are
+   imported **lazily**, inside `_build_analysis_service`'s own
+   RAG-configured branch, not at `tasks.py`'s top. Necessary because
+   `app/api/dependencies.py` imports this module (for the task object)
+   from the API process -- a top-level import would force `backend`'s
+   image to have `sentence-transformers`/`qdrant-client` importable too,
+   just to import a task definition whose body it never executes.
+4. Collection name: `IngestCweTop25UseCase`'s own `CORPUS_NAME`
+   (`"cwe_top25"`), imported directly, not duplicated as a literal.
+5. Vector size: new `EMBEDDING_VECTOR_SIZE = 384` constant added to
+   `sentence_transformer_provider.py` itself (co-located with
+   `DEFAULT_MODEL_NAME`, since it's a fixed fact about that one locked
+   model), imported by the wiring rather than hardcoded at the call
+   site.
+6. **TD #19 (CPU-only PyTorch) resolution approach:** inspected whether
+   the existing single-Dockerfile-plus-`pyproject.toml`-optional-groups
+   architecture could support a clean `backend`-vs-`worker` dependency
+   split without a larger deployment refactor -- concluded yes, since
+   `pyproject.toml` already had a `dev` optional group precedent to
+   extend. Implemented via a new `rag` optional-dependency group (moved
+   `sentence-transformers`/`qdrant-client` out of the base
+   `dependencies` list) plus a Dockerfile `ARG INSTALL_RAG_DEPENDENCIES`
+   (default `false`) that, when `"true"`, installs `torch` from
+   PyTorch's own CPU wheel index before `pip install ".[rag]"`.
+   `docker-compose.yml`'s `worker` service passes that arg (plus
+   `QDRANT_URL` and a `qdrant` `depends_on` entry); `backend` does not.
+   `dev` self-references `security-platform-backend[rag]` (verified
+   working in sandbox) so `pip install -e ".[dev]"` -- this project's
+   one established local/CI command -- keeps working unchanged.
+7. **`kb_version` decision (explicit instruction to investigate, not
+   assume):** inspected the ORM model
+   (`app/infrastructure/db/models/findings.py`) and the repository
+   mapping (`add_analysis`/`_analysis_to_domain`) -- confirmed
+   `kb_version` is a real, already-migrated, already-round-tripping
+   column whose own docstring reads "nullable -- no RAG until Phase 5,"
+   unambiguously identifying it as the intended persisted
+   representation. Populated via a new `_build_kb_version` helper in
+   `analysis_service.py`, mirroring `_build_retrieval_metadata`'s own
+   first-match-payload read: `"<corpus>:<corpus_version>"` (e.g.
+   `"cwe_top25:2025"`) when retrieval had a match, else `None`. Threaded
+   through `FindingAnalysisResult` and `run_scan_workflow.py`'s
+   `_persist`.
 
 ## Files changed
-None in `backend/`. This was an investigation-only session by design —
-the instruction's own explicit branch for "insufficient evidence" was
-followed, not worked around. `normalization.py`, `SqlmapAdapter`,
-`test_sqlmap_adapter.py`, `test_normalization.py` all remain exactly as
-the prior (SQLMap adapter) session left them. The only file touched
-this session is `PROJECT_STATE.md` — TD #18 (§12) rewritten to record
-precisely what this session checked (not just re-stated the prior
-session's note), plus a new §7 session-table row and a new §16
-out-of-sequence-session paragraph, both following the established
-pattern from the prior Nmap/SQLMap sessions.
+- `backend/app/workers/tasks.py` (edited) -- new
+  `_build_analysis_service` helper, imports, call site, docstring.
+- `backend/app/config.py` (edited) -- `qdrant_url` documented as
+  deliberately unvalidated/usage-gated; pointer comment in
+  `check_role_boundaries`.
+- `backend/app/ai_agents/analysis_service.py` (edited) -- `kb_version`
+  field, `_build_kb_version`, wired through `analyze()`/
+  `_parse_completion`, docstring.
+- `backend/app/application/scanning/run_scan_workflow.py` (edited) --
+  `kb_version=item.ai_analysis.kb_version` added to `_persist`'s
+  `FindingAnalysis(...)` construction.
+- `backend/app/infrastructure/embeddings/sentence_transformer_provider.py`
+  (edited) -- new `EMBEDDING_VECTOR_SIZE = 384` constant, docstring
+  updated (now wired, not "deferred").
+- `backend/app/infrastructure/vector_store/qdrant_vector_store.py`
+  (edited) -- docstring updated to match (now wired, not "deferred").
+- `backend/pyproject.toml` (edited) -- new `rag` optional group;
+  `dev` self-references it.
+- `backend/Dockerfile` (edited) -- `INSTALL_RAG_DEPENDENCIES` build arg,
+  conditional CPU-only-PyTorch-first install path.
+- `docker-compose.yml` (edited) -- `worker` gains the build arg,
+  `QDRANT_URL`, and a `qdrant` `depends_on` entry; `qdrant`'s own
+  comment updated; `backend` unchanged.
+- `backend/tests/unit/test_tasks_composition.py` (new, 6685 bytes) --
+  5 tests isolating `_build_analysis_service`.
+- `backend/tests/unit/test_analysis_service.py` (edited) -- 4 new
+  `kb_version` tests appended (37 tests total in that file now).
+- `PROJECT_STATE.md`, `docs/implementation_progress.md`,
+  `docs/session_state.md` (this file) -- all three updated.
 
-## Verification — exact results
-Since nothing in `backend/` changed, this was a confirmation pass, not
-a build — but run for real rather than cited from the prior session's
-numbers, to catch any silent drift:
+**Confirmed untouched, by direct fresh-read comparison, not just by
+claim:** `app/main.py`, `EmbeddingPort`, `VectorStorePort`, the Qdrant
+adapter's actual logic (docstring only touched), `AIProviderPort`,
+CWE ingestion, scanner adapters, `docker-compose.yml`'s `backend`
+service and every network/security boundary (`internal`/`queue`/
+`worker-egress`/`scan-egress`, `secure=True` cookies -- neither
+mentioned nor touched).
 
-- **`pytest tests/ -q` → 99 passed, 0 failed** — identical to the
-  SQLMap adapter session's own result, as expected with zero code
-  changes.
-- Ruff (lint + format) and MyPy `--strict`: both still clean on
-  `normalization.py`, `app/scanner_engine/adapters/sqlmap/adapter.py`,
-  `tests/unit/test_sqlmap_adapter.py`, `tests/unit/test_normalization.py`.
+## Verification -- exact results
+- **Sandbox `pytest tests/unit/ -q` -> 82 passed, 0 failed** (73
+  pre-existing across Milestones 1-4 + 9 new: 4 `kb_version` + 5
+  `_build_analysis_service` composition tests). 100% coverage on
+  `analysis_service.py`.
+- **Ruff (lint + format) and MyPy `--strict`** both clean across the
+  reconstructed sandbox package (71 files).
+- Self-referential `rag` extras mechanism confirmed working in sandbox
+  before being written to the real `pyproject.toml`.
+- **Explicitly not claimed as verified, per instruction:**
+  - `test_scan_worker_task.py` (the full Postgres-backed integration
+    harness) was not re-run this session -- given the memory-drift risk
+    above, faithfully reconstructing that harness plus its ~25-file
+    dependency tree was judged too failure-prone to trust as a signal;
+    the new `test_tasks_composition.py` covers the actual new logic
+    directly, and every other file that harness touches was confirmed
+    unchanged by direct diff review during the real edits.
+  - No real Qdrant server was reachable this session (TD #20 unchanged
+    -- same constraint as Milestone 2: no host port mapping, no network
+    path from Claude's sandbox regardless).
+  - No actual Docker build was run -- no command-execution tool via the
+    Filesystem MCP, and Claude's own sandbox cannot build Docker images.
+    The CPU-only-torch/image-split Dockerfile logic is standard,
+    well-documented technique, not confirmed working end-to-end here.
+  - The full real-repository test suite (~48 files) was not run against
+    the actual repo -- no execution access exists against the real path
+    directly; verification is sandbox-only, as always, but this
+    session's sandbox coverage of the untouched surrounding system is
+    narrower than some prior sessions' for the reason above.
+  - Recommended: a real `docker build --build-arg
+    INSTALL_RAG_DEPENDENCIES=true` for `worker`, and a full `pytest
+    tests/ -q` run, in an environment with execution access (e.g.
+    Claude Code).
 
 ## Pending work
-TD #18 remains open, now on its second confirmed investigation rather
-than a single unexamined note. Resolving it needs one of: (a) a real,
-sqlmap-documented structured output mode being identified (none is
-currently known to exist for injection-detection findings specifically
-— sqlmap's `--dump-format` options are for exfiltrated table data, a
-different concept); (b) real captured sqlmap output being added to this
-repository as a genuine fixture, which a parser could then be built and
-verified against — the missing ingredient this session identified
-precisely, not vaguely; or (c) an explicit human decision to accept the
-risk of a deliberately conservative, fragility-flagged text parser
-built from outside knowledge, made consciously rather than by an AI
-session quietly substituting its own memory for the repository's own
-standard of evidence.
-
-SQLMap's own three-session arc (adapter → wiring → normalizer,
-mirroring Nmap's) remains one-third complete, unchanged by this
-session: no pipeline/API wiring exists yet for `sqlmap`
-(`AppState.active_scanners`, `_select_active_scanner`, the
-`scanner_name` API literal all still nuclei/nmap-only). Remaining
-Phase 4 scanner adapters (burp/zap/reconx/bughunter) untouched. All
-Phase 3 frontend items and the standing TD list remain exactly where
-prior sessions left them — see PROJECT_STATE.md §12/§13 for the
-current, authoritative full list, not re-duplicated here since nothing
-about it changed this session.
+- **TD #19**: updated to "addressed in code/config, not build-verified"
+  -- needs a real `docker build` to close out.
+- **TD #20**: unchanged -- still needs a reachable real Qdrant instance
+  to verify against.
+- **TD #21**: unchanged, untouched this session.
+- Phase 5 as originally scoped is now complete (Milestones 1-5). Any
+  further Phase 5 work (real-environment verification, retrieval
+  tuning, a second knowledge source) is new scope, not a carry-over.
+- Everything else is exactly where the tenth session left it: TD #18
+  open; SQLMap pipeline/API wiring not started; Phase 3 frontend Step 5
+  awaiting a scope decision; the two orphaned `reconx`/`bughunter` stub
+  folders still not deletable -- see `PROJECT_STATE.md` §12/§13 for the
+  current, authoritative list, not re-duplicated here since nothing
+  about those items changed this session.
 
 ## Next immediate task
-No next task self-selected. TD #18 stays open and honestly documented
-rather than closed by fabrication. Independent things still open, none
-blocking the others: (1) Step 5's scope for the Phase 3 frontend test
-suite; (2) a future SQLMap pipeline/API wiring session (adapter
-selection/execution only — would not by itself resolve TD #18); (3)
-supplying real captured sqlmap output as a repository fixture, if
-Madhav has or can generate one, which would change TD #18's own
-calculus directly; (4) whether to continue building further Phase 4
-adapters (burp/zap/reconx/bughunter — note burp/zap are
-`ImportScanner`-shaped, a genuinely different architecture than every
-adapter built so far, and reconx/bughunter have no available spec in
-this repo, so either would need its own scoping discussion before
-implementation). Await explicit instruction before starting new work.
+No further Phase 5 milestone is defined -- per instruction, stopped
+after Milestone 5, no Phase 6 or unrelated work begun. The two
+concrete, mechanical follow-ups this session itself identified (a real
+`docker build` to close TD #19; a reachable Qdrant instance to close TD
+#20) are verification work, not new implementation, and were left for
+an environment that can actually perform them. Also outstanding,
+independent of Phase 5 and unaffected by this session: Step 5's scope
+decision, a future SQLMap pipeline/API wiring session, TD #18, and the
+`reconx`/`bughunter` manual-deletion item.

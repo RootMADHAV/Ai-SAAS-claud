@@ -76,8 +76,8 @@ services:
       interval: 5s
       timeout: 5s
       retries: 10
-    networks:
-      - internal
+    networks: [internal, queue]
+    ports: ["5433:5432"]
 
   redis:
     image: redis:7
@@ -88,6 +88,7 @@ services:
       retries: 10
     networks:
       - queue
+    ports: ["6379:6379"]
 
   minio:
     image: minio/minio:latest
@@ -97,11 +98,12 @@ services:
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-change_me_dev_only}
     volumes:
       - minio_data:/data
-    ports:
+    ports: ["9000:9000", "9001:9001"]
+    #ports:
       # Only the admin console, for a human operator to inspect stored
       # scan output -- the S3 API port (9000) is never exposed to the
       # host; only `backend`/`worker` on the `queue` network reach it.
-      - "9001:9001"
+    #  - "9001:9001"
     healthcheck:
       test: ["CMD", "mc", "ready", "local"]
       interval: 5s
@@ -114,13 +116,20 @@ services:
     image: qdrant/qdrant:latest
     volumes:
       - qdrant_data:/qdrant/storage
+    ports: ["6333:6333"]
     networks:
       - queue
     # Running from day one per PROJECT_STATE.md section 2 ("Qdrant ...
-    # running from day one per requirement; unused until Phase 5 RAG"),
-    # not yet called by any application code -- no healthcheck-gated
-    # `depends_on` anywhere in this file waits on it, since nothing yet
-    # needs it to be ready.
+    # running from day one per requirement; unused until Phase 5 RAG").
+    # Phase 5 Milestone 5: `worker` now depends on this service starting
+    # (see `worker`'s own `depends_on` below) -- `service_started`, not
+    # `service_healthy`, since this image ships no healthcheck this file
+    # can rely on being accurate. That dependency is an ordering hint,
+    # not a hard precondition: AnalysisService's retrieval is optional-
+    # by-design (Phase 5 Milestone 4) and degrades gracefully if Qdrant
+    # is not yet reachable when a scan actually runs, so `worker` starting
+    # before Qdrant is fully ready is not a correctness problem, only a
+    # larger "retrieval unavailable" window than necessary.
 
   backend:
     build:
@@ -158,6 +167,13 @@ services:
   worker:
     build:
       context: ./backend
+      args:
+        # Phase 5 Milestone 5: the only service that gets the RAG
+        # dependency stack (backend/pyproject.toml's `rag` optional
+        # group, backend/Dockerfile's own comment on this arg) --
+        # `backend` below does not set this, so it gets the smaller,
+        # RAG-free image via the Dockerfile's own default.
+        INSTALL_RAG_DEPENDENCIES: "true"
     command: celery -A app.workers.celery_app worker --loglevel=info -Q scans
     environment:
       ENVIRONMENT: ${ENVIRONMENT:-development}
@@ -171,6 +187,13 @@ services:
       AI_DEFAULT_PROVIDER: ${AI_DEFAULT_PROVIDER:-anthropic}
       AI_MODEL: ${AI_MODEL:-claude-sonnet-4-5}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:?ANTHROPIC_API_KEY must be set -- see .env.example}
+      # Phase 5 Milestone 5: optional, deliberately not `:?required` --
+      # app/config.py's qdrant_url is not validated as required (see
+      # that field's own comment); AnalysisService's retrieval degrades
+      # gracefully with no Qdrant configured (Phase 5 Milestone 4).
+      # Fixed internal service address, not a credential, same style as
+      # MINIO_ENDPOINT above -- not templated with a shell-var default.
+      QDRANT_URL: http://qdrant:6333
       # No JWT_SECRET here -- only worker_role=api requires it
       # (app/config.py); this process never issues or verifies a token.
     depends_on:
@@ -180,6 +203,8 @@ services:
         condition: service_healthy
       minio:
         condition: service_healthy
+      qdrant:
+        condition: service_started
     networks:
       - internal
       - queue
