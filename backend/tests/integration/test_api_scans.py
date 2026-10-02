@@ -40,6 +40,10 @@ helper and sends the resulting access-token cookie on every request.
 itself (missing/malformed/wrongly-signed tokens, non-members, and
 non-ACTIVE memberships).
 
+Phase 6 Milestone 1 (RBAC): ``TestRoleBasedAccess`` (end of this file)
+covers the role matrix on top of that -- OWNER/ADMIN/MEMBER may
+create/run/read scans, VIEWER may only read (create/run -> 403).
+
 ``_create_organization()`` calls ``set_org_context()`` before inserting
 its test organization -- ``organizations``' own RLS policy
 (``id = current_setting('app.current_org_id')::uuid``) requires that GUC
@@ -54,6 +58,7 @@ from uuid import UUID, uuid4
 import httpx
 import pytest
 from fastapi import FastAPI
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from app.api.dependencies import (
@@ -651,13 +656,72 @@ class TestAuthenticationAndAuthorization:
 
         assert response.status_code == 403
 
-    async def test_viewer_role_member_can_still_read_and_create(
+
+_WRITER_ROLES = [OrganizationRole.OWNER, OrganizationRole.ADMIN, OrganizationRole.MEMBER]
+
+
+async def _count_scans(db_session: AsyncSession, organization_id: UUID) -> int:
+    """Counts ``scans`` rows through the same RLS-scoped path production
+    code uses (``app.current_org_id`` set, non-superuser ``app_user``) --
+    used to prove a denied create wrote nothing, not merely that it
+    returned 403."""
+    await set_org_context(db_session, organization_id)
+    result = await db_session.execute(text("SELECT count(*) FROM scans"))
+    count: int = result.scalar_one()
+    await db_session.rollback()
+    return count
+
+
+class TestRoleBasedAccess:
+    """Phase 6 Milestone 1 (RBAC) -- the role matrix, end to end over
+    real HTTP against real Postgres with genuine RLS (non-superuser
+    ``app_user``):
+
+        OWNER / ADMIN / MEMBER: read scans + create/run scans
+        VIEWER:                 read scans only
+
+    Replaces the earlier
+    ``test_viewer_role_member_can_still_read_and_create``, which asserted
+    the pre-RBAC behavior (membership-only gate, any ACTIVE role could
+    create) that this milestone intentionally changed.
+    """
+
+    @pytest.mark.parametrize("role", _WRITER_ROLES)
+    async def test_writer_role_can_create_run_and_read_a_scan(
+        self,
+        wired_app: FastAPI,
+        db_session: AsyncSession,
+        dispatcher: _RecordingDispatcher,
+        role: OrganizationRole,
+    ) -> None:
+        org_id = await _create_organization(db_session)
+        cookies = await _create_authenticated_member(db_session, org_id, role=role)
+
+        async with await _make_client(wired_app) as client:
+            created = await client.post(
+                f"/api/v1/organizations/{org_id}/scans",
+                json={"target": "example.com"},
+                cookies=cookies,
+            )
+            assert created.status_code == 201
+            scan_id = created.json()["id"]
+
+            ran = await client.post(
+                f"/api/v1/organizations/{org_id}/scans/{scan_id}/run", cookies=cookies
+            )
+            assert ran.status_code == 202
+
+            fetched = await client.get(
+                f"/api/v1/organizations/{org_id}/scans/{scan_id}", cookies=cookies
+            )
+            assert fetched.status_code == 200
+            assert fetched.json()["id"] == scan_id
+
+        assert dispatcher.calls == [(org_id, UUID(scan_id), "nuclei")]
+
+    async def test_viewer_cannot_create_a_scan_and_nothing_is_written(
         self, wired_app: FastAPI, db_session: AsyncSession
     ) -> None:
-        # Membership-only gate, not RBAC (out of this work's own scope --
-        # Phase 6 on PROJECT_STATE.md's own roadmap): any ACTIVE role,
-        # including the least-privileged VIEWER, passes
-        # require_organization_member.
         org_id = await _create_organization(db_session)
         cookies = await _create_authenticated_member(
             db_session, org_id, role=OrganizationRole.VIEWER
@@ -670,4 +734,130 @@ class TestAuthenticationAndAuthorization:
                 cookies=cookies,
             )
 
-        assert response.status_code == 201
+        assert response.status_code == 403
+        assert "viewer" in response.json()["detail"]
+        assert await _count_scans(db_session, org_id) == 0
+
+    async def test_viewer_cannot_run_a_scan_and_nothing_is_dispatched(
+        self, wired_app: FastAPI, db_session: AsyncSession, dispatcher: _RecordingDispatcher
+    ) -> None:
+        org_id = await _create_organization(db_session)
+        owner_cookies = await _create_authenticated_member(db_session, org_id)
+        viewer_cookies = await _create_authenticated_member(
+            db_session, org_id, role=OrganizationRole.VIEWER
+        )
+
+        async with await _make_client(wired_app) as client:
+            created = await client.post(
+                f"/api/v1/organizations/{org_id}/scans",
+                json={"target": "example.com"},
+                cookies=owner_cookies,
+            )
+            scan_id = created.json()["id"]
+
+            denied = await client.post(
+                f"/api/v1/organizations/{org_id}/scans/{scan_id}/run", cookies=viewer_cookies
+            )
+            still_queued = await client.get(
+                f"/api/v1/organizations/{org_id}/scans/{scan_id}", cookies=owner_cookies
+            )
+
+        assert denied.status_code == 403
+        assert dispatcher.calls == []
+        assert still_queued.json()["status"] == ScanStatus.QUEUED.value
+
+    async def test_viewer_can_read_a_scan_created_by_another_member(
+        self, wired_app: FastAPI, db_session: AsyncSession
+    ) -> None:
+        org_id = await _create_organization(db_session)
+        owner_cookies = await _create_authenticated_member(db_session, org_id)
+        viewer_cookies = await _create_authenticated_member(
+            db_session, org_id, role=OrganizationRole.VIEWER
+        )
+
+        async with await _make_client(wired_app) as client:
+            created = await client.post(
+                f"/api/v1/organizations/{org_id}/scans",
+                json={"target": "example.com"},
+                cookies=owner_cookies,
+            )
+            scan_id = created.json()["id"]
+
+            fetched = await client.get(
+                f"/api/v1/organizations/{org_id}/scans/{scan_id}", cookies=viewer_cookies
+            )
+
+        assert fetched.status_code == 200
+        assert fetched.json()["id"] == scan_id
+        assert len(fetched.json()["workflow_steps"]) == 8
+
+    async def test_viewer_gets_403_not_404_when_running_a_nonexistent_scan(
+        self, wired_app: FastAPI, db_session: AsyncSession, dispatcher: _RecordingDispatcher
+    ) -> None:
+        """The role check runs before the handler's scan lookup, so a
+        VIEWER cannot use the 404-vs-403 difference to probe which scan
+        ids exist."""
+        org_id = await _create_organization(db_session)
+        cookies = await _create_authenticated_member(
+            db_session, org_id, role=OrganizationRole.VIEWER
+        )
+
+        async with await _make_client(wired_app) as client:
+            response = await client.post(
+                f"/api/v1/organizations/{org_id}/scans/{uuid4()}/run", cookies=cookies
+            )
+
+        assert response.status_code == 403
+        assert dispatcher.calls == []
+
+    async def test_a_removed_owner_is_still_rejected_the_role_does_not_bypass_status(
+        self, wired_app: FastAPI, db_session: AsyncSession
+    ) -> None:
+        org_id = await _create_organization(db_session)
+        cookies = await _create_authenticated_member(
+            db_session, org_id, role=OrganizationRole.OWNER, status=MembershipStatus.REMOVED
+        )
+
+        async with await _make_client(wired_app) as client:
+            response = await client.post(
+                f"/api/v1/organizations/{org_id}/scans",
+                json={"target": "example.com"},
+                cookies=cookies,
+            )
+
+        assert response.status_code == 403
+        assert "not an active member" in response.json()["detail"]
+
+    async def test_role_is_evaluated_per_organization(
+        self, wired_app: FastAPI, db_session: AsyncSession
+    ) -> None:
+        """One user, VIEWER in org A and OWNER in org B: denied in A,
+        allowed in B. The role that counts is the one on *that*
+        organization's membership row, never a global per-user role."""
+        org_a = await _create_organization(db_session)
+        org_b = await _create_organization(db_session)
+        user = make_user()
+        await SqlAlchemyUserRepository(db_session).add(user)
+        for org_id, role in ((org_a, OrganizationRole.VIEWER), (org_b, OrganizationRole.OWNER)):
+            await set_org_context(db_session, org_id)
+            await SqlAlchemyOrganizationRepository(db_session).add_member(
+                make_member(org_id, user.id, role=role)
+            )
+        await db_session.commit()
+        token = create_access_token(user_id=user.id, secret=_TEST_JWT_SECRET, expire_minutes=15)
+        cookies = {ACCESS_TOKEN_COOKIE_NAME: token}
+
+        async with await _make_client(wired_app) as client:
+            in_a = await client.post(
+                f"/api/v1/organizations/{org_a}/scans",
+                json={"target": "example.com"},
+                cookies=cookies,
+            )
+            in_b = await client.post(
+                f"/api/v1/organizations/{org_b}/scans",
+                json={"target": "example.com"},
+                cookies=cookies,
+            )
+
+        assert in_a.status_code == 403
+        assert in_b.status_code == 201

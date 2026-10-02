@@ -25,6 +25,7 @@ from app.application.interfaces.identity_repository import (
 from app.application.interfaces.scanner_port import ActiveScanner
 from app.application.interfaces.scanning_repository import ScanRepositoryPort
 from app.application.scanning.trigger_scan import TriggerScanUseCase
+from app.domain.identity.access import SCAN_WRITE_ROLES, can_write_scans
 from app.domain.identity.entities import OrganizationMember, User
 from app.domain.shared.enums import MembershipStatus
 from app.domain.shared.ids import new_id
@@ -211,6 +212,40 @@ async def require_organization_member(
         raise HTTPException(
             status_code=403,
             detail=f"user {current_user.id} is not an active member of organization {organization_id}",
+        )
+    return member
+
+
+async def require_scan_write_access(
+    member: OrganizationMember = Depends(require_organization_member),
+) -> OrganizationMember:
+    """Phase 6 Milestone 1 (RBAC): layered on top of
+    ``require_organization_member`` rather than replacing it -- that
+    dependency still owns authentication (401), the organization-exists
+    check (404), and the ACTIVE-membership check (403), and still reuses
+    ``get_org_session``'s one already-open RLS-scoped transaction. This
+    only adds the role check, using the ``OrganizationMember`` that
+    dependency already resolved (no second query).
+
+    Applied to the two scan routes that change state (``create_scan``,
+    ``run_scan`` in app/api/v1/scans.py). ``get_scan`` stays on plain
+    ``require_organization_member`` -- every ACTIVE member may read.
+
+    Because FastAPI resolves dependencies before the route body runs, a
+    denied role gets 403 before the handler can reveal whether a given
+    scan id exists (no 404-vs-403 oracle for a VIEWER) and before any
+    write is attempted. The role rule itself lives in the domain layer
+    (app/domain/identity/access.py); this function only maps a denial to
+    HTTP 403.
+    """
+    if not can_write_scans(member.role):
+        allowed = ", ".join(sorted(role.value for role in SCAN_WRITE_ROLES))
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                f"role {member.role.value!r} may not create or run scans in organization "
+                f"{member.organization_id} (allowed roles: {allowed})"
+            ),
         )
     return member
 

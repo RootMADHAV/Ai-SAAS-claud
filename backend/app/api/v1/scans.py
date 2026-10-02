@@ -80,6 +80,14 @@ to ``TriggerScanUseCase.execute`` -- a parameter that use case has
 supported since Milestone 4, previously always called with the default
 ``None`` since no route had an authenticated caller to attribute a scan
 to until now.
+
+Phase 6 Milestone 1 (RBAC) update: role enforcement on top of the
+membership check above, using the role matrix in
+``app/domain/identity/access.py`` -- ``create_scan`` and ``run_scan``
+additionally require ``require_scan_write_access`` (OWNER/ADMIN/MEMBER;
+a VIEWER gets 403), while ``get_scan`` stays on plain
+``require_organization_member`` (every ACTIVE member, VIEWER included,
+may read). No other route behavior changed.
 """
 
 from __future__ import annotations
@@ -96,6 +104,7 @@ from app.api.dependencies import (
     get_scan_repository,
     get_trigger_scan_use_case,
     require_organization_member,
+    require_scan_write_access,
 )
 from app.api.v1.schemas import ScanCreateRequest, ScanDetailResponse
 from app.application.interfaces.scanner_port import ActiveScanner
@@ -116,7 +125,7 @@ async def create_scan(
     trigger_scan: TriggerScanUseCase = Depends(get_trigger_scan_use_case),
     scan_repository: ScanRepositoryPort = Depends(get_scan_repository),
     current_user: User = Depends(get_current_user),
-    _member: OrganizationMember = Depends(require_organization_member),
+    _member: OrganizationMember = Depends(require_scan_write_access),
 ) -> ScanDetailResponse:
     """Creates a ``Scan`` (status ``QUEUED``) plus its eight
     ``ScanWorkflowStep`` rows, all ``PENDING`` -- see
@@ -128,6 +137,9 @@ async def create_scan(
     app/api/dependencies.py). ``current_user.id`` is passed through as
     ``triggered_by_user_id``, attributing the scan to whoever actually
     triggered it.
+
+    Phase 6 Milestone 1: additionally requires the OWNER, ADMIN, or
+    MEMBER role (``require_scan_write_access``) -- a VIEWER gets 403.
     """
     scan = await trigger_scan.execute(
         organization_id=organization_id,
@@ -149,7 +161,7 @@ async def run_scan(
     active_scanners: tuple[ActiveScanner, ...] = Depends(get_active_scanners),
     scan_repository: ScanRepositoryPort = Depends(get_scan_repository),
     dispatch_scan: ScanDispatcher = Depends(get_scan_dispatcher),
-    _member: OrganizationMember = Depends(require_organization_member),
+    _member: OrganizationMember = Depends(require_scan_write_access),
 ) -> ScanDetailResponse:
     """Validates, then dispatches the processing pipeline for an
     already-triggered scan to run asynchronously -- see module docstring
@@ -166,6 +178,10 @@ async def run_scan(
     Requires an authenticated, active member of
     ``organization_id`` (see ``require_organization_member``,
     app/api/dependencies.py).
+
+    Phase 6 Milestone 1: additionally requires the OWNER, ADMIN, or
+    MEMBER role (``require_scan_write_access``) -- a VIEWER gets 403,
+    before the scan lookup runs (so no 404-vs-403 oracle).
 
     Poll ``GET .../scans/{scan_id}`` (below) to observe progress to
     completion.
@@ -205,6 +221,9 @@ async def get_scan(
     Requires an authenticated, active member of
     ``organization_id`` (see ``require_organization_member``,
     app/api/dependencies.py).
+
+    Phase 6 Milestone 1: every ACTIVE role, VIEWER included, may read --
+    deliberately not gated by ``require_scan_write_access``.
     """
     scan = await scan_repository.get_by_id(scan_id)
     if scan is None:

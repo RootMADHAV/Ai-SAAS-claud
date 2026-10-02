@@ -57,7 +57,58 @@ RUN if [ "$INSTALL_RAG_DEPENDENCIES" = "true" ]; then \
         pip install --no-cache-dir .; \
     fi
 
+# Scanner binaries (`nuclei`, `nmap`) -- the real executables the two wired
+# ActiveScanner adapters (app/scanner_engine/adapters/{nuclei,nmap}/
+# adapter.py) launch via run_scanner_subprocess. Without them the
+# `worker` container's EXECUTE_SCANNER step always fails: VALIDATE_TARGET
+# passes, then asyncio.create_subprocess_exec raises FileNotFoundError
+# for `nuclei` (recorded on the step's error_message, scan -> FAILED) and
+# every later step stays PENDING. The adapters' tests fake the scanner,
+# so nothing before this ever ran a real binary.
+#
+# Same opt-in shape as INSTALL_RAG_DEPENDENCIES above: "true" for the
+# `worker` service only (docker-compose.yml), default "false" so the
+# `backend`/api image -- which never executes a scanner -- stays free of
+# them.
+#
+# nuclei is fetched in this throwaway stage (curl/unzip never reach the
+# runtime image) from the project's official GitHub release, pinned to an
+# exact version and verified against that release's published SHA-256
+# (<release>/nuclei_<version>_checksums.txt) before it is extracted. To
+# bump: change NUCLEI_VERSION and both checksums together. nmap comes from
+# the distro package in the runtime stage below.
+FROM python:3.12-slim AS scanner-binaries
+
+ARG INSTALL_SCANNER_BINARIES=false
+ARG NUCLEI_VERSION=3.11.1
+ARG NUCLEI_SHA256_AMD64=ea63d4ae232808cd7c6bc00d0142428e231fab59dae01042246097d195835ab6
+ARG NUCLEI_SHA256_ARM64=8044e3d9768ba0a744b2872c1a87e813006f013da97ca9f50f7661a4203bec07
+
+# Always creates /out/bin (empty unless the arg is "true") so the runtime
+# stage's COPY --from below has a source in both build modes -- a COPY
+# cannot itself be made conditional on a build arg.
+RUN mkdir -p /out/bin
+RUN if [ "$INSTALL_SCANNER_BINARIES" = "true" ]; then \
+        set -eux; \
+        apt-get update; \
+        apt-get install -y --no-install-recommends curl unzip; \
+        arch="$(dpkg --print-architecture)"; \
+        case "$arch" in \
+            amd64) sha="$NUCLEI_SHA256_AMD64" ;; \
+            arm64) sha="$NUCLEI_SHA256_ARM64" ;; \
+            *) echo "no pinned nuclei checksum for architecture: $arch" >&2; exit 1 ;; \
+        esac; \
+        curl -fsSL -o /tmp/nuclei.zip \
+            "https://github.com/projectdiscovery/nuclei/releases/download/v${NUCLEI_VERSION}/nuclei_${NUCLEI_VERSION}_linux_${arch}.zip"; \
+        echo "${sha}  /tmp/nuclei.zip" | sha256sum -c -; \
+        unzip -q /tmp/nuclei.zip nuclei -d /out/bin; \
+        chmod 0755 /out/bin/nuclei; \
+    fi
+
 FROM python:3.12-slim AS runtime
+
+# Re-declared: a build ARG is scoped to the stage that declares it.
+ARG INSTALL_SCANNER_BINARIES=false
 
 # A non-root user to run as -- the same "never run as root" posture
 # already enforced in-process for scanner subprocess execution
@@ -66,6 +117,20 @@ FROM python:3.12-slim AS runtime
 # substitute for that in-process check, which still applies regardless
 # of what the container's own UID happens to be.
 RUN groupadd --system app && useradd --system --gid app --create-home app
+
+# nmap (distro package) plus the pinned nuclei binary from the
+# `scanner-binaries` stage above -- see that stage's comment for why.
+# Installed here, as root, before the `USER app` line below; both
+# binaries are then run by the non-root `app` user (nmap with -sT/-Pn
+# only, which needs no raw-socket privileges -- see NmapAdapter). The
+# COPY is a no-op (empty directory) when INSTALL_SCANNER_BINARIES is not
+# "true".
+RUN if [ "$INSTALL_SCANNER_BINARIES" = "true" ]; then \
+        apt-get update && \
+        apt-get install -y --no-install-recommends nmap && \
+        rm -rf /var/lib/apt/lists/*; \
+    fi
+COPY --from=scanner-binaries /out/bin/ /usr/local/bin/
 
 COPY --from=builder /opt/venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"

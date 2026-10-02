@@ -50,10 +50,12 @@ from app.api.dependencies import (
     get_current_user,
     get_scan_dispatcher,
     get_session_factory,
+    require_scan_write_access,
 )
 from app.application.interfaces.identity_repository import UserRepositoryPort
-from app.domain.identity.entities import User
+from app.domain.identity.entities import OrganizationMember, User
 from app.domain.shared.clock import utcnow
+from app.domain.shared.enums import MembershipStatus, OrganizationRole
 from app.domain.shared.ids import new_id
 from app.infrastructure.security.token_service import create_access_token
 from app.scanner_engine.adapters.nmap.adapter import NmapAdapter
@@ -220,3 +222,53 @@ async def test_get_current_user_raises_401_when_the_user_is_inactive() -> None:
         await get_current_user(access_token=token, user_repository=repo, auth_config=_auth_config())
 
     assert exc_info.value.status_code == 401
+
+
+def _member(role: OrganizationRole) -> OrganizationMember:
+    now = utcnow()
+    return OrganizationMember(
+        id=new_id(),
+        organization_id=new_id(),
+        user_id=new_id(),
+        role=role,
+        status=MembershipStatus.ACTIVE,
+        created_at=now,
+        updated_at=now,
+    )
+
+
+@pytest.mark.parametrize(
+    "role", [OrganizationRole.OWNER, OrganizationRole.ADMIN, OrganizationRole.MEMBER]
+)
+async def test_require_scan_write_access_returns_the_member_for_a_writer_role(
+    role: OrganizationRole,
+) -> None:
+    """Phase 6 Milestone 1. Unlike ``require_organization_member`` (see
+    this module's docstring), ``require_scan_write_access`` has no
+    database access of its own -- it only inspects the
+    ``OrganizationMember`` that dependency already resolved -- so it can
+    be unit-tested directly with a plain domain object."""
+    member = _member(role)
+
+    result = await require_scan_write_access(member=member)
+
+    assert result is member
+
+
+async def test_require_scan_write_access_raises_403_for_a_viewer() -> None:
+    with pytest.raises(HTTPException) as exc_info:
+        await require_scan_write_access(member=_member(OrganizationRole.VIEWER))
+
+    assert exc_info.value.status_code == 403
+
+
+async def test_require_scan_write_access_403_detail_names_the_role_and_organization() -> None:
+    viewer = _member(OrganizationRole.VIEWER)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await require_scan_write_access(member=viewer)
+
+    detail = str(exc_info.value.detail)
+    assert "viewer" in detail
+    assert str(viewer.organization_id) in detail
+    assert "admin, member, owner" in detail

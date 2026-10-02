@@ -79,3 +79,16 @@ def test_create_celery_app_works_from_the_api_role_too(monkeypatch: pytest.Monke
     app = create_celery_app()
 
     assert app.conf.broker_url == "redis://localhost:6379/0"
+
+
+def test_create_celery_app_includes_the_tasks_module(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Regression test: a worker started as ``celery -A
+    app.workers.celery_app worker`` imports only this module, so the
+    module defining ``scanning.run_scan_workflow`` must be named in
+    ``include`` or every dispatched task is discarded as unregistered
+    (found when the first real worker process was started)."""
+    _set_required_env(monkeypatch)
+
+    app = create_celery_app()
+
+    assert "app.workers.tasks" in app.conf.include

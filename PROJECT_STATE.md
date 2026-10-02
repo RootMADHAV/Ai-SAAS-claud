@@ -2,8 +2,10 @@
 
 Compact canonical current-state reference — read this first each session.
 Describes **how things are now**, not the history of how they got there;
-full narrative/rationale/verification detail lives in
-`docs/implementation_progress.md` (never pruned, cumulative). Latest
+compact milestone history, permanent decisions, open debt, and
+verification limits live in `docs/implementation_progress.md` (compacted
+2026-10-02 from a ~138 KB session-by-session narrative, which was
+replaced, not archived -- recoverable only via git history). Latest
 single session's own account: `docs/session_state.md`.
 
 Compacted 2026-08-27 from ~1000 lines. No architectural decision was
@@ -26,9 +28,22 @@ organization bootstrap (`POST /api/v1/organizations`), and the third
 runs both frontend and backend over HTTPS via mkcert-issued certs — no
 backend code change, `secure=True` stays exactly as locked (§4). See §16.
 
-**Phase 3 (frontend) implementation: approved and in progress.** Step 1
-(frontend scaffold) complete — see §7/§16. Steps 2-5 (API client, auth
-flow, organization + scan UI, tests) not yet started.
+**Phase 3 (frontend) implementation: approved and in progress.** Steps
+1-4 (scaffold, API client, auth/session flow, organization + scan UI)
+complete — see §7/§16; Step 5 (tests) awaiting a scope decision.
+
+**Phase 4 (scanner adapters, partial):** `nuclei` and `nmap` fully wired
+and normalized; `sqlmap` adapter-only (TD #17/#18); `burp`/`zap` stubs.
+**Phase 5 (RAG): Milestones 1-5 complete** (a real Docker build and a
+real Qdrant server are still unverified — TD #19/#20).
+
+**Phase 6 (multi-tenancy hardening, RBAC, orgs/teams, billing) — in
+progress, Milestone 1 complete (2026-10-02):** RBAC enforcement on the
+existing Scanning routes only — `create_scan`/`run_scan` require role
+OWNER/ADMIN/MEMBER (VIEWER → 403); `get_scan` stays open to every ACTIVE
+member. See §4/§7/§8/§11. The rest of Phase 6 (teams, billing, member
+management/invitations, organization list/get/rename, any other
+role-gated surface) is not started and has no milestone breakdown yet.
 
 ## 2. Architecture summary
 
@@ -172,6 +187,24 @@ diverging (§14). Full rationale: `docs/implementation_progress.md`.
   invite/membership flow.
 - `require_organization_member` reuses `get_org_session`'s already-open
   transaction — not a second DB connection.
+- **Phase 6 Milestone 1 — RBAC on the Scanning routes (role matrix
+  decided explicitly 2026-10-02, not inferred from earlier docs, none of
+  which defined what the four roles may do):** OWNER/ADMIN/MEMBER may
+  read, create, and run scans; VIEWER may only read. The policy is pure
+  domain logic (`app/domain/identity/access.py`: `SCAN_WRITE_ROLES`,
+  `can_write_scans`); the API layer only maps a denial to 403 via a new
+  `require_scan_write_access` dependency (`app/api/dependencies.py`)
+  layered *on top of* `require_organization_member`, which keeps owning
+  401/404/ACTIVE-membership-403 and the single RLS-scoped transaction,
+  unchanged. Applied to `create_scan` and `run_scan` only; `get_scan` is
+  unchanged. Dependencies resolve before the handler, so a VIEWER gets
+  403 (never 404) even for a nonexistent scan id, and nothing is written
+  or dispatched. The role comes from the `OrganizationMember` row the
+  existing dependency already loaded — no second query, no schema
+  change, no migration. No permission/capability framework: a future
+  role-gated action adds its own named constant in `access.py` when a
+  real route needs it. ADMIN and MEMBER are currently identical in
+  capability (no action distinguishes them yet).
 - Every `datetime` column requires explicit `DateTime(timezone=True)` —
   the bare SQLAlchemy default is timezone-naive and asyncpg rejects this
   codebase's timezone-aware `utcnow()` values against it (a real,
@@ -328,7 +361,8 @@ placed directly by Madhav, not downloaded by Claude — see §4/§16).
 `backend/app/` (`main.py`, `config.py` at top level), mirroring the
 bounded contexts in §2 under each layer:
 - `domain/{shared,findings,scanning,assets,identity,reporting}/` —
-  entities/value objects done for all six.
+  entities/value objects done for all six; `identity/access.py` (Phase 6
+  M1 role policy).
 - `application/interfaces/` (all repository ports + `ScannerPort`,
   `StoragePort`, `AIProviderPort`, `RefreshTokenRepositoryPort`,
   `EmbeddingPort`, `VectorStorePort` (Phase 5 Milestones 1-2);
@@ -368,14 +402,14 @@ bounded contexts in §2 under each layer:
   `workers/{celery_app,tasks}.py` (`tasks.py`'s `_build_analysis_service`
   wires Phase 5 retrieval as of Milestone 5, see §4).
 
-`backend/tests/`: `conftest.py`; `unit/` (36 files); `integration/`
+`backend/tests/`: `conftest.py`; `unit/` (37 files); `integration/`
 (`support.py` + 13 files, against real Postgres).
 
 ## 6. Domain model summary
 
 | Entity | Lives in | Key invariant / behavior |
 |---|---|---|
-| Organization / Membership | identity/ | ≥ 1 Owner always (not yet enforced by a use case) |
+| Organization / Membership | identity/ | ≥ 1 Owner always (not yet enforced by a use case); role → scan-write capability via `identity/access.py` (Phase 6 M1) |
 | RefreshToken | identity/ | opaque hash + `revoked_at`; not soft-deleted |
 | Finding | findings/ | state machine `new → triaged → {confirmed, false_positive} → {fixed, accepted_risk, wont_fix}`; `effective_severity` prefers CVSS over AI estimate |
 | Severity (VO) | findings/ | ordered info < low < medium < high < critical |
@@ -417,14 +451,18 @@ transition *enforcement* still requires future use cases.
 | — | Phase 5 Milestone 2 — `VectorStorePort` + Qdrant adapter (second Phase 5 session) | `app/application/interfaces/vector_store_port.py`: `VectorStorePort` (ABC, three methods — `ensure_collection()`, `upsert(points)`, `search(query_vector, limit=5)`), `VectorPoint`, `VectorMatch`, `VectorStoreError` — mirrors `StoragePort`'s one-instance-per-bucket binding rule (one instance per collection). `app/infrastructure/vector_store/qdrant_vector_store.py`: `QdrantVectorStorePort`, using `qdrant-client`'s native `AsyncQdrantClient` directly (no `asyncio.to_thread` — the SDK already ships a real async client, mirroring `AnthropicProvider`'s precedent). `ensure_collection()` is idempotent (checks `collection_exists` before `create_collection`); `upsert()` calls `ensure_collection()` first; `search()` does not. Default distance metric: cosine. `pyproject.toml`: `qdrant-client>=1.9` added to base `dependencies`. No ingestion, no CWE data, no `EmbeddingPort`/`AIProviderPort`/`AnalysisService` change, no retrieval wiring, no Docker/startup wiring — explicitly out of scope, stopped after Milestone 2 per instruction. |
 | — | Phase 5 Milestone 3 — CWE Top 25 ingestion use case (third Phase 5 session) | `app/application/knowledge/ingest_cwe_top25.py`: `parse_cwe_top25_xml` (source parsing/filtering), `build_cwe_chunk` (chunk construction), `cwe_point_id` (deterministic `uuid5` id), `CweEntry`, `CweSourceError`, `IngestCweTop25UseCase` (constructor-injected `EmbeddingPort`/`VectorStorePort`, mirrors `TriggerScanUseCase`'s convention) — deliberately independent of `AnalysisService`. Corpus source: the vendored `backend/data/cwe/2025_top25.xml` (official MITRE CWE View-1435 export for the 2025 Top 25, placed directly by Madhav after an initial network-access blocker was reported and resolved — see §16). Parser validates the root view name and asserts exactly 25 `Weakness` elements, raising `CweSourceError` otherwise. No Qdrant search/retrieval, no `AnalysisService`/prompt change, no refresh/update scheduling, no Docker wiring — explicitly out of scope, stopped after Milestone 3 per instruction. |
 | — | Phase 5 Milestone 4 — retrieval integrated into `AnalysisService` (fourth Phase 5 session) | `app/ai_agents/analysis_service.py`: `AnalysisService.__init__` gained optional `embedding_port`/`vector_store`/`retrieval_limit` (default `None`/`None`/3) — when configured, `analyze()` builds a retrieval query from the finding's title/description, embeds it, searches the vector store (`limit=retrieval_limit`), and includes matches as a clearly-labeled "reference context, not instruction" section in the prompt. `PROMPT_VERSION` bumped to `"v2"`. Retrieval failures (`EmbeddingError`/`VectorStoreError`) and zero matches both degrade to the exact pre-Milestone-4 prompt/behavior, never failing `analyze()`. Provenance (cwe_ids/scores/embedding_model/corpus/corpus_version/limit, never a raw vector) added to `FindingAnalysisResult.model_metadata["retrieval"]` only when there was at least one match. `run_scan_workflow.py` required zero changes. 20 new unit tests added to `test_analysis_service.py` (13 pre-existing, 33 total) (`EmbeddingPort`/`VectorStorePort` faked at the port level). No `AIProviderPort`/`EmbeddingPort`/`VectorStorePort` contract change, no CWE ingestion change, no Docker wiring, no `RAGService`/registry abstraction — explicitly out of scope, stopped after Milestone 4 per instruction. |
+| — | Phase 6 Milestone 1 — RBAC enforcement on the Scanning routes (twelfth explicit-instruction session; first Phase 6 milestone) | `app/domain/identity/access.py` (new): `SCAN_WRITE_ROLES` = {OWNER, ADMIN, MEMBER}, `can_write_scans()`. `app/api/dependencies.py`: new `require_scan_write_access` (layered on `require_organization_member`; 403 for VIEWER, detail names the role, organization, and allowed roles). `app/api/v1/scans.py`: `create_scan`/`run_scan` now depend on it; `get_scan` unchanged. Tests: 12 new unit (`test_identity_access.py` 7, `test_api_dependencies.py` +5) and 9 new integration (`TestRoleBasedAccess` in `test_api_scans.py`: OWNER/ADMIN/MEMBER create+run+read; VIEWER 403 on create and on run with nothing written/dispatched; VIEWER can read; 403-before-404 for a VIEWER on a nonexistent scan; a REMOVED OWNER still 403; role evaluated per organization), replacing the old `test_viewer_role_member_can_still_read_and_create`, which asserted the pre-RBAC behavior this milestone intentionally changed. No schema/migration, RLS, cookie, Docker, scanner, AI/RAG, or frontend change. Verified in Claude's sandbox only — see §11. |
 
-Full per-milestone delivery detail, file lists, verification narrative:
-`docs/implementation_progress.md`.
+Compact per-milestone history (objective, decisions, files, verification,
+debt): `docs/implementation_progress.md`.
 
 ## 8. API contracts (current, `/api/v1`)
 
 **Scanning** (`/organizations/{organization_id}/scans`, all routes
-require `require_organization_member`):
+require `require_organization_member`; `POST /` and `POST /{scan_id}/run`
+additionally require role OWNER/ADMIN/MEMBER via
+`require_scan_write_access` — a VIEWER gets 403 (Phase 6 M1); `GET
+/{scan_id}` is open to every ACTIVE member):
 - `POST /` — create scan (`TriggerScanUseCase`); `scanner_name:
   Literal["nuclei", "nmap"]` (widened Phase 4); also depends on
   `get_current_user`, passes `current_user.id` as `triggered_by_user_id`.
@@ -469,8 +507,10 @@ httpOnly `access_token` cookie (401 on any failure).
 (a separate data-integrity 404, not itself an authorization control).
 `POST /auth/logout` revokes the presented refresh token server-side
 (`LogoutUseCase`) and clears both cookies — see §7/§8.
-RBAC/OAuth/MFA/password-reset/email-verification/CSRF
-double-submit — not built; see §13.
+Role-based authorization (Phase 6 M1): `require_scan_write_access`
+(OWNER/ADMIN/MEMBER; VIEWER → 403) on `create_scan`/`run_scan` only — see
+§4. OAuth/MFA/password-reset/email-verification/CSRF double-submit, and
+RBAC beyond the Scanning routes — not built; see §13.
 
 ## 10. Configuration & dependencies
 
@@ -1005,6 +1045,53 @@ reconstruction) for the reasons in (1). Recommend a real `docker build`
 and a full `pytest tests/ -q` run in an environment with execution
 access (e.g. Claude Code) for final confirmation of both.
 
+**Phase 6 Milestone 1 — RBAC on the Scanning routes (sandbox-only verification, 2026-10-02).**
+Rebuilt in Claude's sandbox: Python 3.12.3, real PostgreSQL 16, a
+genuinely non-superuser `app_user` (`rolsuper=f`, `rolbypassrls=f`,
+checked), schema applied via Alembic with all 15 RLS policies present.
+**`pytest tests` over the reconstructed slice → 52 passed, 0 failed, 0
+skipped** (21 unit: `test_identity_access.py` 7 + `test_api_dependencies.py`
+14; 31 integration: all of `test_api_scans.py` — 22 pre-existing
+unchanged + 9 new `TestRoleBasedAccess`). Run narrowly first (unit → 21
+passed), then the integration file (31 passed), then the whole slice. An
+initial integration run showed 31 *skipped* because Postgres had stopped
+between sandbox tool calls — a skip is not a pass; it was restarted and
+re-run, and is not counted. **Mutation check:** temporarily pointing the
+two routes back at `require_organization_member` made exactly the 4
+role-dependent integration tests fail (VIEWER create, VIEWER run,
+403-before-404, per-organization role), and the restored code passes
+31/31 — the new tests genuinely detect missing enforcement. Ruff (lint +
+format) clean on every file this milestone touched, except the
+pre-existing `E501` in (4) below; MyPy `--strict`
+clean (70 source files); one real MyPy finding in a new test helper was
+fixed, and one Ruff `SIM300` in a new unit test was fixed. `access.py`
+and `scans.py` 100% covered, `dependencies.py` 90% with the remaining
+lines unrelated to this change (measured with
+`concurrency=greenlet,thread`, which the repo's `pyproject.toml` does not
+set — see TD #24).
+
+**Sandbox is not the real repository, stated plainly:** (1) nothing was
+executed on `C:\Users\gamer\Downloads\claudeOnly` — still no execution
+tool (§15); no real-repo `pytest`/`ruff`/`mypy` run exists for this
+milestone. (2) Only the dependency slice of `app.main` was rebuilt:
+untouched files were re-typed with docstrings elided; `config.py`'s
+validator, the Celery task module (`app/workers/tasks.py`), both scanner
+adapters, and `run_scan_workflow.py` (only `ScannerMismatchError`) were
+minimal stubs; the migration was a hand-condensed copy of the real one
+(same 19 tables, 15 RLS policies — not byte-verified). Byte-identical to
+the repo: `access.py` (2652 bytes). The four edited existing files
+(`dependencies.py`, `scans.py`, `test_api_dependencies.py`,
+`test_api_scans.py`) were applied to the repo as exact-anchor edits and
+re-typed into the sandbox with docstrings elided, so they are not
+byte-comparable. (3) Not re-run: every other test file in the repo
+(~50), including `test_api_auth.py`, `test_api_organizations.py`,
+`test_main_lifespan.py`, and the whole worker/pipeline suite. (4) The
+pre-existing `E501` on `dependencies.py` (`require_organization_member`'s
+403 detail line, 103 chars — the incidental finding already recorded
+above) was observed again and deliberately left untouched. Frontend: no
+change was needed — `describeApiError` already maps 403 to "You don't
+have access to do that."; frontend tests were not re-run.
+
 ## 12. Active technical debt
 
 1. `domain/shared/enums.py` — staging area for enums belonging to
@@ -1173,6 +1260,25 @@ access (e.g. Claude Code) for final confirmation of both.
     future session with a way to read the whole file directly) — not a
     design gap, a one-time manual-verification gap under this session's
     own tool constraints.
+22. **No role awareness in the UI or API responses (Phase 6 M1).** A
+    VIEWER only learns they cannot create/run a scan after attempting it
+    (the frontend shows the generic 403 message). Nothing returns the
+    caller's role, and there is still no "list my organizations"/`me`
+    endpoint (§13) to hang it on. Not reachable today: only OWNER
+    memberships can be created (no invite/member-management flow), so
+    the non-OWNER roles exist only in tests.
+23. **RBAC covers only the three Scanning routes (Phase 6 M1), and
+    denials are not audited.** ADMIN and MEMBER are identical in
+    capability (no action distinguishes them yet); no other route is
+    role-gated. `audit_logs` and `AuditLogRepositoryPort` exist, but no
+    use case writes entries, so a 403 leaves no trail beyond HTTP logs.
+24. **`pytest --cov` under-reports async-DB code** (pre-existing since
+    Milestone 5, not introduced here): `backend/pyproject.toml` has no
+    `[tool.coverage.run] concurrency = ["greenlet", "thread"]`, so lines
+    executed inside awaited SQLAlchemy sessions show as missing. Confirmed
+    in this milestone's sandbox that measuring with that setting reports
+    100% on `scans.py`/`access.py` (vs 57% on `scans.py` without it).
+    The repo config was deliberately not changed (out of scope).
 
 ## 13. Deferred / excluded work
 
@@ -1198,8 +1304,16 @@ access (e.g. Claude Code) for final confirmation of both.
 - OpenAI/Ollama/OpenRouter `AIProviderPort` implementations (deferred
   until a second real provider shape is known).
 - Network-isolated `scanner_worker` split (TD #12).
-- RBAC, OAuth, MFA, password reset, email verification, CSRF
-  double-submit token (Phase 3+/Phase 6).
+- RBAC beyond the Scanning routes (Phase 6 M1 covers only
+  `create_scan`/`run_scan`/`get_scan`); OAuth, MFA, password reset, email
+  verification, CSRF double-submit token (Phase 3+/Phase 6).
+- Remaining Phase 6 scope, not started and not yet broken into
+  milestones: teams, billing, member management/invitations
+  (`OrganizationRepositoryPort` already has `list_members`/
+  `update_member`/`count_active_owners`, but no use case or route calls
+  them), organization list/get/rename, `/internal/admin` (needs RBAC),
+  audit-log writes (table and port exist; nothing writes entries), any
+  further multi-tenancy hardening.
 - Full organization management (list/get/rename organizations, invite/
   remove members, role changes) — `POST /api/v1/organizations` (Phase 3
   backend preparation) only ever creates a new org and makes the caller
@@ -1629,3 +1743,20 @@ execution access to build one). Both are standard, well-reasoned
 designs, not confirmed working end to end. **Stopped after Milestone 5
 per explicit instruction -- no Phase 6 or further work begun.** Nothing
 here changes Step 5's own status, TD #18, or any other open item.
+
+**Twelfth out-of-sequence session (explicit instruction): Phase 6
+Milestone 1 — RBAC enforcement on the Scanning routes — complete, see
+§1/§4/§7/§8/§9/§11/§12 TD #22-24.** Began with a planning-only step
+(read the three governing docs, inspected the repository, proposed scope,
+stopped for approval). Phase 6 was defined only by one roadmap row
+("Multi-tenancy hardening, RBAC, orgs/teams, billing"), so the milestone
+slice and the role matrix were proposed and explicitly approved before
+any edit. Implemented exactly the approved matrix (OWNER/ADMIN/MEMBER
+create+run+read; VIEWER read-only) — see §4. Verification is sandbox-only
+(§11); the real repository has not had its test suite run for this
+milestone. **Stopped after Phase 6 M1 per explicit instruction — no
+Phase 6 M2 and no Phase 7 begun.** Nothing here changes Step 5's own
+status, TD #18, or any other open item. Recommended next verification: a
+real `pytest tests/ -q`, `ruff check .`, `ruff format --check .`, and
+`mypy app` run in an environment with execution access (e.g. Claude
+Code).

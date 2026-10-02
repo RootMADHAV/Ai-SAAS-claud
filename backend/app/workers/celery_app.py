@@ -21,9 +21,10 @@ This module is imported by two different kinds of process:
   - The actual Celery worker process (``worker_role=ingestion_worker``,
     started via ``celery -A app.workers.celery_app worker``), which
     additionally needs every ``@celery_app.task``-decorated function to
-    already be registered -- guaranteed by ``app/workers/tasks.py``
-    importing ``celery_app`` from here (not the reverse), so importing
-    that module always has this one already configured.
+    already be registered -- guaranteed by ``create_celery_app()``'s
+    ``include=["app.workers.tasks"]``, which makes the worker import that
+    module at startup (``tasks.py`` imports ``celery_app`` from here, not
+    the reverse, so nothing else would otherwise load it).
 
 ``get_settings()`` is safe to call from either process type: ``redis_url``
 is validated as required for every role (``Settings.check_role_boundaries``),
@@ -59,7 +60,20 @@ def create_celery_app() -> Celery:
     # sourced values app/main.py's _lifespan asserts on.
     assert settings.redis_url is not None
 
-    app = Celery("security_platform", broker=settings.redis_url, backend=settings.redis_url)
+    # include= is what registers app/workers/tasks.py's @celery_app.task
+    # functions in a worker started as `celery -A app.workers.celery_app
+    # worker`: that command imports only this module, which never imports
+    # tasks.py itself, so without it every task message is discarded as
+    # 'unregistered'. Celery imports the listed modules lazily at worker
+    # startup, after celery_app below already exists, so this adds no
+    # circular import with tasks.py's own `from app.workers.celery_app
+    # import celery_app`.
+    app = Celery(
+        "security_platform",
+        broker=settings.redis_url,
+        backend=settings.redis_url,
+        include=["app.workers.tasks"],
+    )
     app.conf.task_default_queue = SCANS_QUEUE_NAME
     # Every task result is a scan's side effects already durably
     # persisted in Postgres via RunScanWorkflowUseCase -- nothing reads a
