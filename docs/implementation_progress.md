@@ -28,7 +28,7 @@ the real repository) unless stated otherwise.
 
 ## Architectural decisions future work depends on
 
-Full current list: `PROJECT_STATE.md` section 4. Condensed:
+Full current list: `PROJECT_STATE.md` section 3. Condensed:
 - **RLS enforces tenant isolation only**; soft-delete visibility is an
   explicit `WHERE deleted_at IS NULL` in repository reads (Postgres checks
   `SELECT USING` against the new row of an `UPDATE`, so combining them
@@ -193,7 +193,7 @@ pre-existing `E501`. Debt introduced: TD #22, #23. Not run on the real repo.
 
 ## Open technical debt
 
-Authoritative text: `PROJECT_STATE.md` section 12.
+Authoritative list: `PROJECT_STATE.md` section 8.
 - #1 enums staging area in `domain/shared/enums.py`.
 - #5 `update()`/`soft_delete()` can touch soft-deleted rows.
 - #6 MinIO, #7 nuclei, #15 nmap, #17 sqlmap: verified only against
@@ -215,7 +215,8 @@ Authoritative text: `PROJECT_STATE.md` section 12.
   denials are not audited (nothing writes `audit_logs`).
 - #24 `pytest --cov` under-reports async-DB code (no
   `concurrency = ["greenlet","thread"]` in `pyproject.toml`).
-Resolved: #2, #3, #4, #9, #10, #16.
+Resolved: #9, #10, #16. #2-#4 do not appear in `PROJECT_STATE.md`'s debt list
+(numbering gap); their status is not recorded in the current docs.
 
 ## Verification limitations that still apply
 - No command-execution tool exists against the real repository; every result
@@ -234,9 +235,11 @@ Compared against the repository and the other two governing docs:
 - Directory listing confirmed the modules and test files named for
   Milestones 1-7, Auth, logout, organization bootstrap, `nmap`/`sqlmap`
   adapters, and Phase 5 are present; `burp`/`zap` are stubs;
-  `reconx`/`bughunter` folders are absent (docs 5/13 still say present).
+  `reconx`/`bughunter` folders are absent (the pre-2026-10-02 `PROJECT_STATE.md`
+  said they still existed; the compact one records the observed state).
 - Observed test files: 36 unit (37 with this milestone) and 14 integration
-  plus `support.py`; `PROJECT_STATE.md` counts are stale.
+  plus `support.py`; the pre-2026-10-02 `PROJECT_STATE.md` counts were stale
+  (the compact one states these).
 - Carried forward only what is in the repo or in `PROJECT_STATE.md` /
   `session_state.md`; TD #13-#21 existed only in `PROJECT_STATE.md` and are
   included above. Nothing was invented to fill gaps; discrepancies not fixed

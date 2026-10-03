@@ -1,110 +1,69 @@
 # Session State
 
-Overwritten at the end of every session -- reflects the most recent
-session only (handoff). Current project state: `PROJECT_STATE.md`.
-Compact milestone history: `docs/implementation_progress.md`.
+Overwritten each session -- latest session only (handoff). Current project
+state: `PROJECT_STATE.md`. Compact history: `docs/implementation_progress.md`.
 
 ## Date
-2026-10-02
+2026-10-02 (second Phase 6 session)
+
+## Workflow rule (set by the owner this session)
+All Phase 6 work is done and verified in the Claude sandbox only. The real
+repository is NOT touched until every Phase 6 milestone is complete and
+verified; then the final state is transferred and committed in one step.
 
 ## Last completed task
-**Phase 6 Milestone 1 -- RBAC enforcement on the existing Scanning
-routes.** Twelfth explicit-instruction session. Began with a planning-only
-step (read the three governing docs, inspected the repo, proposed scope,
-stopped for approval); implemented only after the plan and role matrix
-were approved. Phase 6 had no milestone breakdown anywhere in the repo --
-only the roadmap row "Multi-tenancy hardening, RBAC, orgs/teams,
-billing" -- so the slice (RBAC on scan routes) and the matrix were
-proposed by Claude and explicitly approved.
+1. **Re-verified Phase 6 M1 in the sandbox** (no M1 code changed):
+   - Policy evaluated from the real function: owner/admin/member -> read yes,
+     create/run yes; viewer -> read yes, create/run no (403).
+   - Live app introspection: `POST /scans` and `POST /scans/{id}/run` carry
+     `require_scan_write_access` (on top of `require_organization_member`);
+     `GET /scans/{id}` carries only `require_organization_member`.
+   - Full sandbox suite **52 passed, 0 skipped** (21 unit + 31 integration,
+     PostgreSQL 16, non-superuser `app_user`, RLS enforced); Ruff, format and
+     MyPy strict clean on the M1 files (70 files); pre-existing `E501` untouched.
+2. **Wrote a new compact `PROJECT_STATE.md`** in the sandbox: 22,606 bytes vs
+   131,540 for the prior version (~17%, an ~83% reduction). Cross-checked
+   against the prior file's content: no required information was lost; two
+   small details (frontend session-restore mechanism, runtime dependency list
+   incl. `celery[redis]`) were restored after the check.
+3. Corrected one unsupported line in the sandbox `implementation_progress.md`:
+   it said TD #2, #3, #4 were resolved, but `PROJECT_STATE.md` never records
+   them (its debt list jumps 1 -> 5). Now: resolved = #9, #10, #16; #2-#4
+   status not recorded.
 
-Role matrix enforced:
-
-| Role | Read scans | Create / run scans |
+## Where each document lives right now
+| Document | Sandbox | Real repo (untouched this session) |
 |---|---|---|
-| OWNER | yes | yes |
-| ADMIN | yes | yes |
-| MEMBER | yes | yes |
-| VIEWER | yes | **no (403)** |
+| `PROJECT_STATE.md` | NEW compact, 22,606 B | OLD long version, 131,540 B (already has the M1 edits made before the sandbox-only rule) |
+| `old historic project state.md` | **does not exist** | does not exist yet |
+| `docs/implementation_progress.md` | 15,039 B (with the TD fix) | 14,930 B (without the TD fix) |
+| `docs/session_state.md` | this file | older 5,881 B version |
 
-## Exact changes
-- `backend/app/domain/identity/access.py` (new, 2652 B) --
-  `SCAN_WRITE_ROLES`, `can_write_scans()`; pure domain logic.
-- `backend/app/api/dependencies.py` (edited) -- new
-  `require_scan_write_access`, layered on `require_organization_member`
-  (which is unchanged, as is its RLS transaction reuse).
-- `backend/app/api/v1/scans.py` (edited) -- `create_scan` and `run_scan`
-  depend on it; `get_scan` unchanged; docstrings updated.
-- `backend/tests/unit/test_identity_access.py` (new) -- 7 tests.
-- `backend/tests/unit/test_api_dependencies.py` (edited) -- +5 tests.
-- `backend/tests/integration/test_api_scans.py` (edited) -- replaced the
-  old `test_viewer_role_member_can_still_read_and_create` (asserted
-  pre-RBAC behavior) with `TestRoleBasedAccess` (9 tests).
-- No test-helper change: `make_member`/`_create_authenticated_member`
-  already accepted a `role`. No migration, schema, RLS, cookie, Docker,
-  scanner, AI/RAG, or frontend change (the frontend already maps 403).
-- Docs: `PROJECT_STATE.md` (targeted edits only -- header, sections 1, 4,
-  5, 6, 7, 8, 9, 11, 12 [TD #22-24], 13, 16), this file, and
-  `docs/implementation_progress.md` (replaced with a compact file).
+Why `old historic project state.md` is not in the sandbox: the sandbox never
+contained `PROJECT_STATE.md` (only a rebuilt backend slice), and the only way
+to create it there is retyping 131 KB by hand, which cannot be byte-identical
+(and the real file already holds a corrupted character in sections 13/16 that
+would have to be reproduced). The faithful copy is a rename of the real file.
 
-## Verification -- exact results (SANDBOX ONLY)
-- Sandbox: Python 3.12.3, PostgreSQL 16, non-superuser `app_user`
-  (`rolsuper=f`, `rolbypassrls=f`), schema via Alembic, 15 RLS policies.
-- Narrow first: unit files -> 21 passed. Integration `test_api_scans.py`
-  -> 31 passed. Whole reconstructed slice -> **52 passed, 0 failed, 0
-  skipped.** (A first integration run was 31 *skipped* because Postgres
-  had stopped between tool calls; not counted, restarted and re-run.)
-- Mutation check: routes reverted to the old gate -> exactly 4 role tests
-  fail; restored -> 31/31 pass.
-- Ruff + `ruff format --check` clean on touched files except the
-  pre-existing `E501` on `dependencies.py` (left untouched); MyPy strict
-  clean (70 files). One MyPy finding and one Ruff `SIM300` in new tests
-  were fixed. `access.py`/`scans.py` 100% covered (greenlet-aware
-  measurement; see TD #24).
-- **NOT verified / boundary:** nothing was run on the real repository (no
-  execution tool). The sandbox rebuilt only the dependency slice of
-  `app.main`: untouched files re-typed with docstrings elided; Celery
-  task module, both scanner adapters, `config.py`'s validator, and
-  `run_scan_workflow.py` were stubs; the migration was a hand-condensed
-  copy. `access.py` is byte-identical to the repo; the four edited files
-  are not byte-comparable. ~50 other test files were not re-run. No
-  Docker, no real MinIO/Qdrant/scanner binaries.
+## Sync plan for the END of Phase 6 (do not do now)
+1. Rename real `PROJECT_STATE.md` -> `old historic project state.md`
+   (byte-exact move, no retyping).
+2. Place the sandbox `PROJECT_STATE.md`, `docs/implementation_progress.md`,
+   `docs/session_state.md`, and all verified Phase 6 code/tests in the repo;
+   byte-check each against the sandbox.
+3. Run the real `pytest tests/ -q`, `ruff check .`, `ruff format --check .`,
+   `mypy app` where execution exists; then commit.
 
-## Pending work
-- **Run the real suite** where execution exists (e.g. Claude Code):
-  `pytest tests/ -q`, `ruff check .`, `ruff format --check .`,
-  `mypy app`. No real-repo run exists for this milestone.
-- **Commit before further work.** `docs/implementation_progress.md` was
-  replaced (138,022 B -> compact). Its prior content is recoverable only
-  from git history; its last modification (2026-09-30) predates the last
-  commit ("phase 5 qdrant/RAG implemented", 2026-10-01), which suggests
-  it is in `HEAD` -- not confirmed (no git access).
-- Remaining Phase 6 (not started, no milestone breakdown): teams,
-  billing, member management/invitations, organization list/get/rename,
-  `/internal/admin`, audit-log writes, other multi-tenancy hardening.
-- New debt TD #22-24 (`PROJECT_STATE.md` sections 12); all earlier open
-  items unchanged (TD #18, TD #19/#20/#21, Step 5, sqlmap wiring).
+## Pending
+- Phase 6 M2: **NOT started, NOT defined.** Wait for the owner's explicit
+  instruction. Phase 7 not started.
+- Open owner decisions: Phase 6 M2 scope; Phase 3 Step 5 scope.
+- No real-repo test run exists for Phase 6 M1.
+- Open debt: see `PROJECT_STATE.md` section 8 (TD #22-24 are new in Phase 6).
 
-## Documentation inconsistencies observed, deliberately NOT fixed
-(per instruction not to spend this milestone on historical cleanup)
-1. `PROJECT_STATE.md` sections 5/13 say the `reconx`/`bughunter` stub
-   folders still exist and could not be deleted; the directory listing
-   this session shows only `burp`, `nmap`, `nuclei`, `sqlmap`, `zap`
-   under `scanner_engine/adapters/` -- they are already gone.
-2. Test-file counts: section 11 still says "30 unit, 14 integration";
-   the directory listing showed 36 unit (now 37) and 14 integration
-   test files plus `support.py` (section 5 says 13 integration).
-3. Section 7's table has no Phase 5 Milestone 5 row (it is covered in
-   sections 4/11/16).
-4. Section 16 and parts of section 11 still carry long per-session
-   narrative; `PROJECT_STATE.md` is ~119 KB, not compact.
-5. `.kilo/worktrees/brassy-plane/` is a second copy of the repo (with its
-   own `PROJECT_STATE.md`) inside the project directory -- not
-   authoritative; ignored.
-6. `backend/.venv` appears to be CPython 3.13 (from `__pycache__`
-   names) while docs say Python 3.12; `requires-python >= 3.12`, so
-   compatible, but worth knowing when comparing local vs. sandbox runs.
-
-## Next immediate task
-None defined. Stopped after Phase 6 M1 per instruction -- no Phase 6 M2
-and no Phase 7 begun. Phase 6 M2's scope must be chosen and approved
-before any work starts.
+## Observations carried forward (not fixed)
+- `.kilo/worktrees/brassy-plane/` is a second repo copy inside the project
+  directory; not authoritative.
+- `backend/.venv` appears to be CPython 3.13 vs documented 3.12 (compatible).
+- `PROJECT_STATE.md` section 16 in the OLD file has a corrupted character
+  ("Milestone 5 ?? RAG wiring"); irrelevant once the old file is archived.
