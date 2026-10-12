@@ -82,11 +82,14 @@ from fastapi.responses import JSONResponse
 from app.api.dependencies import AppState, AuthConfig
 from app.api.internal.health import router as health_router
 from app.api.v1.auth import router as auth_router
+from app.api.v1.members import router as members_router
 from app.api.v1.organizations import router as organizations_router
 from app.api.v1.scans import router as scans_router
 from app.application.identity.errors import (
     AuthenticationError,
     EmailAlreadyRegisteredError,
+    MemberManagementForbiddenError,
+    MembershipConflictError,
     OrganizationSlugAlreadyTakenError,
 )
 from app.application.scanning.run_scan_workflow import ScannerMismatchError
@@ -239,6 +242,14 @@ async def _organization_slug_taken_handler(request: Request, exc: Exception) -> 
     return JSONResponse(status_code=409, content={"detail": str(exc)})
 
 
+async def _membership_conflict_handler(request: Request, exc: Exception) -> JSONResponse:
+    return JSONResponse(status_code=409, content={"detail": str(exc)})
+
+
+async def _member_management_forbidden_handler(request: Request, exc: Exception) -> JSONResponse:
+    return JSONResponse(status_code=403, content={"detail": str(exc)})
+
+
 def create_app(cors_allowed_origins: Sequence[str] | None = None) -> FastAPI:
     """Factory, not a bare module-level ``FastAPI()`` -- tests call this
     directly and override ``app/api/dependencies.py``'s low-level
@@ -290,14 +301,15 @@ def create_app(cors_allowed_origins: Sequence[str] | None = None) -> FastAPI:
     app.include_router(scans_router, prefix="/api/v1")
     app.include_router(auth_router, prefix="/api/v1")
     app.include_router(organizations_router, prefix="/api/v1")
+    app.include_router(members_router, prefix="/api/v1")
     app.include_router(health_router, prefix="/internal")
     app.add_exception_handler(LookupError, _lookup_error_handler)
     app.add_exception_handler(ScannerMismatchError, _scanner_mismatch_error_handler)
     app.add_exception_handler(AuthenticationError, _authentication_error_handler)
     app.add_exception_handler(EmailAlreadyRegisteredError, _email_already_registered_handler)
-    app.add_exception_handler(
-        OrganizationSlugAlreadyTakenError, _organization_slug_taken_handler
-    )
+    app.add_exception_handler(OrganizationSlugAlreadyTakenError, _organization_slug_taken_handler)
+    app.add_exception_handler(MembershipConflictError, _membership_conflict_handler)
+    app.add_exception_handler(MemberManagementForbiddenError, _member_management_forbidden_handler)
     return app
 
 

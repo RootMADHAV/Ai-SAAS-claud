@@ -15,9 +15,16 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from app.application.identity.create_organization import CreateOrganizationUseCase
 from app.application.identity.login_user import LoginUseCase
 from app.application.identity.logout import LogoutUseCase
+from app.application.identity.manage_members import (
+    AddMemberUseCase,
+    ChangeMemberRoleUseCase,
+    ListMembersUseCase,
+    RemoveMemberUseCase,
+)
 from app.application.identity.refresh_token import RefreshTokenUseCase
 from app.application.identity.register_user import RegisterUserUseCase
 from app.application.interfaces.identity_repository import (
+    AuditLogRepositoryPort,
     OrganizationRepositoryPort,
     RefreshTokenRepositoryPort,
     UserRepositoryPort,
@@ -25,11 +32,12 @@ from app.application.interfaces.identity_repository import (
 from app.application.interfaces.scanner_port import ActiveScanner
 from app.application.interfaces.scanning_repository import ScanRepositoryPort
 from app.application.scanning.trigger_scan import TriggerScanUseCase
-from app.domain.identity.access import SCAN_WRITE_ROLES, can_write_scans
+from app.domain.identity.access import SCAN_WRITE_ROLES, can_manage_members, can_write_scans
 from app.domain.identity.entities import OrganizationMember, User
 from app.domain.shared.enums import MembershipStatus
 from app.domain.shared.ids import new_id
 from app.infrastructure.db.repositories.identity_repository import (
+    SqlAlchemyAuditLogRepository,
     SqlAlchemyOrganizationRepository,
     SqlAlchemyRefreshTokenRepository,
     SqlAlchemyUserRepository,
@@ -274,3 +282,87 @@ def get_create_organization_use_case(
     ),
 ) -> CreateOrganizationUseCase:
     return CreateOrganizationUseCase(organization_repository)
+
+
+async def require_member_manager(
+    member: OrganizationMember = Depends(require_organization_member),
+) -> OrganizationMember:
+    """Phase 6 M2: early gate for the member-management mutations, layered
+    on ``require_organization_member`` exactly like
+    ``require_scan_write_access`` (that dependency still owns 401/404/
+    ACTIVE-membership 403 and the single RLS-scoped transaction). Only
+    OWNER and ADMIN pass; the target- and role-dependent rules (an ADMIN
+    may not grant or touch ADMIN/OWNER) and the last-owner invariant are
+    enforced authoritatively by the use cases, under the row lock."""
+    if not can_manage_members(member.role):
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                f"role {member.role.value!r} may not manage members of organization "
+                f"{member.organization_id}"
+            ),
+        )
+    return member
+
+
+def get_org_organization_repository(
+    session: AsyncSession = Depends(get_org_session),
+) -> OrganizationRepositoryPort:
+    """Organization repository bound to the request's organization-scoped
+    (RLS) session -- not the bootstrap session used to create an
+    organization. Every member operation therefore runs in the same
+    transaction as ``require_organization_member``'s membership read."""
+    return SqlAlchemyOrganizationRepository(session)
+
+
+def get_org_user_repository(
+    session: AsyncSession = Depends(get_org_session),
+) -> UserRepositoryPort:
+    """User repository on the SAME organization-scoped session (``users``
+    has no RLS policy, so it is readable there): one transaction, no
+    second connection, unlike ``get_user_repository`` (identity session)."""
+    return SqlAlchemyUserRepository(session)
+
+
+def get_org_audit_log_repository(
+    session: AsyncSession = Depends(get_org_session),
+) -> AuditLogRepositoryPort:
+    """Phase 6 M3: audit repository on the SAME organization-scoped session
+    as the membership repository, so an audit insert and the membership
+    mutation it describes are one transaction (commit together, roll back
+    together) and the insert satisfies the ``audit_logs`` RLS policy. It must
+    never be given its own session: that would not be atomic, and it would
+    block forever on the key-share lock the member use cases' row lock
+    (``FOR UPDATE`` on the organization) holds against the audit row's
+    foreign key."""
+    return SqlAlchemyAuditLogRepository(session)
+
+
+def get_list_members_use_case(
+    organizations: OrganizationRepositoryPort = Depends(get_org_organization_repository),
+    users: UserRepositoryPort = Depends(get_org_user_repository),
+) -> ListMembersUseCase:
+    return ListMembersUseCase(organizations, users)
+
+
+def get_add_member_use_case(
+    organizations: OrganizationRepositoryPort = Depends(get_org_organization_repository),
+    users: UserRepositoryPort = Depends(get_org_user_repository),
+    audit: AuditLogRepositoryPort = Depends(get_org_audit_log_repository),
+) -> AddMemberUseCase:
+    return AddMemberUseCase(organizations, users, audit)
+
+
+def get_change_member_role_use_case(
+    organizations: OrganizationRepositoryPort = Depends(get_org_organization_repository),
+    users: UserRepositoryPort = Depends(get_org_user_repository),
+    audit: AuditLogRepositoryPort = Depends(get_org_audit_log_repository),
+) -> ChangeMemberRoleUseCase:
+    return ChangeMemberRoleUseCase(organizations, users, audit)
+
+
+def get_remove_member_use_case(
+    organizations: OrganizationRepositoryPort = Depends(get_org_organization_repository),
+    audit: AuditLogRepositoryPort = Depends(get_org_audit_log_repository),
+) -> RemoveMemberUseCase:
+    return RemoveMemberUseCase(organizations, audit)

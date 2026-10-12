@@ -219,6 +219,21 @@ class SqlAlchemyOrganizationRepository(OrganizationRepositoryPort):
         )
         return len(result.scalars().all())
 
+    async def lock_for_membership_change(self, organization_id: UUID) -> None:
+        # Selects the id column only (a row lock needs no payload) and
+        # applies the same deleted_at filter as get_by_id. Runs under the
+        # session's RLS context: the organizations policy is
+        # self-referential, so only the session's own organization row is
+        # visible -- locking another tenant's row is impossible by
+        # construction.
+        result = await self._session.execute(
+            select(OrganizationRow.id)
+            .where(OrganizationRow.id == organization_id, OrganizationRow.deleted_at.is_(None))
+            .with_for_update()
+        )
+        if result.scalar_one_or_none() is None:
+            raise LookupError(f"Organization {organization_id} does not exist")
+
 
 class SqlAlchemyUserRepository(UserRepositoryPort):
     def __init__(self, session: AsyncSession) -> None:

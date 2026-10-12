@@ -81,6 +81,9 @@ class FakeOrganizationRepository(OrganizationRepositoryPort):
             and m.status is MembershipStatus.ACTIVE
         )
 
+    async def lock_for_membership_change(self, organization_id: UUID) -> None:
+        return None
+
 
 @pytest.fixture
 def organization_repository() -> FakeOrganizationRepository:

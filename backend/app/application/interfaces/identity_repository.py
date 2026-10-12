@@ -74,6 +74,21 @@ class OrganizationRepositoryPort(ABC):
         in this port."""
         ...
 
+    @abstractmethod
+    async def lock_for_membership_change(self, organization_id: UUID) -> None:
+        """Acquire an exclusive row lock on the organization row, held until
+        the surrounding transaction ends (``SELECT ... FOR UPDATE``).
+
+        Phase 6 M2: every membership *mutation* (add, change role, remove)
+        calls this first, in the same transaction as the mutation, so
+        concurrent mutations on one organization are serialized. This is
+        what makes the "never zero ACTIVE OWNERs" invariant hold under
+        concurrency: ``count_active_owners`` alone is a check-then-act race
+        (two owners demoting each other can both read "2" and both commit).
+        Raises ``LookupError`` if the organization is not visible/does not
+        exist."""
+        ...
+
 
 class UserRepositoryPort(ABC):
     """Persistence for the ``User`` entity. Not org-scoped -- see

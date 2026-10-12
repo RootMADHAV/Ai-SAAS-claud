@@ -70,6 +70,7 @@ async def test_create_engine_builds_a_working_engine_from_settings(
         minio_endpoint="localhost:9000",
         minio_root_user="test",
         minio_root_password="a-real-password",
+        minio_bucket="test-bucket",
         jwt_secret="a-real-secret",
     )
     engine = create_engine(settings)

@@ -51,3 +51,47 @@ class OrganizationSlugAlreadyTakenError(ValueError):
     ``AuthenticationError`` hierarchy -- same reasoning as
     ``EmailAlreadyRegisteredError`` above: a uniqueness conflict, not a
     credential failure."""
+
+
+class MemberNotFoundError(LookupError):
+    """Raised by the member-management use cases (Phase 6 M2) when the
+    target user is not an ACTIVE member of the organization in the URL
+    (absent, already ``REMOVED``, or a member of a different
+    organization -- which RLS makes invisible anyway). Subclasses
+    ``LookupError`` so the existing global handler maps it to HTTP 404; it
+    is not part of the ``AuthenticationError`` hierarchy."""
+
+
+class UserNotFoundError(LookupError):
+    """Raised by ``AddMemberUseCase`` when no ACTIVE registered user has
+    the requested email. Maps to HTTP 404 via ``LookupError``. The message
+    deliberately does not echo the address. Note this is the documented
+    user-enumeration trade-off of direct add-by-email: an actor who is
+    allowed to add can learn whether an address is registered."""
+
+
+class MembershipConflictError(ValueError):
+    """Base for member-management requests that conflict with current
+    membership state. Maps to HTTP 409 (one handler in ``app/main.py``
+    covers every subclass), the same convention as
+    ``EmailAlreadyRegisteredError``."""
+
+
+class MemberAlreadyActiveError(MembershipConflictError):
+    """Raised by ``AddMemberUseCase`` when the user already has an
+    ACTIVE membership in the organization."""
+
+
+class LastOwnerError(MembershipConflictError):
+    """Raised when a role change or removal would leave the organization
+    with zero ACTIVE OWNER memberships. Raised BEFORE anything is written,
+    under the row lock taken by ``lock_for_membership_change``."""
+
+
+class MemberManagementForbiddenError(Exception):
+    """Raised by the member-management use cases when the actor's CURRENT
+    membership (re-read under the lock) does not authorize the operation:
+    not an ACTIVE member, not an OWNER/ADMIN, or an ADMIN attempting to
+    grant or touch ADMIN/OWNER. Maps to HTTP 403. Deliberately not a
+    ``ValueError``/``LookupError`` subclass, so it can never be caught by
+    the 404/409 handlers registered for those bases."""

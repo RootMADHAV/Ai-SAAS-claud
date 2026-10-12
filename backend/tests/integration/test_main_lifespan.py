@@ -37,6 +37,8 @@ Milestone 1 but was genuinely unused until this work.
 
 from __future__ import annotations
 
+import os
+
 import pytest
 from sqlalchemy import text
 
@@ -59,7 +61,10 @@ async def test_lifespan_wires_app_state_with_working_objects(
     monkeypatch.setenv("WORKER_ROLE", "api")
     monkeypatch.setenv(
         "DATABASE_URL",
-        "postgresql+asyncpg://app_user:app_password@localhost/security_platform_test",
+        os.environ.get(
+            "TEST_DATABASE_URL",
+            "postgresql+asyncpg://app_user:app_password@localhost/security_platform_test",
+        ),
     )
     monkeypatch.setenv("REDIS_URL", "redis://localhost:6379/0")
     monkeypatch.setenv("MINIO_ENDPOINT", "localhost:9000")

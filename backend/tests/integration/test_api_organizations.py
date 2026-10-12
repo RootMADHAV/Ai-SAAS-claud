@@ -24,7 +24,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from app.api.dependencies import (
     AuthConfig,
-    get_active_scanner,
+    get_active_scanners,
     get_auth_config,
     get_scan_dispatcher,
     get_session_factory,
@@ -63,7 +63,7 @@ class _FakeActiveScanner(ActiveScanner):
         raise AssertionError("not exercised by this module's tests")
 
 
-def _noop_dispatcher(organization_id: UUID, scan_id: UUID) -> None:
+def _noop_dispatcher(organization_id: UUID, scan_id: UUID, scanner_name: str) -> None:
     """This module never asserts anything about dispatch itself (that is
     test_api_scans.py's job) -- just needs a real Celery broker call
     replaced with something harmless for the one test here that reaches
@@ -210,7 +210,7 @@ async def test_full_bootstrap_flow_register_login_create_org_create_and_run_scan
     on to round-trip through the client's own cookie jar -- see
     test_api_auth.py's module docstring for why (Secure cookies over
     this transport's plain http:// scheme)."""
-    wired_app.dependency_overrides[get_active_scanner] = lambda: _FakeActiveScanner()
+    wired_app.dependency_overrides[get_active_scanners] = lambda: (_FakeActiveScanner(),)
     wired_app.dependency_overrides[get_scan_dispatcher] = lambda: _noop_dispatcher
 
     async with await _make_client(wired_app) as client:

@@ -1,8 +1,9 @@
 # Implementation Progress
 
 Compact historical milestone record. Compacted 2026-10-02 (Phase 6
-Milestone 1) from a ~138 KB session-by-session narrative, which was
-replaced, not archived (recoverable only via git history). Purpose of the
+Milestone 1) from a ~138 KB session-by-session narrative, which is kept
+as the owner's backup `docs/old historic implementation_progress.md` (never
+edit, rename or delete it; also recoverable via git history). Purpose of the
 three governing docs: `PROJECT_STATE.md` = compact authoritative current
 state; `docs/session_state.md` = latest-session handoff; this file =
 compact history (objective, decisions, files, verification, debt).
@@ -20,7 +21,7 @@ the real repository) unless stated otherwise.
 | 3 | MVP frontend | Steps 1-4 complete; Step 5 (tests) awaiting a scope decision |
 | 4 | Scanner adapters beyond Nuclei | Partial: `nuclei`, `nmap` wired + normalized; `sqlmap` adapter-only; `burp`/`zap` stubs; no complete roster is enumerated anywhere in the repo |
 | 5 | AI features + RAG | Milestones 1-5 complete; real Docker build and real Qdrant unverified |
-| 6 | Multi-tenancy hardening, RBAC, orgs/teams, billing | In progress: **M1 (RBAC on scan routes) complete**; rest not started, no milestone breakdown |
+| 6 | Multi-tenancy hardening, RBAC, orgs/teams, billing | In progress: **M1 (RBAC on scan routes) complete**; **M2 (member management + last-owner protection) and M3 (audit trail for successful membership changes): in the real working tree, uncommitted, verified by the owner on the real repo 2026-10-11/12** (762 passed / 0 skipped / 0 failed, mypy clean, live 18/18 walkthrough, exactly 6 audit rows); M4 not started and not defined; closing Phase 6 at M3 is an open owner decision |
 | 7 | Full dashboard | Not started |
 | 8 | DOCX/PDF polish, scheduling, notifications | Not started |
 | 9 | Security hardening pass | Not started |
@@ -62,6 +63,21 @@ Full current list: `PROJECT_STATE.md` section 3. Condensed:
 - **`require_organization_member`** reuses `get_org_session`'s already-open
   RLS-scoped transaction. **Phase 6 M1 layers `require_scan_write_access` on
   top** with the role matrix in `app/domain/identity/access.py`.
+- **Member management (Phase 6 M2)**: pure rules per operation in `access.py`
+  (ADMIN manages only MEMBER/VIEWER, never grants/touches ADMIN/OWNER); every
+  mutation takes `lock_for_membership_change` (`SELECT ... FOR UPDATE` on the
+  organization row) FIRST, re-reads the actor under the lock, then applies
+  policy and the last-owner guard (`count_active_owners`, race-free only under
+  the lock). Removal = status `REMOVED`; re-add reactivates the same row.
+  Direct add-by-email, no invitations; mutations are POST-only (CORS allows
+  only GET/POST and was not widened); M2 itself wrote no audit entries.
+- **Membership audit (Phase 6 M3)**: successful add / reactivate / role change /
+  remove write exactly one `audit_logs` row (`member.added`,
+  `member.reactivated`, `member.role_changed`, `member.removed`; IDs-only
+  metadata) through a REQUIRED `AuditLogRepositoryPort`, in the same
+  organization-scoped transaction under the row lock; fail-closed (an audit
+  error rolls back the membership change). Refusals and no-ops write nothing.
+  Record-only: no read API.
 - **Phase 5**: `EmbeddingPort` is separate from `AIProviderPort`;
   `VectorStorePort` binds one collection per instance; corpus is the vendored
   CWE Top 25 (2025, View-1435); retrieval lives inside `AnalysisService` and
@@ -191,6 +207,90 @@ with a non-superuser role; mutation check failed exactly the 4 role tests
 when enforcement was removed; Ruff and MyPy strict clean except a
 pre-existing `E501`. Debt introduced: TD #22, #23. Not run on the real repo.
 
+**Phase 6 M2 -- Member management with last-owner protection.** Objective:
+let OWNER/ADMIN list, add (existing registered user, by email), re-role and
+remove members without ever leaving an organization with zero ACTIVE OWNERs.
+Decisions: matrix in `PROJECT_STATE.md` section 3 (ADMIN limited to
+MEMBER/VIEWER targets and roles); owner-row lock before any read-then-write;
+actor re-read under the lock; authorization before the email lookup;
+soft removal (`REMOVED`) with same-row reactivation; POST-only mutations;
+record-only scope -- no audit logging, no invitations, no migration/RLS/
+schema/cookie/CORS change; M1 scan policy unchanged. New files:
+`application/identity/manage_members.py`, `api/v1/members.py`,
+`api/v1/member_schemas.py`; tests `unit/test_member_access_policy.py`,
+`unit/test_manage_members.py`, `unit/test_member_dependencies.py`,
+`integration/test_api_members.py`, `integration/test_membership_concurrency.py`.
+Modified: `domain/identity/access.py` (member rules added), `application/
+identity/errors.py` (six errors), `application/interfaces/identity_repository.py`
+and `infrastructure/db/repositories/identity_repository.py`
+(`lock_for_membership_change`), `api/dependencies.py` (`require_member_manager`,
+organization-scoped repository providers, four use-case providers),
+`main.py` (router + 403/409 handlers), `tests/unit/test_create_organization.py`
+(no-op lock on the fake). **Verification, labeled:** *sandbox only (sandbox
+lost afterwards):* 292 passed / 0 skipped for a replica of the M2 state
+(235 new tests), 57 passed for the M1 + create-organization regression,
+mutation checks (last-owner guard off -> 15 failed; row lock removed -> 11
+failed). *Real repo:* code and tests transferred and size/edit-diff checked;
+the two integration test files also matched their recorded SHA256s in a
+scratch rebuild; *at the time* no real-repo run had happened -- **superseded: see the "Phase 6 M2 + M3 real-repo verification" entry below.**
+Debt introduced: TD #25-#27 (updates to #22, #23).
+
+**Phase 6 M3 -- Audit trail for membership changes.** Objective: make every
+SUCCESSFUL membership mutation leave one durable, tenant-isolated audit row.
+Decisions (approved D1-D5): record-only (no audit read endpoint, pagination or
+new RBAC policy); successful changes only (denied, failed, not-found,
+conflict, last-owner and no-op requests write nothing); exactly four actions;
+no hardening migration/trigger/RLS change (rows stay mutable at the DB level);
+IDs-only metadata (never email or name); fail-closed in the SAME transaction
+(no swallowing, no second transaction, no async/fire-and-forget). A separate
+transaction would block forever on the FK key-share lock held by the
+organization-row `FOR UPDATE`, so the audit repository shares the request's
+session (`get_org_audit_log_repository`). Reused unchanged: `audit_logs` +
+RLS, `AuditLogEntry`, `AuditLogRepositoryPort`, `SqlAlchemyAuditLogRepository`;
+`event_bus` untouched. New: `domain/identity/audit.py`
+(`MemberAuditAction`, `MEMBER_AUDIT_RESOURCE_TYPE`), `tests/unit/
+test_member_audit.py`, `tests/integration/test_member_audit.py`. Modified:
+`application/identity/manage_members.py` (`_record_audit`; required `audit`
+argument on the add / change-role / remove use cases; the M2 module docstring
+gained the audit contract), `api/dependencies.py` (provider +
+three use-case providers), `tests/unit/test_manage_members.py` (audit fake),
+`tests/integration/test_membership_concurrency.py` (audit argument; exactly
+the winner is audited). **Verification, labeled:** *sandbox only (sandbox
+lost; the real-repo files were rebuilt afterwards):* 343 passed / 0 skipped
+(292 + 51 new) and mutation checks (all audit writes off -> 33 failed;
+reactivation write only -> 6; reactivation mislabeled -> 4; errors swallowed
+-> 5; audit moved outside the transaction -> exactly the 8 atomicity tests
+failed). *Real repo:* files present and statically reviewed (constructor call
+sites, imports, ordering, wiring); *at the time* not run -- **superseded: see
+the verification entry below.** Debt introduced: TD #28-#31 (update to #23).
+
+**Phase 6 M2 + M3 real-repo verification (owner-run, 2026-10-11/12).** The
+owner ran everything on Windows (CPython 3.13.7, `.venv`, PostgreSQL 16 in
+Docker on host port 5433, non-superuser `app_user`); results come from the
+owner's pasted output. Backend full suite **762 passed, 0 skipped, 0 failed**
+(3m40s; 98% coverage, `--cov` still under-reports async code, TD #24),
+including `test_api_organizations.py`. A first run without
+`TEST_DATABASE_URL` showed 556 passed / 206 skipped (every Postgres test
+skipped) and was not counted. `mypy app` clean (113 files). Ruff: only the
+known pre-existing `E501`; format: the known `test_create_organization.py`
+wrap plus five files Phase 6 never touched. Frontend Vitest 47/47. Scope
+check: migrations, frontend, Docker and both historic backups untouched.
+**Live walkthrough** against a real `uvicorn` + PostgreSQL: 18/18 scenarios
+(M1 scan gate, M2 role matrix, last-owner and already-active 409s, 401/403/404
+paths) and exactly 6 `audit_logs` rows in the expected order with IDs-only
+metadata; refused, no-op and conflicting requests wrote nothing. **Test-only
+fixes (all pre-existing breakage, no production code changed):**
+`test_api_organizations.py` (Phase 4 rename `get_active_scanner` ->
+`get_active_scanners`, 3-argument dispatcher), `test_session.py` (required
+`minio_bucket`), `test_main_lifespan.py` and `test_scan_worker_task.py`
+(hard-coded port-5432 URL -> `TEST_DATABASE_URL`). Environment findings: the
+owner's machine has another listener on port 5432 and a Docker `backend`
+image built before M2 that also answers on port 8000 (it had no member
+routes; the walkthrough used a fresh `uvicorn` on port 8001); the Postgres
+tests need `TEST_DATABASE_URL` (port 5433) set and the `.venv` active in
+each new shell. Not verified: Docker image build, real MinIO/Qdrant/scanner
+binaries, browser/mkcert path. No new technical debt was added.
+
 ## Open technical debt
 
 Authoritative list: `PROJECT_STATE.md` section 8.
@@ -209,20 +309,37 @@ Authoritative list: `PROJECT_STATE.md` section 8.
 - #20 Qdrant adapter verified only against a mock.
 - #21 CWE file's 25-entry count not exhaustively enumerated (runtime assertion
   guards it).
-- #22 no role awareness in the UI/API responses; non-OWNER roles are
-  unreachable until a member-management flow exists.
-- #23 RBAC covers only the three scan routes; ADMIN == MEMBER in capability;
-  denials are not audited (nothing writes `audit_logs`).
+- #22 no role awareness in the UI/API responses; non-OWNER roles are now
+  reachable through the M2 member routes, but the frontend has no UI for them.
+- #23 RBAC covers the three scan routes and the M2 member routes; ADMIN ==
+  MEMBER for scans. Successful membership changes are audited (M3); denials,
+  scan actions, auth events and organization creation are not.
 - #24 `pytest --cov` under-reports async-DB code (no
   `concurrency = ["greenlet","thread"]` in `pyproject.toml`).
+- #25 `ListMembersUseCase` does one user lookup per member (N+1), no
+  pagination.
+- #26 add-by-email reveals to an authorized actor whether an address is
+  registered; no rate limiting exists in the codebase.
+- #27 no invitation, leave-organization or ownership-transfer flow.
+- #28 `audit_logs` rows are mutable at the DB level (UPDATE/DELETE/TRUNCATE
+  by `app_user`); append-only is a convention only.
+- #29 refused/failed membership attempts are not audited.
+- #30 no audit read API/pagination; action names and metadata keys are a
+  stored contract.
+- #31 an organization-less audit event is rejected by the current RLS
+  `WITH CHECK` (unrepresentable).
 Resolved: #9, #10, #16. #2-#4 do not appear in `PROJECT_STATE.md`'s debt list
 (numbering gap); their status is not recorded in the current docs.
 
 ## Verification limitations that still apply
 - No command-execution tool exists against the real repository; every result
-  above is from a sandbox rebuild, not a run on `C:\Users\gamer\Downloads\claudeOnly`.
-  Sandbox rebuilds are usually partial slices; most test files are not re-run
-  in any given session.
+  above is from a sandbox rebuild, not a run on `C:\Users\gamer\Downloads\claudeOnly`,
+  **except** the owner-run Phase 6 M2 + M3 verification entry. Sandbox rebuilds
+  are usually partial slices; most test files are not re-run in any given
+  session.
+- Phase 6 M2 and M3: their sandbox pass counts (292, then 343) came from a
+  sandbox that no longer exists and are historical; the real-repo evidence is
+  the owner's 762 passed / 0 skipped run and live walkthrough (2026-10-11/12).
 - No Docker: compose, Dockerfile and the CPU-only torch install are unbuilt.
 - No real MinIO, Qdrant, nuclei, nmap or sqlmap in any session.
 - The Filesystem MCP has no delete tool and caps large reads (~500 KB).
@@ -250,7 +367,12 @@ Compared against the repository and the other two governing docs:
   "Phase 2 current", "Step 1 only").
 
 ## Phase 6 result so far
-Milestone 1 complete (sandbox-verified). Not started: teams, billing,
-member management/invitations, organization list/get/rename,
-`/internal/admin`, audit-log writes, further multi-tenancy hardening. No
-Phase 6 M2 or Phase 7 work has begun.
+Milestone 1 complete and committed. Milestones 2 (member management with
+last-owner protection) and 3 (audit trail for successful membership
+changes): in the real working tree, uncommitted, and verified by the owner
+on the real repo (762 passed / 0 skipped / 0 failed; live walkthrough; see
+the verification entry above). Next for the owner: review and commit. Not started:
+M4 (not defined), teams, billing, invitations / leave-organization /
+ownership transfer, organization list/get/rename, `/internal/admin`, an audit
+read API, auditing of denied attempts, further multi-tenancy hardening. No
+Phase 7 work has begun.

@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from dataclasses import dataclass
 from uuid import UUID
 
@@ -71,6 +72,14 @@ from app.workers.tasks import (
 from tests.integration.support import make_organization, set_org_context
 
 pytestmark = pytest.mark.integration
+
+# The worker composition root reads DATABASE_URL from the environment, so tests that
+# drive it must point at the same database as the ``engine`` fixture (TEST_DATABASE_URL),
+# not a hard-coded default-port URL that may reach a different server.
+_TEST_DATABASE_URL = os.environ.get(
+    "TEST_DATABASE_URL",
+    "postgresql+asyncpg://app_user:app_password@localhost/security_platform_test",
+)
 
 
 class _FakeStorage(StoragePort):
@@ -263,10 +272,7 @@ async def test_run_scan_workflow_task_completes_a_real_scan_end_to_end(
         pytest.skip("No PostgreSQL instance reachable for this task test")
 
     monkeypatch.setenv("WORKER_ROLE", "ingestion_worker")
-    monkeypatch.setenv(
-        "DATABASE_URL",
-        "postgresql+asyncpg://app_user:app_password@localhost/security_platform_test",
-    )
+    monkeypatch.setenv("DATABASE_URL", _TEST_DATABASE_URL)
     monkeypatch.setenv("REDIS_URL", "redis://localhost:6379/0")
     monkeypatch.setenv("MINIO_ENDPOINT", "localhost:9000")
     monkeypatch.setenv("MINIO_ROOT_USER", "test-user")
@@ -344,10 +350,7 @@ async def test_run_scan_workflow_task_selects_nmap_for_an_nmap_scoped_scan(
         pytest.skip("No PostgreSQL instance reachable for this task test")
 
     monkeypatch.setenv("WORKER_ROLE", "ingestion_worker")
-    monkeypatch.setenv(
-        "DATABASE_URL",
-        "postgresql+asyncpg://app_user:app_password@localhost/security_platform_test",
-    )
+    monkeypatch.setenv("DATABASE_URL", _TEST_DATABASE_URL)
     monkeypatch.setenv("REDIS_URL", "redis://localhost:6379/0")
     monkeypatch.setenv("MINIO_ENDPOINT", "localhost:9000")
     monkeypatch.setenv("MINIO_ROOT_USER", "test-user")
