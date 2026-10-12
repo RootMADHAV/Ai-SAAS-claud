@@ -10,9 +10,10 @@ interface NewScanFormProps {
   organizationId: string;
 }
 
-/** Scan creation: target only. Scanner is fixed to "nuclei" for this
- * MVP -- shown as a label, not sent explicitly (the backend already
- * defaults `scanner_name` to "nuclei", the only adapter wired). */
+/** Scan creation: target only. The scanner is not user-selectable in
+ * this milestone -- it is shown as a label and not sent explicitly, so
+ * the backend applies its default (`scanner_name="nuclei"`; the backend
+ * contract also accepts "nmap", see `ScannerName`). */
 export function NewScanForm({ organizationId }: NewScanFormProps): JSX.Element {
   const router = useRouter();
   const [target, setTarget] = useState("");

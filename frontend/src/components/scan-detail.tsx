@@ -5,6 +5,7 @@ import { useState } from "react";
 
 import { describeApiError } from "@/lib/api/error-message";
 import { runScan } from "@/lib/api/scans";
+import { formatTimestamp } from "@/lib/format-timestamp";
 import { useScanPolling } from "@/lib/scans/use-scan-polling";
 
 interface ScanDetailProps {
@@ -79,6 +80,7 @@ export function ScanDetail({ organizationId, scanId }: ScanDetailProps): JSX.Ele
       </Link>
       <h1 className="mb-2 mt-2 text-xl font-semibold">Scan: {scan.target}</h1>
       <p className="text-sm text-muted-foreground">Status: {scan.status}</p>
+      <p className="text-sm text-muted-foreground">Scanner: {scan.scanner_name}</p>
 
       <div className="mt-4">
         {canRun ? (
@@ -109,12 +111,27 @@ export function ScanDetail({ organizationId, scanId }: ScanDetailProps): JSX.Ele
             .slice()
             .sort((a, b) => a.step_order - b.step_order)
             .map((step) => (
-              <li
-                key={step.id}
-                className="flex items-center justify-between border-b border-border py-1"
-              >
-                <span>{step.step_name}</span>
-                <span className="text-muted-foreground">{step.status}</span>
+              <li key={step.id} className="border-b border-border py-1">
+                <div className="flex items-center justify-between">
+                  <span>{step.step_name}</span>
+                  <span className="text-muted-foreground">{step.status}</span>
+                </div>
+                {step.retry_count > 0 && (
+                  <p className="text-xs text-muted-foreground">Retries: {step.retry_count}</p>
+                )}
+                {step.started_at !== null && (
+                  <p className="text-xs text-muted-foreground">
+                    Started: {formatTimestamp(step.started_at)}
+                  </p>
+                )}
+                {step.completed_at !== null && (
+                  <p className="text-xs text-muted-foreground">
+                    Completed: {formatTimestamp(step.completed_at)}
+                  </p>
+                )}
+                {step.error_message !== null && (
+                  <p className="text-xs text-destructive">Error: {step.error_message}</p>
+                )}
               </li>
             ))}
         </ul>

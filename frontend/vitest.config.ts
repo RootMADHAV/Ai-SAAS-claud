@@ -3,6 +3,13 @@ import { fileURLToPath } from "node:url";
 import react from "@vitejs/plugin-react";
 import { defineConfig } from "vitest/config";
 
+// `--no-experimental-webstorage` only exists on Node >= 22.4; on an older
+// Node (Vitest 4 still supports 20.19+) an unknown flag makes the test
+// worker exit immediately, so it is only passed where Node recognises it.
+const canDisableNodeWebStorage = process.allowedNodeEnvironmentFlags.has(
+  "--no-experimental-webstorage",
+);
+
 export default defineConfig({
   // tsconfig.json sets "jsx": "preserve" for Next.js's own SWC compiler
   // to handle. Vite's default transformer reads that same tsconfig and
@@ -29,6 +36,16 @@ export default defineConfig({
     // jsdom cost project-wide.
     environment: "node",
     include: ["src/**/*.test.{ts,tsx}"],
+    // Node >= 25 defines its own global `localStorage` (built-in Web
+    // Storage, on by default; reproduced on 25.9 and 26.11, not on 22/24).
+    // Vitest's jsdom environment only copies a jsdom window property onto
+    // the global when that name is not already a global (or is on its
+    // fixed override list, which does not include `localStorage`), so
+    // jsdom's working localStorage is skipped and tests see Node's, which
+    // is undefined unless `--localstorage-file` is given. Turning Node's
+    // built-in Web Storage off in the test workers lets jsdom provide
+    // `window.localStorage`, exactly as on Node 22/24. Test-runner-only.
+    execArgv: canDisableNodeWebStorage ? ["--no-experimental-webstorage"] : [],
     // Fixed value so tests never depend on a local .env.local existing
     // (that file is gitignored/per-developer -- see
     // .env.local.example). Matches the locked mkcert local-HTTPS setup

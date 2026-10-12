@@ -76,13 +76,20 @@ export interface OrganizationResponse {
 // --- Scanning (backend/app/api/v1/schemas.py) ---
 
 /**
+ * Scanner identifiers accepted by the backend -- mirrors
+ * `ScanCreateRequest.scanner_name: Literal["nuclei", "nmap"]` in
+ * backend/app/api/v1/schemas.py.
+ */
+export const SCANNER_NAMES = ["nuclei", "nmap"] as const;
+export type ScannerName = (typeof SCANNER_NAMES)[number];
+
+/**
  * POST /organizations/{organization_id}/scans body. `scanner_name` is
- * optional client-side (the backend defaults it to "nuclei", the only
- * adapter currently wired -- Literal["nuclei"] in the Pydantic model).
+ * optional client-side (the backend defaults it to "nuclei").
  */
 export interface ScanCreateRequest {
   target: string;
-  scanner_name?: "nuclei";
+  scanner_name?: ScannerName;
 }
 
 export interface WorkflowStepResponse {

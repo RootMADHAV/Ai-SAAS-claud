@@ -129,6 +129,16 @@ describe("endpoint wrappers", () => {
       expect(init.body).toBe(JSON.stringify({ target: "example.com" }));
     });
 
+    it("createScan() sends scanner_name when given (nmap is part of the backend contract)", async () => {
+      fetchMock.mockResolvedValueOnce(jsonResponse(201, { ...scanDetail, scanner_name: "nmap" }));
+
+      const scan = await createScan(orgId, { target: "example.com", scanner_name: "nmap" });
+
+      expect(scan.scanner_name).toBe("nmap");
+      const [, init] = nthFetchCall(fetchMock, 0);
+      expect(init.body).toBe(JSON.stringify({ target: "example.com", scanner_name: "nmap" }));
+    });
+
     it("runScan() posts (no body) to /organizations/{id}/scans/{scanId}/run", async () => {
       fetchMock.mockResolvedValueOnce(jsonResponse(202, { ...scanDetail, status: "running" }));
 

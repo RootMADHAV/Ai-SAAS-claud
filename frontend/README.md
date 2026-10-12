@@ -84,8 +84,8 @@ script).
 ## Structure
 
 ```
-src/app/          App Router routes: /, /login, /register, /dashboard
-                  (protected placeholder)
+src/app/          App Router routes: /, /login, /register, /dashboard,
+                  /scans/[scanId] (protected)
 src/components/   Shared UI components (nav-bar.tsx; components.json is
                   configured for the shadcn CLI for anything added later)
 src/lib/api/      Typed API client foundation (Step 2) -- one function
@@ -122,9 +122,11 @@ src/lib/auth/     Client-side session state (Step 3) -- AuthProvider/
 
 ## Status
 
-Steps 1–3 of the Phase 3 MVP frontend plan are complete: scaffold,
-typed API client, and the auth/session flow (register, login, session
-restore on load, protected routes, logout, basic nav state). No
-organization/scan UI yet — that's Step 4. See the root
-`docs/session_state.md` for exact current progress and verification
-results.
+The frontend covers: scaffold, typed API client, the auth/session flow
+(register, login, session restore on load, protected routes, logout, nav
+state), organization creation, and the scan flow (create a scan, run/retry
+it, live status with per-step retries, timestamps and error messages).
+There is no scan history, findings view, organization switching or member
+management UI yet. A repeatable browser walkthrough is in
+`docs/frontend_manual_checklist.md`. See the root `docs/session_state.md`
+for exact current progress, verification results and known test failures.

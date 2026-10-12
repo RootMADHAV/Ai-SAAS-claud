@@ -21,8 +21,8 @@ the real repository) unless stated otherwise.
 | 3 | MVP frontend | Steps 1-4 complete; Step 5 (tests) awaiting a scope decision |
 | 4 | Scanner adapters beyond Nuclei | Partial: `nuclei`, `nmap` wired + normalized; `sqlmap` adapter-only; `burp`/`zap` stubs; no complete roster is enumerated anywhere in the repo |
 | 5 | AI features + RAG | Milestones 1-5 complete; real Docker build and real Qdrant unverified |
-| 6 | Multi-tenancy hardening, RBAC, orgs/teams, billing | In progress: **M1 (RBAC on scan routes) complete**; **M2 (member management + last-owner protection) and M3 (audit trail for successful membership changes): in the real working tree, uncommitted, verified by the owner on the real repo 2026-10-11/12** (762 passed / 0 skipped / 0 failed, mypy clean, live 18/18 walkthrough, exactly 6 audit rows); M4 not started and not defined; closing Phase 6 at M3 is an open owner decision |
-| 7 | Full dashboard | Not started |
+| 6 | Multi-tenancy hardening, RBAC, orgs/teams, billing | In progress: **M1 (RBAC on scan routes) complete**; **M2 (member management + last-owner protection) and M3 (audit trail for successful membership changes): verified by the owner on the real repo 2026-10-11/12; the owner's pasted `git show --stat HEAD` lists them in commit `bc45cd9`** (762 passed / 0 skipped / 0 failed, mypy clean, live 18/18 walkthrough, exactly 6 audit rows); M4 not started and not defined; closing Phase 6 at M3 is an open owner decision |
+| 7 | Full dashboard | In progress: **M1 (scan-flow polish + component tests) implemented 2026-10-12**, frontend only, awaiting owner review; M2+ not approved |
 | 8 | DOCX/PDF polish, scheduling, notifications | Not started |
 | 9 | Security hardening pass | Not started |
 | 10 | Deployment | Not started |
@@ -334,7 +334,8 @@ Resolved: #9, #10, #16. #2-#4 do not appear in `PROJECT_STATE.md`'s debt list
 ## Verification limitations that still apply
 - No command-execution tool exists against the real repository; every result
   above is from a sandbox rebuild, not a run on `C:\Users\gamer\Downloads\claudeOnly`,
-  **except** the owner-run Phase 6 M2 + M3 verification entry. Sandbox rebuilds
+  **except** the owner-run Phase 6 M2 + M3 verification entry and the owner's
+  pre-M1 frontend baseline (see Phase 7 below). Sandbox rebuilds
   are usually partial slices; most test files are not re-run in any given
   session.
 - Phase 6 M2 and M3: their sandbox pass counts (292, then 343) came from a
@@ -371,8 +372,36 @@ Milestone 1 complete and committed. Milestones 2 (member management with
 last-owner protection) and 3 (audit trail for successful membership
 changes): in the real working tree, uncommitted, and verified by the owner
 on the real repo (762 passed / 0 skipped / 0 failed; live walkthrough; see
-the verification entry above). Next for the owner: review and commit. Not started:
+the verification entry above); the owner's pasted git output shows them in
+commit `bc45cd9` ("phase 6 teams and billing completed" -- the message does
+not by itself prove Phase 6 is closed; closing at M3 is still an open owner
+decision). Not started:
 M4 (not defined), teams, billing, invitations / leave-organization /
 ownership transfer, organization list/get/rename, `/internal/admin`, an audit
-read API, auditing of denied attempts, further multi-tenancy hardening. No
-Phase 7 work has begun.
+read API, auditing of denied attempts, further multi-tenancy hardening.
+
+## Phase 7 result so far
+**M1 -- frontend scan-flow polish + component tests (2026-10-12).** Frontend
+only; no backend, DB/RLS, API, dependency, lockfile or config change; not
+staged or committed.
+- `ScanCreateRequest.scanner_name` is now `ScannerName` (`"nuclei" | "nmap"`,
+  from `SCANNER_NAMES`), matching the backend `Literal`. The scan form still
+  sends target only (backend default nuclei); no scanner selector added.
+- Scan detail shows the scanner name and, per workflow step, `Retries: N`
+  (when > 0), `Started:` / `Completed:` (fixed UTC, `src/lib/format-timestamp.ts`)
+  and `Error: <error_message>`.
+- 25 new Vitest tests: new-scan form (4), scan detail (12), dashboard page (5),
+  `formatTimestamp` (3), plus one `createScan` nmap test. Component tests mock
+  `useSelectedOrganizationId`.
+- `docs/frontend_manual_checklist.md` added (not yet executed on a live stack).
+- Verification: sandbox (Node 22, no lockfile) vitest 47/47 before and 72/72
+  after, `tsc` and `eslint` clean. Owner baseline on the real repo before M1:
+  `npm test` 43 passed / **4 failed** (`use-selected-organization.test.ts`,
+  `window.localStorage` undefined under the owner's Node), typecheck and lint
+  clean. The 4 failures are pre-existing (Node >= 25 built-in `localStorage`
+  shadows jsdom's under Vitest 4.1.11); fixed in `frontend/vitest.config.ts`
+  via `execArgv: ["--no-experimental-webstorage"]` (guarded by
+  `process.allowedNodeEnvironmentFlags`). Sandbox: 72/72 on Node 22, 24, 25, 26.
+  Owner-run on Windows, Node v26.7.0 (2026-10-13): `npm test` 72/72 passed.
+- Not started: scan history (M2), findings API/UI (M3, M4), organization
+  listing/switching (M5, needs an RLS-safe design), member-management UI (M6).
